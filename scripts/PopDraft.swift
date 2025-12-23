@@ -1347,7 +1347,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "PopDraft"
-        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)"
+        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)\n\nBuilt by Ofer Bachner"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

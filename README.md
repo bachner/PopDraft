@@ -271,6 +271,10 @@ This removes:
 - LaunchAgents
 - Configuration (optional)
 
+## Author
+
+Built by [Ofer Bachner](https://www.linkedin.com/in/ofer-bachner/)
+
 ## License
 
 MIT
