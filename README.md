@@ -98,7 +98,7 @@ Convenient model management with automatic updates.
 
 ### Popup Menu (Recommended)
 
-1. **Copy text** to clipboard (Cmd+C)
+1. **Select text** in any application
 2. Press **Option+Space**
 3. Select an action from the popup or type to search
 4. **Preview the result** in the popup window

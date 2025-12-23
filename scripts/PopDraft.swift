@@ -812,9 +812,51 @@ class PopupWindowController: NSWindowController {
         window?.setContentSize(hostingView?.fittingSize ?? NSSize(width: 320, height: 400))
     }
 
+    private func captureSelectedText() {
+        let pasteboard = NSPasteboard.general
+
+        // Save current clipboard content
+        let savedContents = pasteboard.pasteboardItems?.compactMap { item -> (NSPasteboard.PasteboardType, Data)? in
+            guard let types = item.types.first,
+                  let data = item.data(forType: types) else { return nil }
+            return (types, data)
+        } ?? []
+        let savedChangeCount = pasteboard.changeCount
+
+        // Simulate Cmd+C to copy selected text
+        let source = CGEventSource(stateID: .hidSystemState)
+
+        // Key down: Cmd+C
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
+        keyDown?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+
+        // Key up: Cmd+C
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
+        keyUp?.flags = .maskCommand
+        keyUp?.post(tap: .cghidEventTap)
+
+        // Wait for clipboard to update
+        usleep(50000)  // 50ms
+
+        // Check if clipboard changed (meaning text was selected and copied)
+        if pasteboard.changeCount != savedChangeCount {
+            clipboardText = pasteboard.string(forType: .string) ?? ""
+
+            // Restore original clipboard
+            pasteboard.clearContents()
+            for (type, data) in savedContents {
+                pasteboard.setData(data, forType: type)
+            }
+        } else {
+            // No selection - clipboard unchanged, use existing clipboard content
+            clipboardText = pasteboard.string(forType: .string) ?? ""
+        }
+    }
+
     func showAtMouseLocation() {
-        // Get clipboard content
-        clipboardText = NSPasteboard.general.string(forType: .string) ?? ""
+        // Capture selected text by simulating Cmd+C
+        captureSelectedText()
 
         // Reset state
         searchText = ""
@@ -848,12 +890,12 @@ class PopupWindowController: NSWindowController {
             }
         }
 
+        updateView()
         window?.setFrame(frame, display: true)
         window?.makeKeyAndOrderFront(nil)
 
         // Start monitoring keyboard
         startKeyboardMonitoring()
-
         // Make the app active so we can receive key events
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -874,7 +916,7 @@ class PopupWindowController: NSWindowController {
             guard let self = self else { return event }
 
             let actions = ActionManager.shared.filteredActions(searchText: self.searchText)
-
+            updateView()
             switch event.keyCode {
             case 53: // Escape
                 switch self.state {
@@ -945,7 +987,7 @@ class PopupWindowController: NSWindowController {
 
         // Get selected text from clipboard
         guard !clipboardText.isEmpty else {
-            state = .error("No text in clipboard.\nCopy some text first (⌘C)")
+            state = .error("No text selected.\nSelect some text first.")
             updateView()
             return
         }
@@ -1293,7 +1335,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "PopDraft"
-        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Copy text to clipboard\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)"
+        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
