@@ -8,23 +8,146 @@ echo "QuickLLM Installer"
 echo "===================="
 echo ""
 
-# Check for Ollama
-echo "Checking requirements..."
-if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    echo "Warning: Ollama doesn't appear to be running at localhost:11434"
-    echo "   Please install Ollama from https://ollama.ai and start it"
-    echo ""
-    read -p "Continue anyway? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-else
-    echo "[OK] Ollama is running"
-fi
-
 # Get the directory where install.sh is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Config directory
+CONFIG_DIR="$HOME/.quickllm"
+CONFIG_FILE="$CONFIG_DIR/config"
+MODELS_DIR="$CONFIG_DIR/models"
+
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$MODELS_DIR"
+
+# Backend selection
+echo "Choose your LLM backend:"
+echo "  1) Ollama (recommended for beginners - easy model management)"
+echo "  2) llama.cpp (lighter weight - direct model loading)"
+echo ""
+read -p "Enter choice [1-2, default=1]: " BACKEND_CHOICE
+BACKEND_CHOICE=${BACKEND_CHOICE:-1}
+
+SELECTED_BACKEND="ollama"
+if [ "$BACKEND_CHOICE" = "2" ]; then
+    SELECTED_BACKEND="llamacpp"
+fi
+
+echo ""
+echo "Selected backend: $SELECTED_BACKEND"
+echo ""
+
+# Backend-specific setup
+if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
+    echo "Setting up llama.cpp..."
+
+    # Install llama.cpp via Homebrew
+    if ! command -v llama-server &> /dev/null; then
+        echo "  Installing llama.cpp via Homebrew..."
+        if command -v brew &> /dev/null; then
+            brew install llama.cpp
+            echo "  [OK] llama.cpp installed"
+        else
+            echo "  [ERROR] Homebrew not found. Please install Homebrew first:"
+            echo "          /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+            exit 1
+        fi
+    else
+        echo "  [OK] llama.cpp already installed"
+    fi
+
+    # Model selection
+    echo ""
+    echo "Choose a model to download:"
+    echo "  1) Qwen 2.5 7B Instruct Q4 (4.4 GB - good balance)"
+    echo "  2) Qwen 2.5 3B Instruct Q4 (2.0 GB - faster, lighter)"
+    echo "  3) Qwen 2.5 14B Instruct Q4 (8.5 GB - higher quality)"
+    echo "  4) Skip model download (I'll provide my own)"
+    echo ""
+    read -p "Enter choice [1-4, default=1]: " MODEL_CHOICE
+    MODEL_CHOICE=${MODEL_CHOICE:-1}
+
+    MODEL_URL=""
+    MODEL_FILE=""
+    case "$MODEL_CHOICE" in
+        1)
+            MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"
+            MODEL_FILE="qwen2.5-7b-instruct-q4_k_m.gguf"
+            ;;
+        2)
+            MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+            MODEL_FILE="qwen2.5-3b-instruct-q4_k_m.gguf"
+            ;;
+        3)
+            MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf"
+            MODEL_FILE="qwen2.5-14b-instruct-q4_k_m.gguf"
+            ;;
+        4)
+            echo "  Skipping model download."
+            echo "  Set LLAMACPP_MODEL_PATH in ~/.quickllm/config to your model path."
+            MODEL_FILE=""
+            ;;
+    esac
+
+    if [ -n "$MODEL_URL" ]; then
+        MODEL_PATH="$MODELS_DIR/$MODEL_FILE"
+        if [ -f "$MODEL_PATH" ]; then
+            echo "  [OK] Model already exists: $MODEL_FILE"
+        else
+            echo "  Downloading model: $MODEL_FILE"
+            echo "  This may take a while depending on your connection..."
+            curl -L --progress-bar -o "$MODEL_PATH" "$MODEL_URL"
+            echo "  [OK] Model downloaded to $MODEL_PATH"
+        fi
+    fi
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+# QuickLLM Configuration
+BACKEND=llamacpp
+
+# Ollama settings (not used when BACKEND=llamacpp)
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+
+# llama.cpp settings
+LLAMACPP_URL=http://localhost:8080
+LLAMACPP_MODEL_PATH=$MODELS_DIR/${MODEL_FILE:-model.gguf}
+EOF
+
+    echo "  [OK] Configuration saved to $CONFIG_FILE"
+
+else
+    # Ollama setup
+    echo "Checking Ollama..."
+    if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        echo "  [WARN] Ollama doesn't appear to be running at localhost:11434"
+        echo "         Please install Ollama from https://ollama.ai and start it"
+        echo ""
+        read -p "Continue anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    else
+        echo "  [OK] Ollama is running"
+    fi
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+# QuickLLM Configuration
+BACKEND=ollama
+
+# Ollama settings
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+
+# llama.cpp settings (not used when BACKEND=ollama)
+LLAMACPP_URL=http://localhost:8080
+LLAMACPP_MODEL_PATH=$MODELS_DIR/model.gguf
+EOF
+
+    echo "  [OK] Configuration saved to $CONFIG_FILE"
+fi
 
 # Create bin directory
 echo ""
@@ -32,6 +155,7 @@ echo "Installing scripts to ~/bin/..."
 mkdir -p ~/bin
 
 # Copy scripts
+cp "$SCRIPT_DIR/scripts/llm-config.sh" ~/bin/
 cp "$SCRIPT_DIR/scripts/llm-process.sh" ~/bin/
 cp "$SCRIPT_DIR/scripts/llm-clipboard.sh" ~/bin/
 cp "$SCRIPT_DIR/scripts/llm-grammar.sh" ~/bin/
@@ -115,6 +239,61 @@ sleep 1
 launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
 
 echo "  [OK] TTS server configured (auto-starts on login, ~400-600MB RAM)"
+
+# Setup llama.cpp server LaunchAgent if using llama.cpp backend
+if [ "$SELECTED_BACKEND" = "llamacpp" ] && [ -n "$MODEL_FILE" ]; then
+    echo ""
+    echo "Setting up llama.cpp server auto-start..."
+
+    cat > ~/Library/LaunchAgents/com.quickllm.llama-server.plist << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quickllm.llama-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/llama-server</string>
+        <string>-m</string>
+        <string>$MODELS_DIR/$MODEL_FILE</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>-ngl</string>
+        <string>99</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/llm-llama-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/llm-llama-server.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+    # Check if llama-server is in /usr/local/bin instead (Intel Macs)
+    if [ ! -f /opt/homebrew/bin/llama-server ] && [ -f /usr/local/bin/llama-server ]; then
+        sed -i '' "s|/opt/homebrew/bin/llama-server|/usr/local/bin/llama-server|g" ~/Library/LaunchAgents/com.quickllm.llama-server.plist
+    fi
+
+    # Stop any existing llama server and load the LaunchAgent
+    launchctl unload ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
+    pkill -f "llama-server.*8080" 2>/dev/null || true
+    sleep 1
+    launchctl load ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
+
+    echo "  [OK] llama.cpp server configured (auto-starts on login)"
+    echo "  [INFO] Server will start loading model in background..."
+    echo "  [INFO] Check logs: tail -f /tmp/llm-llama-server.log"
+fi
 
 # Compile and install native chat app
 echo ""
@@ -203,9 +382,14 @@ echo "==========================================="
 echo "[OK] Installation complete!"
 echo "==========================================="
 echo ""
+echo "Backend: $SELECTED_BACKEND"
+if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
+    echo "Model: $MODEL_FILE"
+fi
+echo ""
 echo "POPUP MENU (Recommended):"
 echo "  Option+Space  ->  Show action popup (copy text first)"
-echo "  Look for the ✨ icon in your menu bar"
+echo "  Look for the sparkles icon in your menu bar"
 echo ""
 echo "KEYBOARD SHORTCUTS:"
 echo "  Ctrl+Option+G  ->  Grammar Check"
@@ -217,6 +401,9 @@ echo "  Ctrl+Option+S  ->  Speak (Text-to-Speech)"
 echo ""
 echo "Usage: Select text, copy it (Cmd+C), then press Option+Space"
 echo "       Or use keyboard shortcuts directly on selected text"
+echo ""
+echo "Configuration: ~/.quickllm/config"
+echo "To switch backends, edit the config file and restart QuickLLM."
 echo ""
 echo "Note: You may need to restart apps for shortcuts to take effect."
 echo "      Customize shortcuts in: System Settings > Keyboard > Keyboard Shortcuts > Services"

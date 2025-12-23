@@ -11,12 +11,18 @@ echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo ""
     echo "Stopping services..."
+
     # TTS server
     launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.quickllm.tts-server.plist
     launchctl unload ~/Library/LaunchAgents/com.llm-mac.tts-server.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.llm-mac.tts-server.plist
     pkill -f llm-tts-server.py 2>/dev/null || true
+
+    # llama.cpp server
+    launchctl unload ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.quickllm.llama-server.plist
+    pkill -f "llama-server.*8080" 2>/dev/null || true
 
     # Popup app
     launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
@@ -26,6 +32,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
 
     echo ""
     echo "Removing scripts and apps from ~/bin/..."
+    rm -f ~/bin/llm-config.sh
     rm -f ~/bin/llm-process.sh
     rm -f ~/bin/llm-clipboard.sh
     rm -f ~/bin/llm-grammar.sh
@@ -53,6 +60,16 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -rf ~/Library/Services/LLM\ Chat.workflow
     rm -rf ~/Library/Services/LLM\ Speak.workflow
     echo "[OK] Workflows removed"
+
+    echo ""
+    read -p "Remove configuration and models (~/.quickllm)? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf ~/.quickllm
+        echo "[OK] Configuration and models removed"
+    else
+        echo "[SKIP] Configuration preserved at ~/.quickllm"
+    fi
 
     echo ""
     echo "Refreshing services..."

@@ -2,8 +2,23 @@
 # LLM Interactive Chat Session
 # Usage: llm-chat-session.sh <context_file>
 # Runs an interactive chat with the LLM, keeping the initial context
+# Supports both Ollama and llama.cpp backends via config
 
 export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source the config helper
+if [ -f "$SCRIPT_DIR/llm-config.sh" ]; then
+    source "$SCRIPT_DIR/llm-config.sh"
+elif [ -f "$HOME/bin/llm-config.sh" ]; then
+    source "$HOME/bin/llm-config.sh"
+else
+    echo "Error: llm-config.sh not found"
+    exit 1
+fi
+
+load_config
 
 CONTEXT_FILE="$1"
 CONTEXT=""
@@ -13,7 +28,6 @@ if [ -n "$CONTEXT_FILE" ] && [ -f "$CONTEXT_FILE" ]; then
     rm -f "$CONTEXT_FILE"
 fi
 
-MODEL="qwen3-coder:480b-cloud"
 MESSAGES_FILE=$(mktemp /tmp/llm-chat-messages.XXXXXX)
 
 # Initialize messages array
@@ -29,7 +43,7 @@ BOLD='\033[1m'
 
 clear
 echo -e "${BOLD}${BLUE}=== LLM Chat Session ===${NC}"
-echo -e "${CYAN}Model: $MODEL${NC}"
+echo -e "${CYAN}Backend: $BACKEND | Model: $(get_model)${NC}"
 echo -e "${CYAN}Type 'exit' or 'quit' to end the session${NC}"
 echo -e "${CYAN}Type 'clear' to start a new conversation${NC}"
 echo ""
@@ -105,29 +119,10 @@ with open("$MESSAGES_FILE", "w") as f:
     json.dump(messages, f)
 PYEOF
 
-    # Call Ollama chat API
-    MESSAGES_JSON=$(cat "$MESSAGES_FILE")
-
     echo -ne "${GREEN}Assistant:${NC} "
 
-    RESPONSE=$(curl -s http://localhost:11434/api/chat \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"model\": \"$MODEL\",
-            \"messages\": $MESSAGES_JSON,
-            \"stream\": false
-        }" 2>/dev/null)
-
-    # Extract and display response
-    ASSISTANT_MSG=$(echo "$RESPONSE" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    msg = data.get('message', {})
-    print(msg.get('content', 'Error: No response from LLM'))
-except Exception as e:
-    print(f'Error: Failed to parse LLM response - {e}')
-")
+    # Use the unified chat API
+    ASSISTANT_MSG=$(llm_chat "$MESSAGES_FILE")
 
     echo "$ASSISTANT_MSG"
     echo ""

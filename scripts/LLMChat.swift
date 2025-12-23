@@ -1,16 +1,114 @@
 import Cocoa
 import Foundation
 
+// MARK: - LLM Configuration
+
+struct LLMConfig {
+    enum Backend: String {
+        case ollama
+        case llamacpp
+    }
+
+    var backend: Backend = .ollama
+    var ollamaURL: String = "http://localhost:11434"
+    var llamacppURL: String = "http://localhost:8080"
+    var ollamaModel: String = "qwen2.5:7b"
+
+    static func load() -> LLMConfig {
+        var config = LLMConfig()
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".quickllm/config")
+
+        guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else {
+            return config
+        }
+
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+
+            let parts = trimmed.components(separatedBy: "=")
+            guard parts.count == 2 else { continue }
+
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+
+            switch key {
+            case "BACKEND":
+                config.backend = Backend(rawValue: value) ?? .ollama
+            case "OLLAMA_URL":
+                config.ollamaURL = value
+            case "LLAMACPP_URL":
+                config.llamacppURL = value
+            case "OLLAMA_MODEL":
+                config.ollamaModel = value
+            default:
+                break
+            }
+        }
+
+        return config
+    }
+}
+
 // MARK: - LLM API Client
+
 class LLMClient {
-    let model = "qwen3-coder:480b-cloud"
-    let apiURL = URL(string: "http://localhost:11434/api/chat")!
+    private var config: LLMConfig
+    private var activeBackend: LLMConfig.Backend?
     var messages: [[String: String]] = []
     var contextText: String = ""
 
+    init() {
+        config = LLMConfig.load()
+    }
+
+    var backendName: String {
+        let backend = activeBackend ?? config.backend
+        return backend == .llamacpp ? "llama.cpp" : "Ollama"
+    }
+
+    // Check if a backend is available
+    private func isBackendAvailable(_ backend: LLMConfig.Backend) -> Bool {
+        let urlString = backend == .llamacpp
+            ? "\(config.llamacppURL)/health"
+            : "\(config.ollamaURL)/api/tags"
+
+        guard let url = URL(string: urlString) else { return false }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.0
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var isAvailable = false
+
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                isAvailable = true
+            }
+            semaphore.signal()
+        }.resume()
+
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        return isAvailable
+    }
+
+    // Select backend with fallback
+    private func selectBackend() -> LLMConfig.Backend? {
+        if isBackendAvailable(config.backend) {
+            activeBackend = config.backend
+            return config.backend
+        }
+        let fallback: LLMConfig.Backend = config.backend == .llamacpp ? .ollama : .llamacpp
+        if isBackendAvailable(fallback) {
+            activeBackend = fallback
+            return fallback
+        }
+        return nil
+    }
+
     func setContext(_ context: String) {
         contextText = context
-        // System-style instruction that tells the LLM to apply instructions to the text
         messages.append([
             "role": "system",
             "content": "You are a helpful assistant. The user has selected the following text and will give you instructions to apply to it. Follow their instructions precisely. Here is the selected text:\n\n---\n\(context)\n---"
@@ -20,13 +118,77 @@ class LLMClient {
     func sendMessage(_ text: String, completion: @escaping (String) -> Void) {
         messages.append(["role": "user", "content": text])
 
-        var request = URLRequest(url: apiURL)
+        guard let backend = selectBackend() else {
+            completion("Error: No LLM backend available. Start llama-server or Ollama.")
+            return
+        }
+
+        switch backend {
+        case .llamacpp:
+            sendLlamaCpp(completion: completion)
+        case .ollama:
+            sendOllama(completion: completion)
+        }
+    }
+
+    private func sendLlamaCpp(completion: @escaping (String) -> Void) {
+        guard let url = URL(string: "\(config.llamacppURL)/v1/chat/completions") else {
+            completion("Error: Invalid URL")
+            return
+        }
+
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 120
 
         let body: [String: Any] = [
-            "model": model,
+            "messages": messages,
+            "stream": false,
+            "max_tokens": 4096
+        ]
+
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            var response = "Error: No response"
+
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let choices = json["choices"] as? [[String: Any]],
+               let first = choices.first,
+               let message = first["message"] as? [String: Any],
+               let content = message["content"] as? String {
+                response = content
+                self?.messages.append(["role": "assistant", "content": content])
+            } else if let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let errorObj = json["error"] as? [String: Any],
+                      let message = errorObj["message"] as? String {
+                response = "Error: \(message)"
+            } else if let error = error {
+                response = "Error: \(error.localizedDescription)"
+            }
+
+            DispatchQueue.main.async {
+                completion(response)
+            }
+        }.resume()
+    }
+
+    private func sendOllama(completion: @escaping (String) -> Void) {
+        guard let url = URL(string: "\(config.ollamaURL)/api/chat") else {
+            completion("Error: Invalid URL")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+
+        let body: [String: Any] = [
+            "model": config.ollamaModel,
             "messages": messages,
             "stream": false
         ]
@@ -54,6 +216,7 @@ class LLMClient {
 }
 
 // MARK: - Chat Window Controller
+
 class ChatWindowController: NSWindowController, NSTextFieldDelegate {
     var contextView: NSTextView!
     var chatView: NSTextView!
@@ -67,7 +230,7 @@ class ChatWindowController: NSWindowController, NSTextFieldDelegate {
     convenience init(context: String) {
         self.init(window: nil)
         self.context = context
-        setupUI()  // Setup UI after context is set
+        setupUI()
     }
 
     override init(window: NSWindow?) {
@@ -118,7 +281,7 @@ class ChatWindowController: NSWindowController, NSTextFieldDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "LLM Chat"
+        window.title = "LLM Chat (\(llmClient.backendName))"
         window.minSize = NSSize(width: 500, height: 400)
         window.center()
 
@@ -275,6 +438,7 @@ class ChatWindowController: NSWindowController, NSTextFieldDelegate {
 }
 
 // MARK: - App Delegate
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var windowController: ChatWindowController?
 
@@ -324,6 +488,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - Main
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

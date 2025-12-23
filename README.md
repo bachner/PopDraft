@@ -12,6 +12,7 @@ The easiest way to use QuickLLM - a floating action menu that appears near your 
 - **Explain simply** - Break down complex text
 - **Craft a reply** - Generate thoughtful responses
 - **Continue writing** - Extend your text
+- **Read aloud** - Text-to-speech using neural TTS
 - **Custom prompt** - Enter any instruction
 
 ### Keyboard Shortcuts
@@ -30,8 +31,10 @@ Direct shortcuts for common actions:
 ## Requirements
 
 - macOS 13+ (Ventura or later)
-- [Ollama](https://ollama.ai) running locally
 - Python 3.10+ (for TTS features)
+- **One of the following backends:**
+  - **llama.cpp** (recommended) - Lightweight, direct model loading
+  - **Ollama** - Easy model management
 
 ## Installation
 
@@ -39,7 +42,7 @@ Direct shortcuts for common actions:
 
 1. Download `QuickLLM-x.x.x.dmg` from [Releases](../../releases)
 2. Open the DMG and double-click **QuickLLM.app**
-3. Follow the Terminal prompts
+3. Follow the Terminal prompts to choose your backend
 4. Grant Accessibility permissions when prompted
 
 ### From Source
@@ -50,12 +53,46 @@ cd quickllm
 ./install.sh
 ```
 
+The installer will prompt you to choose:
+1. **Backend**: llama.cpp or Ollama
+2. **Model** (if llama.cpp): Download size from 2GB to 8.5GB
+
 ### Build DMG
 
 ```bash
 ./build-dmg.sh 1.0.0
 # Output: build/QuickLLM-1.0.0.dmg
 ```
+
+## Backend Options
+
+### llama.cpp (Recommended)
+
+Lightweight runtime that loads GGUF models directly. No separate app needed.
+
+**Pros:**
+- Smaller footprint
+- Direct model control
+- Auto-starts with the system
+
+**Setup:** The installer handles everything:
+- Installs llama.cpp via Homebrew
+- Downloads your chosen model
+- Sets up auto-start LaunchAgent
+
+### Ollama
+
+Convenient model management with automatic updates.
+
+**Pros:**
+- Easy model switching (`ollama pull model-name`)
+- Automatic model updates
+- Web UI available
+
+**Setup:**
+1. Install from [ollama.ai](https://ollama.ai)
+2. Run `ollama pull qwen2.5:7b` (or your preferred model)
+3. Choose Ollama during QuickLLM installation
 
 ## Usage
 
@@ -64,9 +101,16 @@ cd quickllm
 1. **Copy text** to clipboard (Cmd+C)
 2. Press **Option+Space**
 3. Select an action from the popup or type to search
-4. Result is automatically pasted
+4. **Preview the result** in the popup window
+5. Click **Copy** (or press Enter) to copy to clipboard
 
-Look for the ✨ icon in your menu bar.
+Look for the sparkles icon in your menu bar.
+
+**Keyboard shortcuts in popup:**
+- `Up/Down` - Navigate actions
+- `Enter` - Select action / Copy result
+- `Escape` - Close popup / Go back
+- Type to filter actions
 
 ### Keyboard Shortcuts
 
@@ -93,20 +137,42 @@ llm-tts.py -o output.wav "Save to file"
 
 ## Configuration
 
-### Change LLM Model
+Configuration file: `~/.quickllm/config`
 
-Edit `~/bin/llm-process.sh`:
 ```bash
-"model": "your-model-name"
+# Backend: ollama or llamacpp
+BACKEND=llamacpp
+
+# Ollama settings
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+
+# llama.cpp settings
+LLAMACPP_URL=http://localhost:8080
+LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 ```
 
-Also update in:
-- `~/bin/llm-chat-session.sh`
-- `~/bin/QuickLLMApp` (requires recompile)
+### Switch Backends
+
+1. Edit `~/.quickllm/config`
+2. Change `BACKEND=ollama` or `BACKEND=llamacpp`
+3. Restart QuickLLMApp (or log out/in)
+
+### Change Model
+
+**For llama.cpp:**
+1. Download a GGUF model to `~/.quickllm/models/`
+2. Update `LLAMACPP_MODEL_PATH` in config
+3. Restart the llama server: `launchctl kickstart -k gui/$(id -u)/com.quickllm.llama-server`
+
+**For Ollama:**
+1. Pull the model: `ollama pull model-name`
+2. Update `OLLAMA_MODEL` in config
+3. Restart QuickLLMApp
 
 ### Change Keyboard Shortcuts
 
-**System Settings** → **Keyboard** → **Keyboard Shortcuts** → **Services**
+**System Settings** -> **Keyboard** -> **Keyboard Shortcuts** -> **Services**
 
 Find QuickLLM services under "Text" and double-click to change.
 
@@ -118,13 +184,13 @@ Edit and recompile `scripts/QuickLLMApp.swift` - modify the `registerGlobalHotKe
 
 ```
 quickllm/
-├── install.sh              # Installer
+├── install.sh              # Installer (backend selection, model download)
 ├── uninstall.sh            # Uninstaller
 ├── build-dmg.sh            # DMG builder
-├── requirements.txt        # Python dependencies
 ├── scripts/
-│   ├── QuickLLMApp.swift   # Popup menu app (NEW)
-│   ├── llm-process.sh      # Core Ollama API client
+│   ├── llm-config.sh       # Configuration & API abstraction
+│   ├── QuickLLMApp.swift   # Popup menu app
+│   ├── llm-process.sh      # Core LLM processing
 │   ├── llm-clipboard.sh    # Clipboard handler
 │   ├── llm-grammar.sh      # Grammar check
 │   ├── llm-articulate.sh   # Articulate
@@ -137,6 +203,9 @@ quickllm/
 │   ├── llm-tts.sh          # TTS wrapper
 │   ├── LLMChat.swift       # Native chat app
 │   └── setup-workflows.sh  # Workflow generator
+├── ~/.quickllm/
+│   ├── config              # Backend configuration
+│   └── models/             # GGUF models (llama.cpp)
 └── README.md
 ```
 
@@ -146,18 +215,34 @@ quickllm/
 
 1. Check if QuickLLMApp is running: `pgrep -f QuickLLMApp`
 2. Start it manually: `~/bin/QuickLLMApp &`
-3. Check for the ✨ icon in the menu bar
+3. Check for the sparkles icon in the menu bar
 
 ### Shortcuts not working
 
 1. Restart the application you're using
-2. Check **System Settings** → **Keyboard** → **Keyboard Shortcuts** → **Services**
+2. Check **System Settings** -> **Keyboard** -> **Keyboard Shortcuts** -> **Services**
 3. Verify Accessibility permissions are granted
 
-### Ollama not responding
+### LLM not responding
 
+**For llama.cpp:**
 ```bash
+# Check if server is running
+curl http://localhost:8080/health
+
+# Check logs
+tail -f /tmp/llm-llama-server.log
+
+# Restart server
+launchctl kickstart -k gui/$(id -u)/com.quickllm.llama-server
+```
+
+**For Ollama:**
+```bash
+# Check if running
 curl http://localhost:11434/api/tags
+
+# Start Ollama app if needed
 ```
 
 ### TTS issues
@@ -168,11 +253,23 @@ pip install kokoro soundfile numpy
 brew install espeak-ng
 ```
 
+### View current configuration
+
+```bash
+~/bin/llm-config.sh
+```
+
 ## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
+
+This removes:
+- Scripts from `~/bin/`
+- Workflows from `~/Library/Services/`
+- LaunchAgents
+- Configuration (optional)
 
 ## License
 

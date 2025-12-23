@@ -14,6 +14,15 @@ struct LLMAction: Identifiable, Hashable {
     let icon: String
     let prompt: String
     let shortcut: String?
+    let isTTS: Bool
+
+    init(name: String, icon: String, prompt: String, shortcut: String?, isTTS: Bool = false) {
+        self.name = name
+        self.icon = icon
+        self.prompt = prompt
+        self.shortcut = shortcut
+        self.isTTS = isTTS
+    }
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -24,15 +33,207 @@ struct LLMAction: Identifiable, Hashable {
     }
 }
 
-// MARK: - Ollama Client
+// MARK: - LLM Configuration
 
-class OllamaClient {
-    static let shared = OllamaClient()
-    private let baseURL = "http://localhost:11434"
-    private let model = "qwen3-coder:480b-cloud"
+struct LLMConfig {
+    enum Backend: String {
+        case ollama
+        case llamacpp
+    }
+
+    var backend: Backend = .ollama
+    var ollamaURL: String = "http://localhost:11434"
+    var llamacppURL: String = "http://localhost:8080"
+    var ollamaModel: String = "qwen2.5:7b"
+
+    static func load() -> LLMConfig {
+        var config = LLMConfig()
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".quickllm/config")
+
+        guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else {
+            return config
+        }
+
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+
+            let parts = trimmed.components(separatedBy: "=")
+            guard parts.count == 2 else { continue }
+
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+
+            switch key {
+            case "BACKEND":
+                config.backend = Backend(rawValue: value) ?? .ollama
+            case "OLLAMA_URL":
+                config.ollamaURL = value
+            case "LLAMACPP_URL":
+                config.llamacppURL = value
+            case "OLLAMA_MODEL":
+                config.ollamaModel = value
+            default:
+                break
+            }
+        }
+
+        return config
+    }
+}
+
+// MARK: - LLM Client
+
+class LLMClient {
+    static let shared = LLMClient()
+    private var config: LLMConfig
+    private var activeBackend: LLMConfig.Backend?
+
+    init() {
+        config = LLMConfig.load()
+    }
+
+    func reloadConfig() {
+        config = LLMConfig.load()
+        activeBackend = nil
+    }
+
+    var backendName: String {
+        let backend = activeBackend ?? config.backend
+        return backend == .llamacpp ? "llama.cpp" : "Ollama"
+    }
+
+    // Check if a backend is available (synchronous, with short timeout)
+    private func isBackendAvailable(_ backend: LLMConfig.Backend) -> Bool {
+        let urlString = backend == .llamacpp
+            ? "\(config.llamacppURL)/health"
+            : "\(config.ollamaURL)/api/tags"
+
+        guard let url = URL(string: urlString) else { return false }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.0
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var isAvailable = false
+
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                isAvailable = true
+            }
+            semaphore.signal()
+        }.resume()
+
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        return isAvailable
+    }
+
+    // Select backend with fallback
+    private func selectBackend() -> LLMConfig.Backend? {
+        // Try configured backend first
+        if isBackendAvailable(config.backend) {
+            activeBackend = config.backend
+            return config.backend
+        }
+
+        // Try fallback
+        let fallback: LLMConfig.Backend = config.backend == .llamacpp ? .ollama : .llamacpp
+        if isBackendAvailable(fallback) {
+            activeBackend = fallback
+            return fallback
+        }
+
+        activeBackend = nil
+        return nil
+    }
 
     func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<String, Error>) -> Void) {
-        guard let url = URL(string: "\(baseURL)/api/generate") else {
+        // Auto-select backend with fallback
+        guard let backend = selectBackend() else {
+            completion(.failure(NSError(domain: "No LLM backend available. Start llama-server or Ollama.", code: -1)))
+            return
+        }
+
+        switch backend {
+        case .llamacpp:
+            generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        case .ollama:
+            generateOllama(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        }
+    }
+
+    // MARK: - llama.cpp Backend (OpenAI-compatible API)
+
+    private func generateLlamaCpp(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let url = URL(string: "\(config.llamacppURL)/v1/chat/completions") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+
+        var messages: [[String: String]] = []
+        if let system = systemPrompt {
+            messages.append(["role": "system", "content": system])
+        }
+        messages.append(["role": "user", "content": prompt])
+
+        let body: [String: Any] = [
+            "messages": messages,
+            "stream": false,
+            "max_tokens": 4096
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "No data", code: -1)))
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let message = first["message"] as? [String: Any],
+                   let content = message["content"] as? String {
+                    var cleaned = content
+                    if let range = cleaned.range(of: "</think>") {
+                        cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    completion(.success(cleaned))
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorObj = json["error"] as? [String: Any],
+                          let message = errorObj["message"] as? String {
+                    completion(.failure(NSError(domain: message, code: -1)))
+                } else {
+                    completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - Ollama Backend
+
+    private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
         }
@@ -43,7 +244,7 @@ class OllamaClient {
         request.timeoutInterval = 120
 
         var body: [String: Any] = [
-            "model": model,
+            "model": config.ollamaModel,
             "prompt": prompt,
             "stream": false
         ]
@@ -73,7 +274,6 @@ class OllamaClient {
             do {
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let responseText = json["response"] as? String {
-                    // Clean up the response - remove /no_think tags if present
                     var cleaned = responseText
                     if let range = cleaned.range(of: "</think>") {
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -84,6 +284,56 @@ class OllamaClient {
                 }
             } catch {
                 completion(.failure(error))
+            }
+        }.resume()
+    }
+}
+
+// MARK: - TTS Client
+
+class TTSClient {
+    static let shared = TTSClient()
+    private let serverURL = "http://127.0.0.1:7865"
+
+    func speak(text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        // URL encode the text
+        guard let encodedText = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(serverURL)/speak?text=\(encodedText)&play=1") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                completion(.success(()))
+            } else {
+                completion(.failure(NSError(domain: "TTS server error", code: -1)))
+            }
+        }.resume()
+    }
+
+    func checkHealth(completion: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "\(serverURL)/health") else {
+            completion(false)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                completion(true)
+            } else {
+                completion(false)
             }
         }.resume()
     }
@@ -126,6 +376,13 @@ class ActionManager {
             shortcut: nil
         ),
         LLMAction(
+            name: "Read aloud",
+            icon: "speaker.wave.2.fill",
+            prompt: "",
+            shortcut: "S",
+            isTTS: true
+        ),
+        LLMAction(
             name: "Custom prompt...",
             icon: "ellipsis.circle.fill",
             prompt: "",
@@ -141,19 +398,53 @@ class ActionManager {
     }
 }
 
+// MARK: - View State
+
+enum PopupState {
+    case actionList
+    case customPrompt
+    case processing
+    case result(String)
+    case error(String)
+}
+
 // MARK: - Popup View
 
 struct PopupView: View {
     @Binding var searchText: String
     @Binding var selectedIndex: Int
-    @Binding var isProcessing: Bool
+    @Binding var state: PopupState
     @Binding var customPromptText: String
-    @Binding var showCustomPrompt: Bool
     let actions: [LLMAction]
     let onSelect: (LLMAction) -> Void
-    let onCancel: () -> Void
+    let onCopy: () -> Void
+    let onBack: () -> Void
+    let onDismiss: () -> Void
 
     var body: some View {
+        VStack(spacing: 0) {
+            switch state {
+            case .actionList:
+                actionListView
+            case .customPrompt:
+                customPromptView
+            case .processing:
+                processingView
+            case .result(let text):
+                resultView(text: text)
+            case .error(let message):
+                errorView(message: message)
+            }
+        }
+        .frame(width: 320)
+        .background(VisualEffectView(material: .popover, blendingMode: .behindWindow))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .shadow(color: .black.opacity(0.2), radius: 10, x: 0, y: 5)
+    }
+
+    // MARK: - Action List View
+
+    private var actionListView: some View {
         VStack(spacing: 0) {
             // Search field
             HStack(spacing: 8) {
@@ -161,26 +452,9 @@ struct PopupView: View {
                     .foregroundColor(.secondary)
                     .font(.system(size: 14))
 
-                if showCustomPrompt {
-                    TextField("Enter your prompt...", text: $customPromptText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14))
-                        .onSubmit {
-                            if !customPromptText.isEmpty {
-                                let customAction = LLMAction(
-                                    name: "Custom",
-                                    icon: "ellipsis.circle.fill",
-                                    prompt: customPromptText,
-                                    shortcut: nil
-                                )
-                                onSelect(customAction)
-                            }
-                        }
-                } else {
-                    TextField("Search actions...", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14))
-                }
+                TextField("Search actions...", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -188,63 +462,189 @@ struct PopupView: View {
 
             Divider()
 
-            if isProcessing {
-                // Processing indicator
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                    Text("Processing...")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, minHeight: 100)
-                .padding()
-            } else if showCustomPrompt {
-                // Custom prompt hint
-                VStack(spacing: 8) {
-                    Text("Type your instruction and press Enter")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                    Button("Cancel") {
-                        showCustomPrompt = false
-                        customPromptText = ""
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.blue)
-                }
-                .frame(maxWidth: .infinity, minHeight: 80)
-                .padding()
-            } else {
-                // Action list
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
-                                ActionRow(
-                                    action: action,
-                                    isSelected: index == selectedIndex
-                                )
-                                .id(index)
-                                .onTapGesture {
-                                    onSelect(action)
-                                }
+            // Action list
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
+                            ActionRow(
+                                action: action,
+                                isSelected: index == selectedIndex
+                            )
+                            .id(index)
+                            .onTapGesture {
+                                onSelect(action)
                             }
                         }
-                        .padding(.vertical, 4)
                     }
-                    .onChange(of: selectedIndex) { _, newIndex in
-                        withAnimation {
-                            proxy.scrollTo(newIndex, anchor: .center)
-                        }
+                    .padding(.vertical, 4)
+                }
+                .onChange(of: selectedIndex) { _, newIndex in
+                    withAnimation {
+                        proxy.scrollTo(newIndex, anchor: .center)
                     }
                 }
-                .frame(maxHeight: 320)
             }
+            .frame(maxHeight: 280)
         }
-        .frame(width: 280)
-        .background(VisualEffectView(material: .popover, blendingMode: .behindWindow))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .shadow(color: .black.opacity(0.2), radius: 10, x: 0, y: 5)
+    }
+
+    // MARK: - Custom Prompt View
+
+    private var customPromptView: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+
+                Text("Custom Prompt")
+                    .font(.system(size: 13, weight: .medium))
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            VStack(spacing: 12) {
+                TextField("Enter your instruction...", text: $customPromptText, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .lineLimit(3...6)
+                    .padding(8)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .cornerRadius(6)
+
+                Text("Press Enter to process")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .padding(12)
+        }
+    }
+
+    // MARK: - Processing View
+
+    private var processingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .scaleEffect(0.8)
+            Text("Processing...")
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 120)
+        .padding()
+    }
+
+    // MARK: - Result View
+
+    private func resultView(text: String) -> some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+
+                Text("Result")
+                    .font(.system(size: 13, weight: .medium))
+
+                Spacer()
+
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            // Result text
+            ScrollView {
+                Text(text)
+                    .font(.system(size: 13))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+            .frame(maxHeight: 250)
+
+            Divider()
+
+            // Action buttons
+            HStack(spacing: 12) {
+                Button(action: onCopy) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 12))
+                        Text("Copy")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.accentColor)
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(12)
+        }
+    }
+
+    // MARK: - Error View
+
+    private func errorView(message: String) -> some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+
+                Text("Error")
+                    .font(.system(size: 13, weight: .medium))
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 32))
+                    .foregroundColor(.orange)
+
+                Text(message)
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(20)
+        }
     }
 }
 
@@ -303,15 +703,15 @@ class PopupWindowController: NSWindowController {
     private var hostingView: NSHostingView<PopupView>?
     private var searchText = ""
     private var selectedIndex = 0
-    private var isProcessing = false
+    private var state: PopupState = .actionList
     private var customPromptText = ""
-    private var showCustomPrompt = false
     private var clipboardText = ""
+    private var resultText = ""
     private var localMonitor: Any?
 
     init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 400),
             styleMask: [.nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -343,12 +743,13 @@ class PopupWindowController: NSWindowController {
         let view = PopupView(
             searchText: Binding(get: { self.searchText }, set: { self.searchText = $0; self.updateView() }),
             selectedIndex: Binding(get: { self.selectedIndex }, set: { self.selectedIndex = $0 }),
-            isProcessing: Binding(get: { self.isProcessing }, set: { self.isProcessing = $0 }),
+            state: Binding(get: { self.state }, set: { self.state = $0; self.updateView() }),
             customPromptText: Binding(get: { self.customPromptText }, set: { self.customPromptText = $0 }),
-            showCustomPrompt: Binding(get: { self.showCustomPrompt }, set: { self.showCustomPrompt = $0; self.updateView() }),
             actions: actions,
             onSelect: { [weak self] action in self?.selectAction(action) },
-            onCancel: { [weak self] in self?.dismiss() }
+            onCopy: { [weak self] in self?.copyResult() },
+            onBack: { [weak self] in self?.goBack() },
+            onDismiss: { [weak self] in self?.dismiss() }
         )
 
         if hostingView == nil {
@@ -358,7 +759,7 @@ class PopupWindowController: NSWindowController {
             hostingView?.rootView = view
         }
 
-        window?.setContentSize(hostingView?.fittingSize ?? NSSize(width: 280, height: 400))
+        window?.setContentSize(hostingView?.fittingSize ?? NSSize(width: 320, height: 400))
     }
 
     func showAtMouseLocation() {
@@ -368,9 +769,9 @@ class PopupWindowController: NSWindowController {
         // Reset state
         searchText = ""
         selectedIndex = 0
-        isProcessing = false
+        state = .actionList
         customPromptText = ""
-        showCustomPrompt = false
+        resultText = ""
         updateView()
 
         // Position near mouse
@@ -412,6 +813,12 @@ class PopupWindowController: NSWindowController {
         window?.orderOut(nil)
     }
 
+    private func goBack() {
+        state = .actionList
+        customPromptText = ""
+        updateView()
+    }
+
     private func startKeyboardMonitoring() {
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self = self else { return event }
@@ -420,25 +827,35 @@ class PopupWindowController: NSWindowController {
 
             switch event.keyCode {
             case 53: // Escape
-                self.dismiss()
+                switch self.state {
+                case .actionList:
+                    self.dismiss()
+                default:
+                    self.goBack()
+                }
                 return nil
 
             case 125: // Down arrow
-                if self.selectedIndex < actions.count - 1 {
+                if case .actionList = self.state, self.selectedIndex < actions.count - 1 {
                     self.selectedIndex += 1
                     self.updateView()
                 }
                 return nil
 
             case 126: // Up arrow
-                if self.selectedIndex > 0 {
+                if case .actionList = self.state, self.selectedIndex > 0 {
                     self.selectedIndex -= 1
                     self.updateView()
                 }
                 return nil
 
             case 36: // Return/Enter
-                if self.showCustomPrompt {
+                switch self.state {
+                case .actionList:
+                    if self.selectedIndex < actions.count {
+                        self.selectAction(actions[self.selectedIndex])
+                    }
+                case .customPrompt:
                     if !self.customPromptText.isEmpty {
                         let customAction = LLMAction(
                             name: "Custom",
@@ -448,8 +865,10 @@ class PopupWindowController: NSWindowController {
                         )
                         self.selectAction(customAction)
                     }
-                } else if self.selectedIndex < actions.count {
-                    self.selectAction(actions[self.selectedIndex])
+                case .result:
+                    self.copyResult()
+                default:
+                    break
                 }
                 return nil
 
@@ -469,70 +888,70 @@ class PopupWindowController: NSWindowController {
     private func selectAction(_ action: LLMAction) {
         // Handle custom prompt
         if action.name == "Custom prompt..." {
-            showCustomPrompt = true
+            state = .customPrompt
             updateView()
             return
         }
 
-        // Get selected text from clipboard (user should have copied it)
+        // Get selected text from clipboard
         guard !clipboardText.isEmpty else {
-            showNotification(title: "QuickLLM", message: "No text in clipboard. Copy some text first.")
-            dismiss()
+            state = .error("No text in clipboard.\nCopy some text first (⌘C)")
+            updateView()
+            return
+        }
+
+        // Handle TTS action
+        if action.isTTS {
+            state = .processing
+            updateView()
+
+            TTSClient.shared.speak(text: clipboardText) { [weak self] result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success:
+                        self?.showNotification(title: "QuickLLM", message: "Reading aloud...")
+                        self?.dismiss()
+                    case .failure(let error):
+                        self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
+                        self?.updateView()
+                    }
+                }
+            }
             return
         }
 
         // Show processing state
-        isProcessing = true
+        state = .processing
         updateView()
 
         // Build the full prompt
         let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
 
-        // Call Ollama
-        OllamaClient.shared.generate(prompt: fullPrompt) { [weak self] result in
+        // Call LLM backend
+        LLMClient.shared.generate(prompt: fullPrompt) { [weak self] result in
             DispatchQueue.main.async {
-                self?.isProcessing = false
-
                 switch result {
                 case .success(let response):
-                    // Copy result to clipboard
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(response, forType: .string)
-
-                    // Show success notification
-                    self?.showNotification(title: "QuickLLM", message: "Result copied to clipboard")
-
-                    // Try to paste (Cmd+V)
-                    self?.simulatePaste()
-
+                    self?.resultText = response
+                    self?.state = .result(response)
                 case .failure(let error):
-                    self?.showNotification(title: "QuickLLM Error", message: error.localizedDescription)
+                    self?.state = .error(error.localizedDescription)
                 }
-
-                self?.dismiss()
+                self?.updateView()
             }
         }
     }
 
-    private func simulatePaste() {
-        // Small delay to ensure clipboard is ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            let source = CGEventSource(stateID: .hidSystemState)
+    private func copyResult() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(resultText, forType: .string)
 
-            // Key down
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true) // V key
-            keyDown?.flags = .maskCommand
-            keyDown?.post(tap: .cghidEventTap)
-
-            // Key up
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
-            keyUp?.flags = .maskCommand
-            keyUp?.post(tap: .cghidEventTap)
-        }
+        // Show brief feedback then dismiss
+        showNotification(title: "QuickLLM", message: "Copied to clipboard")
+        dismiss()
     }
 
     private func showNotification(title: String, message: String) {
-        // Use osascript for notifications (works reliably on all macOS versions)
         let script = """
         display notification "\(message.replacingOccurrences(of: "\"", with: "\\\""))" with title "\(title.replacingOccurrences(of: "\"", with: "\\\""))"
         """
@@ -588,7 +1007,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "QuickLLM"
-        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Copy text to clipboard\n2. Press Option+Space\n3. Select an action\n\nPowered by Ollama"
+        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Copy text to clipboard\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -597,8 +1016,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Global Hotkey
 
     func registerGlobalHotKey() {
-        // Option + Space
-        let hotKeyID = EventHotKeyID(signature: OSType(0x514C4D), id: 1) // "QLM" + 1
+        let hotKeyID = EventHotKeyID(signature: OSType(0x514C4D), id: 1)
         let modifiers: UInt32 = UInt32(optionKey)
         let keyCode: UInt32 = 49 // Space
 
@@ -608,7 +1026,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if status == noErr {
             globalHotKeyRef = hotKeyRef
 
-            // Install event handler
             var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
                 var hotKeyID = EventHotKeyID()
