@@ -68,7 +68,7 @@ The installer will prompt you to choose:
 
 ### llama.cpp (Recommended)
 
-Lightweight runtime that loads GGUF models directly. No separate app needed.
+Minimal inference server that loads GGUF models directly. No GUI app required.
 
 **Pros:**
 - Smaller footprint
