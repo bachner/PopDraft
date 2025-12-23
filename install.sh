@@ -119,7 +119,11 @@ EOF
 else
     # Ollama setup
     echo "Checking Ollama..."
-    if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+    OLLAMA_RUNNING=false
+    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        OLLAMA_RUNNING=true
+        echo "  [OK] Ollama is running"
+    else
         echo "  [WARN] Ollama doesn't appear to be running at localhost:11434"
         echo "         Please install Ollama from https://ollama.ai and start it"
         echo ""
@@ -128,9 +132,58 @@ else
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             exit 1
         fi
-    else
-        echo "  [OK] Ollama is running"
     fi
+
+    # Model selection
+    SELECTED_MODEL="qwen3-coder:480b-cloud"
+    FALLBACK_MODEL="qwen2.5-coder:7b"
+
+    if [ "$OLLAMA_RUNNING" = true ]; then
+        echo ""
+        echo "Available Ollama models:"
+
+        # Get list of models
+        MODELS=$(curl -s http://localhost:11434/api/tags | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    models = [m['name'] for m in data.get('models', [])]
+    for i, m in enumerate(models[:15], 1):
+        print(f'  {i}) {m}')
+    if len(models) > 15:
+        print(f'  ... and {len(models) - 15} more')
+except:
+    pass
+" 2>/dev/null)
+
+        if [ -n "$MODELS" ]; then
+            echo "$MODELS"
+            echo ""
+            echo "Enter model name for PRIMARY model (cloud models recommended):"
+            echo "  - Cloud models (e.g., qwen3-coder:480b-cloud) use Ollama's servers"
+            echo "  - Local models run on your machine"
+            echo ""
+            read -p "Primary model [default: qwen3-coder:480b-cloud]: " USER_MODEL
+            if [ -n "$USER_MODEL" ]; then
+                SELECTED_MODEL="$USER_MODEL"
+            fi
+
+            echo ""
+            echo "Enter model name for FALLBACK model (local model recommended):"
+            echo "  This is used when the primary model is unavailable."
+            echo ""
+            read -p "Fallback model [default: qwen2.5-coder:7b]: " USER_FALLBACK
+            if [ -n "$USER_FALLBACK" ]; then
+                FALLBACK_MODEL="$USER_FALLBACK"
+            fi
+        else
+            echo "  Could not fetch models. Using defaults."
+        fi
+    fi
+
+    echo ""
+    echo "  Primary model: $SELECTED_MODEL"
+    echo "  Fallback model: $FALLBACK_MODEL"
 
     # Write config
     cat > "$CONFIG_FILE" << EOF
@@ -139,7 +192,8 @@ BACKEND=ollama
 
 # Ollama settings
 OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_MODEL=$SELECTED_MODEL
+OLLAMA_FALLBACK_MODEL=$FALLBACK_MODEL
 
 # llama.cpp settings (not used when BACKEND=ollama)
 LLAMACPP_URL=http://localhost:8080

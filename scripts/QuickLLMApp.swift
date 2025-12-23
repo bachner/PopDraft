@@ -44,7 +44,8 @@ struct LLMConfig {
     var backend: Backend = .ollama
     var ollamaURL: String = "http://localhost:11434"
     var llamacppURL: String = "http://localhost:8080"
-    var ollamaModel: String = "qwen2.5:7b"
+    var ollamaModel: String = "qwen3-coder:480b-cloud"
+    var ollamaFallbackModel: String? = "qwen2.5-coder:7b"
 
     static func load() -> LLMConfig {
         var config = LLMConfig()
@@ -74,6 +75,8 @@ struct LLMConfig {
                 config.llamacppURL = value
             case "OLLAMA_MODEL":
                 config.ollamaModel = value
+            case "OLLAMA_FALLBACK_MODEL":
+                config.ollamaFallbackModel = value.isEmpty ? nil : value
             default:
                 break
             }
@@ -233,6 +236,23 @@ class LLMClient {
     // MARK: - Ollama Backend
 
     private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        // Try primary model first, then fallback
+        generateOllamaWithModel(model: config.ollamaModel, prompt: prompt, systemPrompt: systemPrompt) { [weak self] result in
+            switch result {
+            case .success:
+                completion(result)
+            case .failure(let error):
+                // If primary model fails and we have a fallback, try it
+                if let fallback = self?.config.ollamaFallbackModel {
+                    self?.generateOllamaWithModel(model: fallback, prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+                } else {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func generateOllamaWithModel(model: String, prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
         guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -244,7 +264,7 @@ class LLMClient {
         request.timeoutInterval = 120
 
         var body: [String: Any] = [
-            "model": config.ollamaModel,
+            "model": model,
             "prompt": prompt,
             "stream": false
         ]
@@ -279,6 +299,10 @@ class LLMClient {
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
                     completion(.success(cleaned))
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorMsg = json["error"] as? String {
+                    // Model not found or other Ollama error - trigger fallback
+                    completion(.failure(NSError(domain: errorMsg, code: -1)))
                 } else {
                     completion(.failure(NSError(domain: "Invalid response", code: -1)))
                 }
@@ -415,6 +439,7 @@ struct PopupView: View {
     @Binding var selectedIndex: Int
     @Binding var state: PopupState
     @Binding var customPromptText: String
+    @FocusState private var isSearchFocused: Bool
     let actions: [LLMAction]
     let onSelect: (LLMAction) -> Void
     let onCopy: () -> Void
@@ -455,6 +480,7 @@ struct PopupView: View {
                 TextField("Search actions...", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
+                    .focused($isSearchFocused)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -486,6 +512,12 @@ struct PopupView: View {
                 }
             }
             .frame(maxHeight: 280)
+        }
+        .onAppear {
+            // Focus the search field when action list appears
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isSearchFocused = true
+            }
         }
     }
 
@@ -697,6 +729,13 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+// MARK: - Key Panel (allows text input)
+
+class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 // MARK: - Popup Window Controller
 
 class PopupWindowController: NSWindowController {
@@ -710,7 +749,7 @@ class PopupWindowController: NSWindowController {
     private var localMonitor: Any?
 
     init() {
-        let window = NSPanel(
+        let window = KeyPanel(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 400),
             styleMask: [.nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
@@ -724,6 +763,7 @@ class PopupWindowController: NSWindowController {
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.becomesKeyOnlyIfNeeded = false  // Always become key when shown
 
         super.init(window: window)
 
@@ -962,11 +1002,241 @@ class PopupWindowController: NSWindowController {
     }
 }
 
+// MARK: - Settings Window
+
+struct SettingsView: View {
+    @State private var primaryModel: String = ""
+    @State private var fallbackModel: String = ""
+    @State private var availableModels: [String] = []
+    @State private var isLoading = false
+    @State private var statusMessage: String = ""
+    let onSave: (String, String) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Model Settings")
+                .font(.headline)
+
+            if isLoading {
+                ProgressView("Loading models...")
+                    .padding()
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    // Primary model
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Primary Model")
+                            .font(.system(size: 12, weight: .medium))
+                        if availableModels.isEmpty {
+                            TextField("e.g., qwen3-coder:480b-cloud", text: $primaryModel)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            Picker("", selection: $primaryModel) {
+                                ForEach(availableModels, id: \.self) { model in
+                                    Text(model).tag(model)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        Text("Cloud models (e.g., *-cloud) use Ollama's servers")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Fallback model
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Fallback Model")
+                            .font(.system(size: 12, weight: .medium))
+                        if availableModels.isEmpty {
+                            TextField("e.g., qwen2.5-coder:7b", text: $fallbackModel)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            Picker("", selection: $fallbackModel) {
+                                Text("None").tag("")
+                                ForEach(availableModels, id: \.self) { model in
+                                    Text(model).tag(model)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        Text("Used when primary model is unavailable")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
+                if !statusMessage.isEmpty {
+                    Text(statusMessage)
+                        .font(.system(size: 11))
+                        .foregroundColor(.green)
+                }
+
+                HStack(spacing: 12) {
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                    .keyboardShortcut(.cancelAction)
+
+                    Button("Save") {
+                        onSave(primaryModel, fallbackModel)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(primaryModel.isEmpty)
+                }
+                .padding(.top, 8)
+            }
+        }
+        .padding(20)
+        .frame(width: 350)
+        .onAppear {
+            loadCurrentConfig()
+            fetchModels()
+        }
+    }
+
+    private func loadCurrentConfig() {
+        let config = LLMConfig.load()
+        primaryModel = config.ollamaModel
+        fallbackModel = config.ollamaFallbackModel ?? ""
+    }
+
+    private func fetchModels() {
+        isLoading = true
+        guard let url = URL(string: "http://localhost:11434/api/tags") else {
+            isLoading = false
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            DispatchQueue.main.async {
+                isLoading = false
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let models = json["models"] as? [[String: Any]] else {
+                    return
+                }
+
+                availableModels = models.compactMap { $0["name"] as? String }.sorted()
+
+                // Ensure current selections are in the list
+                if !primaryModel.isEmpty && !availableModels.contains(primaryModel) {
+                    availableModels.insert(primaryModel, at: 0)
+                }
+                if !fallbackModel.isEmpty && !availableModels.contains(fallbackModel) {
+                    availableModels.append(fallbackModel)
+                }
+            }
+        }.resume()
+    }
+}
+
+class SettingsWindowController: NSWindowController {
+    private var hostingView: NSHostingView<SettingsView>?
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 350, height: 300),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "QuickLLM Settings"
+        window.center()
+
+        super.init(window: window)
+
+        let view = SettingsView(
+            onSave: { [weak self] primary, fallback in
+                self?.saveConfig(primary: primary, fallback: fallback)
+                self?.window?.close()
+            },
+            onCancel: { [weak self] in
+                self?.window?.close()
+            }
+        )
+
+        hostingView = NSHostingView(rootView: view)
+        window.contentView = hostingView
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func showWindow() {
+        // Recreate the view to refresh data
+        let view = SettingsView(
+            onSave: { [weak self] primary, fallback in
+                self?.saveConfig(primary: primary, fallback: fallback)
+                self?.window?.close()
+            },
+            onCancel: { [weak self] in
+                self?.window?.close()
+            }
+        )
+        hostingView?.rootView = view
+
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func saveConfig(primary: String, fallback: String) {
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".quickllm/config")
+
+        // Read existing config
+        var lines: [String] = []
+        if let contents = try? String(contentsOf: configPath, encoding: .utf8) {
+            lines = contents.components(separatedBy: .newlines)
+        }
+
+        // Update or add model settings
+        var foundPrimary = false
+        var foundFallback = false
+
+        for i in 0..<lines.count {
+            if lines[i].hasPrefix("OLLAMA_MODEL=") {
+                lines[i] = "OLLAMA_MODEL=\(primary)"
+                foundPrimary = true
+            } else if lines[i].hasPrefix("OLLAMA_FALLBACK_MODEL=") {
+                lines[i] = "OLLAMA_FALLBACK_MODEL=\(fallback)"
+                foundFallback = true
+            }
+        }
+
+        if !foundPrimary {
+            lines.append("OLLAMA_MODEL=\(primary)")
+        }
+        if !foundFallback {
+            lines.append("OLLAMA_FALLBACK_MODEL=\(fallback)")
+        }
+
+        // Write config
+        let newContent = lines.joined(separator: "\n")
+        try? newContent.write(to: configPath, atomically: true, encoding: .utf8)
+
+        // Reload config in LLMClient
+        LLMClient.shared.reloadConfig()
+
+        // Show notification
+        let script = """
+        display notification "Models updated: \(primary)" with title "QuickLLM"
+        """
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = ["-e", script]
+        try? task.run()
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popupController: PopupWindowController?
+    var settingsController: SettingsWindowController?
     var globalHotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -982,13 +1252,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Show Popup (⌥Space)", action: #selector(showPopup), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "About QuickLLM", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
 
-        // Create popup controller
+        // Create controllers
         popupController = PopupWindowController()
+        settingsController = SettingsWindowController()
 
         // Register global hotkey (Option + Space)
         registerGlobalHotKey()
@@ -1002,6 +1274,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showPopup() {
         popupController?.showAtMouseLocation()
+    }
+
+    @objc func showSettings() {
+        settingsController?.showWindow()
     }
 
     @objc func showAbout() {
