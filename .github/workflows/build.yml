@@ -10,19 +10,24 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build PopDraft
+        timeout-minutes: 5
         run: |
-          # Compile the Swift app
-          swiftc -o PopDraft scripts/PopDraft.swift -framework Cocoa -framework Carbon
+          # Show Swift version
+          swiftc --version
+
+          # Compile the Swift app (with optimization for faster build)
+          swiftc -O -o PopDraft scripts/PopDraft.swift -framework Cocoa -framework Carbon
 
           # Verify build
-          ./PopDraft --version 2>/dev/null || echo "Binary built successfully"
+          ls -la PopDraft
+          echo "Binary built successfully"
 
       - name: Get version
         id: version
@@ -53,33 +58,33 @@ jobs:
 
           # Create Info.plist
           cat > "${APP_BUNDLE}/Contents/Info.plist" << PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>PopDraft</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.popdraft.app</string>
-              <key>CFBundleName</key>
-              <string>PopDraft</string>
-              <key>CFBundleDisplayName</key>
-              <string>PopDraft</string>
-              <key>CFBundleVersion</key>
-              <string>${VERSION}</string>
-              <key>CFBundleShortVersionString</key>
-              <string>${VERSION}</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>13.0</string>
-              <key>LSUIElement</key>
-              <true/>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-          </dict>
-          </plist>
-          PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>PopDraft</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.popdraft.app</string>
+    <key>CFBundleName</key>
+    <string>PopDraft</string>
+    <key>CFBundleDisplayName</key>
+    <string>PopDraft</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+PLIST
 
           # Copy resources
           cp -r scripts/ "${APP_BUNDLE}/Contents/Resources/"
@@ -89,17 +94,17 @@ jobs:
 
           # Create launcher script
           cat > "${APP_BUNDLE}/Contents/MacOS/PopDraft-Launcher" << 'LAUNCHER'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          RESOURCES="$DIR/../Resources"
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+RESOURCES="$DIR/../Resources"
 
-          # Run installer on first launch
-          if [ ! -f ~/.popdraft/installed ]; then
-              osascript -e 'tell app "Terminal" to do script "'"$RESOURCES/install.sh"'"'
-          else
-              exec "$DIR/PopDraft"
-          fi
-          LAUNCHER
+# Run installer on first launch
+if [ ! -f ~/.popdraft/installed ]; then
+    osascript -e 'tell app "Terminal" to do script "'"$RESOURCES/install.sh"'"'
+else
+    exec "$DIR/PopDraft"
+fi
+LAUNCHER
           chmod +x "${APP_BUNDLE}/Contents/MacOS/PopDraft-Launcher"
 
           # Create Applications symlink
@@ -109,6 +114,7 @@ jobs:
           hdiutil create -volname "${APP_NAME}" -srcfolder "${BUILD_DIR}" -ov -format UDZO "build/${DMG_NAME}.dmg"
 
           echo "DMG created: build/${DMG_NAME}.dmg"
+          ls -la build/
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
