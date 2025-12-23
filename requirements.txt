@@ -1,0 +1,6 @@
+# LLM Mac Python Dependencies
+# For Text-to-Speech (Kokoro-82M)
+
+kokoro>=0.9.4
+soundfile>=0.12.0
+numpy>=1.24.0
