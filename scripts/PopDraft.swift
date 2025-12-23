@@ -440,6 +440,7 @@ struct PopupView: View {
     @Binding var state: PopupState
     @Binding var customPromptText: String
     @FocusState private var isSearchFocused: Bool
+    @FocusState private var isCustomPromptFocused: Bool
     let allActions: [LLMAction]
     let onSelect: (LLMAction) -> Void
     let onCopy: () -> Void
@@ -561,6 +562,8 @@ struct PopupView: View {
                     .padding(8)
                     .background(Color(NSColor.textBackgroundColor))
                     .cornerRadius(6)
+                    .focused($isCustomPromptFocused)
+                    .onAppear { isCustomPromptFocused = true }
 
                 Text("Press Enter to process")
                     .font(.system(size: 11))
@@ -896,6 +899,7 @@ class PopupWindowController: NSWindowController {
 
         // Start monitoring keyboard
         startKeyboardMonitoring()
+        updateView()
         // Make the app active so we can receive key events
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -916,7 +920,7 @@ class PopupWindowController: NSWindowController {
             guard let self = self else { return event }
 
             let actions = ActionManager.shared.filteredActions(searchText: self.searchText)
-            updateView()
+
             switch event.keyCode {
             case 53: // Escape
                 switch self.state {
