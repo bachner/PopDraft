@@ -71,14 +71,14 @@ Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> 
 - `llm-config.sh` - Configuration helper with unified API abstraction
 
 **Popup Menu App (Primary Interface):**
-- `QuickLLMApp.swift` - Native macOS menu bar app with floating popup
+- `PopDraft.swift` - Native macOS menu bar app with floating popup
   - Global hotkey: Option+Space
   - Searchable action list with 7 actions (including TTS)
   - Result preview with Copy button (no auto-paste)
   - State machine: actionList -> processing -> result/error
   - Reads config from ~/.quickllm/config for backend selection
   - TTS integration via HTTP server at localhost:7865
-  - LaunchAgent: `~/Library/LaunchAgents/com.quickllm.app.plist`
+  - LaunchAgent: `~/Library/LaunchAgents/com.popdraft.app.plist`
 
 **Core Engine (for keyboard shortcuts):**
 - `llm-config.sh` - Unified API abstraction for both backends
@@ -131,7 +131,7 @@ LLAMACPP_URL=http://localhost:8080
 LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 ```
 
-**Switching backends:** Edit `~/.quickllm/config`, change `BACKEND=`, then restart QuickLLMApp.
+**Switching backends:** Edit `~/.quickllm/config`, change `BACKEND=`, then restart PopDraft.
 
 **API endpoints:**
 - llama.cpp: `http://localhost:8080` (OpenAI-compatible `/v1/chat/completions`)

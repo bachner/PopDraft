@@ -156,7 +156,7 @@ LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 
 1. Edit `~/.quickllm/config`
 2. Change `BACKEND=ollama` or `BACKEND=llamacpp`
-3. Restart QuickLLMApp (or log out/in)
+3. Restart PopDraft (or log out/in)
 
 ### Change Model
 
@@ -168,7 +168,7 @@ LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 **For Ollama:**
 1. Pull the model: `ollama pull model-name`
 2. Update `OLLAMA_MODEL` in config
-3. Restart QuickLLMApp
+3. Restart PopDraft
 
 ### Change Keyboard Shortcuts
 
@@ -178,7 +178,7 @@ Find QuickLLM services under "Text" and double-click to change.
 
 ### Change Popup Hotkey
 
-Edit and recompile `scripts/QuickLLMApp.swift` - modify the `registerGlobalHotKey()` function.
+Edit and recompile `scripts/PopDraft.swift` - modify the `registerGlobalHotKey()` function.
 
 ## File Structure
 
@@ -189,7 +189,7 @@ quickllm/
 ├── build-dmg.sh            # DMG builder
 ├── scripts/
 │   ├── llm-config.sh       # Configuration & API abstraction
-│   ├── QuickLLMApp.swift   # Popup menu app
+│   ├── PopDraft.swift      # Popup menu app
 │   ├── llm-process.sh      # Core LLM processing
 │   ├── llm-clipboard.sh    # Clipboard handler
 │   ├── llm-grammar.sh      # Grammar check
@@ -213,8 +213,8 @@ quickllm/
 
 ### Popup not appearing
 
-1. Check if QuickLLMApp is running: `pgrep -f QuickLLMApp`
-2. Start it manually: `~/bin/QuickLLMApp &`
+1. Check if PopDraft is running: `pgrep -f PopDraft`
+2. Start it manually: `~/bin/PopDraft &`
 3. Check for the sparkles icon in the menu bar
 
 ### Shortcuts not working

@@ -1,5 +1,5 @@
 #!/usr/bin/env swift
-// QuickLLM - Popup Menu App
+// PopDraft - Popup Menu App
 // A menu bar app that shows a floating action popup for text processing
 
 import Cocoa
@@ -440,11 +440,19 @@ struct PopupView: View {
     @Binding var state: PopupState
     @Binding var customPromptText: String
     @FocusState private var isSearchFocused: Bool
-    let actions: [LLMAction]
+    let allActions: [LLMAction]
     let onSelect: (LLMAction) -> Void
     let onCopy: () -> Void
     let onBack: () -> Void
     let onDismiss: () -> Void
+
+    // Computed filtered actions - recomputes when searchText changes
+    private var actions: [LLMAction] {
+        if searchText.isEmpty {
+            return allActions
+        }
+        return allActions.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -775,17 +783,18 @@ class PopupWindowController: NSWindowController {
     }
 
     private func updateView() {
-        let actions = ActionManager.shared.filteredActions(searchText: searchText)
-        if selectedIndex >= actions.count {
-            selectedIndex = max(0, actions.count - 1)
-        }
-
         let view = PopupView(
-            searchText: Binding(get: { self.searchText }, set: { self.searchText = $0; self.updateView() }),
+            searchText: Binding(
+                get: { self.searchText },
+                set: { newValue in
+                    self.searchText = newValue
+                    self.selectedIndex = 0  // Reset selection when searching
+                }
+            ),
             selectedIndex: Binding(get: { self.selectedIndex }, set: { self.selectedIndex = $0 }),
             state: Binding(get: { self.state }, set: { self.state = $0; self.updateView() }),
             customPromptText: Binding(get: { self.customPromptText }, set: { self.customPromptText = $0 }),
-            actions: actions,
+            allActions: ActionManager.shared.actions,
             onSelect: { [weak self] action in self?.selectAction(action) },
             onCopy: { [weak self] in self?.copyResult() },
             onBack: { [weak self] in self?.goBack() },
@@ -949,7 +958,7 @@ class PopupWindowController: NSWindowController {
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
-                        self?.showNotification(title: "QuickLLM", message: "Reading aloud...")
+                        self?.showNotification(title: "PopDraft", message: "Reading aloud...")
                         self?.dismiss()
                     case .failure(let error):
                         self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
@@ -987,7 +996,7 @@ class PopupWindowController: NSWindowController {
         NSPasteboard.general.setString(resultText, forType: .string)
 
         // Show brief feedback then dismiss
-        showNotification(title: "QuickLLM", message: "Copied to clipboard")
+        showNotification(title: "PopDraft", message: "Copied to clipboard")
         dismiss()
     }
 
@@ -1141,7 +1150,7 @@ class SettingsWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "QuickLLM Settings"
+        window.title = "PopDraft Settings"
         window.center()
 
         super.init(window: window)
@@ -1222,7 +1231,7 @@ class SettingsWindowController: NSWindowController {
 
         // Show notification
         let script = """
-        display notification "Models updated: \(primary)" with title "QuickLLM"
+        display notification "Models updated: \(primary)" with title "PopDraft"
         """
         let task = Process()
         task.launchPath = "/usr/bin/osascript"
@@ -1244,7 +1253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "QuickLLM")
+            button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "PopDraft")
             button.image?.isTemplate = true
         }
 
@@ -1253,7 +1262,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Show Popup (⌥Space)", action: #selector(showPopup), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "About QuickLLM", action: #selector(showAbout), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "About PopDraft", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
@@ -1265,7 +1274,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Register global hotkey (Option + Space)
         registerGlobalHotKey()
 
-        print("QuickLLM started. Press Option+Space to show popup.")
+        print("PopDraft started. Press Option+Space to show popup.")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1282,7 +1291,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "QuickLLM"
+        alert.messageText = "PopDraft"
         alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Copy text to clipboard\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")

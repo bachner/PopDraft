@@ -369,20 +369,20 @@ else
 fi
 
 # Popup app (menu bar)
-if swiftc -O -o ~/bin/QuickLLMApp "$SCRIPT_DIR/scripts/QuickLLMApp.swift" -framework Cocoa -framework Carbon 2>/dev/null; then
-    echo "[OK] QuickLLM popup app compiled"
+if swiftc -O -o ~/bin/PopDraft "$SCRIPT_DIR/scripts/PopDraft.swift" -framework Cocoa -framework Carbon 2>/dev/null; then
+    echo "[OK] PopDraft app compiled"
 
     # Create LaunchAgent for popup app
-    cat > ~/Library/LaunchAgents/com.quickllm.app.plist << 'PLIST'
+    cat > ~/Library/LaunchAgents/com.popdraft.app.plist << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.quickllm.app</string>
+    <string>com.popdraft.app</string>
     <key>ProgramArguments</key>
     <array>
-        <string>HOME_DIR/bin/QuickLLMApp</string>
+        <string>HOME_DIR/bin/PopDraft</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -391,12 +391,12 @@ if swiftc -O -o ~/bin/QuickLLMApp "$SCRIPT_DIR/scripts/QuickLLMApp.swift" -frame
 </dict>
 </plist>
 PLIST
-    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.quickllm.app.plist
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
-    echo "[OK] QuickLLM popup app set to auto-start"
+    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.popdraft.app.plist
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    echo "[OK] PopDraft app set to auto-start"
 else
-    echo "[WARN] Could not compile QuickLLM popup app"
+    echo "[WARN] Could not compile PopDraft app"
 fi
 
 # Make executable

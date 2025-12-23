@@ -24,9 +24,12 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f ~/Library/LaunchAgents/com.quickllm.llama-server.plist
     pkill -f "llama-server.*8080" 2>/dev/null || true
 
-    # Popup app
+    # Popup app (PopDraft)
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.popdraft.app.plist
     launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.quickllm.app.plist
+    pkill -f PopDraft 2>/dev/null || true
     pkill -f QuickLLMApp 2>/dev/null || true
     echo "[OK] Services stopped"
 
@@ -46,6 +49,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f ~/bin/llm-tts-server.py
     rm -f ~/bin/LLMChat
     rm -f ~/bin/LLMChat.swift
+    rm -f ~/bin/PopDraft
     rm -f ~/bin/QuickLLMApp
     rm -f ~/bin/setup-workflows.sh
     rm -f ~/.llm-tts-server.pid

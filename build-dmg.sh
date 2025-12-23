@@ -96,15 +96,15 @@ cp "${SCRIPT_DIR}/scripts/llm-tts-server.py" "${APP_BUNDLE}/Contents/Resources/s
 cp "${SCRIPT_DIR}/scripts/llm-chat-gui.py" "${APP_BUNDLE}/Contents/Resources/scripts/" 2>/dev/null || true
 cp "${SCRIPT_DIR}/scripts/llm-chat-gui.sh" "${APP_BUNDLE}/Contents/Resources/scripts/" 2>/dev/null || true
 cp "${SCRIPT_DIR}/scripts/LLMChat.swift" "${APP_BUNDLE}/Contents/Resources/scripts/"
-cp "${SCRIPT_DIR}/scripts/QuickLLMApp.swift" "${APP_BUNDLE}/Contents/Resources/scripts/"
+cp "${SCRIPT_DIR}/scripts/PopDraft.swift" "${APP_BUNDLE}/Contents/Resources/scripts/"
 cp "${SCRIPT_DIR}/scripts/setup-workflows.sh" "${APP_BUNDLE}/Contents/Resources/scripts/"
 
 # Copy pre-compiled binaries if they exist
 if [ -f "${SCRIPT_DIR}/scripts/LLMChat" ]; then
     cp "${SCRIPT_DIR}/scripts/LLMChat" "${APP_BUNDLE}/Contents/Resources/scripts/"
 fi
-if [ -f "${SCRIPT_DIR}/scripts/QuickLLMApp" ]; then
-    cp "${SCRIPT_DIR}/scripts/QuickLLMApp" "${APP_BUNDLE}/Contents/Resources/scripts/"
+if [ -f "${SCRIPT_DIR}/scripts/PopDraft" ]; then
+    cp "${SCRIPT_DIR}/scripts/PopDraft" "${APP_BUNDLE}/Contents/Resources/scripts/"
 fi
 
 # Copy root files
@@ -246,32 +246,32 @@ elif [ -f "${SCRIPTS_SRC}/LLMChat.swift" ]; then
     fi
 fi
 
-# Popup app
-if [ -f "${SCRIPTS_SRC}/QuickLLMApp" ]; then
-    cp "${SCRIPTS_SRC}/QuickLLMApp" ~/bin/
-    chmod +x ~/bin/QuickLLMApp
-    echo "  Installed pre-compiled QuickLLMApp"
-elif [ -f "${SCRIPTS_SRC}/QuickLLMApp.swift" ]; then
-    cp "${SCRIPTS_SRC}/QuickLLMApp.swift" ~/bin/
-    if swiftc -O -o ~/bin/QuickLLMApp ~/bin/QuickLLMApp.swift -framework Cocoa -framework Carbon 2>/dev/null; then
-        echo "  Compiled QuickLLMApp successfully"
+# Popup app (PopDraft)
+if [ -f "${SCRIPTS_SRC}/PopDraft" ]; then
+    cp "${SCRIPTS_SRC}/PopDraft" ~/bin/
+    chmod +x ~/bin/PopDraft
+    echo "  Installed pre-compiled PopDraft"
+elif [ -f "${SCRIPTS_SRC}/PopDraft.swift" ]; then
+    cp "${SCRIPTS_SRC}/PopDraft.swift" ~/bin/
+    if swiftc -O -o ~/bin/PopDraft ~/bin/PopDraft.swift -framework Cocoa -framework Carbon 2>/dev/null; then
+        echo "  Compiled PopDraft successfully"
     else
-        echo "  WARNING: Could not compile QuickLLMApp"
+        echo "  WARNING: Could not compile PopDraft"
     fi
 fi
 
 # Setup popup app auto-start
-if [ -f ~/bin/QuickLLMApp ]; then
-    cat > ~/Library/LaunchAgents/com.quickllm.app.plist << 'LAUNCHPLIST'
+if [ -f ~/bin/PopDraft ]; then
+    cat > ~/Library/LaunchAgents/com.popdraft.app.plist << 'LAUNCHPLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.quickllm.app</string>
+    <string>com.popdraft.app</string>
     <key>ProgramArguments</key>
     <array>
-        <string>HOME_DIR/bin/QuickLLMApp</string>
+        <string>HOME_DIR/bin/PopDraft</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -280,10 +280,10 @@ if [ -f ~/bin/QuickLLMApp ]; then
 </dict>
 </plist>
 LAUNCHPLIST
-    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.quickllm.app.plist
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
-    echo "  QuickLLM popup app set to auto-start"
+    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.popdraft.app.plist
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    echo "  PopDraft app set to auto-start"
 fi
 
 # Add ~/bin to PATH if not already there
