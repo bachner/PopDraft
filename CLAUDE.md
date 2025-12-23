@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-QuickLLM is a macOS tool that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp or Ollama) for text generation and Kokoro-82M for neural TTS, accessible from any application.
+PopDraft is a macOS tool that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp or Ollama) for text generation and Kokoro-82M for neural TTS, accessible from any application.
 
 ## Key Commands
 
@@ -21,7 +21,7 @@ QuickLLM is a macOS tool that provides system-wide LLM text processing via keybo
 ./uninstall.sh            # Clean removal
 
 # Build DMG for distribution
-./build-dmg.sh 1.0.0      # Creates build/QuickLLM-1.0.0.dmg
+./build-dmg.sh 1.0.0      # Creates build/PopDraft-1.0.0.dmg
 
 # Workflow setup (regenerate shortcuts)
 ./scripts/setup-workflows.sh
@@ -34,14 +34,14 @@ brew install espeak-ng
 pip install kokoro soundfile numpy
 
 # TTS server management
-launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist    # Start
-launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist  # Stop
+launchctl load ~/Library/LaunchAgents/com.popdraft.tts-server.plist    # Start
+launchctl unload ~/Library/LaunchAgents/com.popdraft.tts-server.plist  # Stop
 tail -f /tmp/llm-tts-server.log                                         # Logs
 curl http://127.0.0.1:7865/health                                       # Health check
 
 # llama.cpp server management (if using llama.cpp backend)
-launchctl load ~/Library/LaunchAgents/com.quickllm.llama-server.plist   # Start
-launchctl unload ~/Library/LaunchAgents/com.quickllm.llama-server.plist # Stop
+launchctl load ~/Library/LaunchAgents/com.popdraft.llama-server.plist   # Start
+launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist # Stop
 tail -f /tmp/llm-llama-server.log                                        # Logs
 curl http://localhost:8080/health                                        # Health check
 
@@ -66,8 +66,8 @@ Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> 
 ### Component Layers
 
 **Configuration:**
-- `~/.quickllm/config` - Backend selection and settings (ollama or llamacpp)
-- `~/.quickllm/models/` - GGUF model storage for llama.cpp
+- `~/.popdraft/config` - Backend selection and settings (ollama or llamacpp)
+- `~/.popdraft/models/` - GGUF model storage for llama.cpp
 - `llm-config.sh` - Configuration helper with unified API abstraction
 
 **Popup Menu App (Primary Interface):**
@@ -76,7 +76,7 @@ Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> 
   - Searchable action list with 7 actions (including TTS)
   - Result preview with Copy button (no auto-paste)
   - State machine: actionList -> processing -> result/error
-  - Reads config from ~/.quickllm/config for backend selection
+  - Reads config from ~/.popdraft/config for backend selection
   - TTS integration via HTTP server at localhost:7865
   - LaunchAgent: `~/Library/LaunchAgents/com.popdraft.app.plist`
 
@@ -97,10 +97,10 @@ Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> 
 - `llm-tts-server.py` - Persistent TTS server (keeps model loaded, ~400-600MB RAM)
 - `llm-tts.py` - Client that uses server if running, falls back to direct loading
 - `llm-tts.sh` - Shell wrapper for clipboard integration
-- LaunchAgent: `~/Library/LaunchAgents/com.quickllm.tts-server.plist` (auto-start on login)
+- LaunchAgent: `~/Library/LaunchAgents/com.popdraft.tts-server.plist` (auto-start on login)
 
 **LLM Server (llama.cpp backend only):**
-- LaunchAgent: `~/Library/LaunchAgents/com.quickllm.llama-server.plist`
+- LaunchAgent: `~/Library/LaunchAgents/com.popdraft.llama-server.plist`
 - Runs `llama-server` with configured model on port 8080
 
 **System Integration:**
@@ -116,7 +116,7 @@ Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> 
 
 ## Configuration
 
-**Config file:** `~/.quickllm/config`
+**Config file:** `~/.popdraft/config`
 
 ```bash
 # Backend: ollama or llamacpp
@@ -128,10 +128,10 @@ OLLAMA_MODEL=qwen2.5:7b
 
 # llama.cpp settings
 LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
+LLAMACPP_MODEL_PATH=~/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
 ```
 
-**Switching backends:** Edit `~/.quickllm/config`, change `BACKEND=`, then restart PopDraft.
+**Switching backends:** Edit `~/.popdraft/config`, change `BACKEND=`, then restart PopDraft.
 
 **API endpoints:**
 - llama.cpp: `http://localhost:8080` (OpenAI-compatible `/v1/chat/completions`)
@@ -151,8 +151,8 @@ LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 ## Installation Targets
 
 - Scripts: `~/bin/`
-- Config: `~/.quickllm/config`
-- Models: `~/.quickllm/models/`
+- Config: `~/.popdraft/config`
+- Models: `~/.popdraft/models/`
 - Workflows: `~/Library/Services/`
 - LaunchAgents: `~/Library/LaunchAgents/`
 - PATH update: `~/.zshrc` or `~/.bashrc`

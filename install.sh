@@ -1,10 +1,10 @@
 #!/bin/bash
-# QuickLLM Installer
+# PopDraft Installer
 # Installs LLM text processing tools for macOS
 
 set -e
 
-echo "QuickLLM Installer"
+echo "PopDraft Installer"
 echo "===================="
 echo ""
 
@@ -12,7 +12,7 @@ echo ""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Config directory
-CONFIG_DIR="$HOME/.quickllm"
+CONFIG_DIR="$HOME/.popdraft"
 CONFIG_FILE="$CONFIG_DIR/config"
 MODELS_DIR="$CONFIG_DIR/models"
 
@@ -83,7 +83,7 @@ if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
             ;;
         4)
             echo "  Skipping model download."
-            echo "  Set LLAMACPP_MODEL_PATH in ~/.quickllm/config to your model path."
+            echo "  Set LLAMACPP_MODEL_PATH in ~/.popdraft/config to your model path."
             MODEL_FILE=""
             ;;
     esac
@@ -102,7 +102,7 @@ if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
 
     # Write config
     cat > "$CONFIG_FILE" << EOF
-# QuickLLM Configuration
+# PopDraft Configuration
 BACKEND=llamacpp
 
 # Ollama settings (not used when BACKEND=llamacpp)
@@ -187,7 +187,7 @@ except:
 
     # Write config
     cat > "$CONFIG_FILE" << EOF
-# QuickLLM Configuration
+# PopDraft Configuration
 BACKEND=ollama
 
 # Ollama settings
@@ -252,13 +252,13 @@ fi
 echo "  Setting up TTS server auto-start..."
 mkdir -p ~/Library/LaunchAgents
 
-cat > ~/Library/LaunchAgents/com.quickllm.tts-server.plist << 'PLIST'
+cat > ~/Library/LaunchAgents/com.popdraft.tts-server.plist << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.quickllm.tts-server</string>
+    <string>com.popdraft.tts-server</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
@@ -284,13 +284,13 @@ cat > ~/Library/LaunchAgents/com.quickllm.tts-server.plist << 'PLIST'
 PLIST
 
 # Replace HOME_DIR placeholder with actual home directory
-sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.quickllm.tts-server.plist
+sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.popdraft.tts-server.plist
 
 # Stop any existing TTS server and load the LaunchAgent
-launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
+launchctl unload ~/Library/LaunchAgents/com.popdraft.tts-server.plist 2>/dev/null || true
 pkill -f llm-tts-server.py 2>/dev/null || true
 sleep 1
-launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.popdraft.tts-server.plist 2>/dev/null || true
 
 echo "  [OK] TTS server configured (auto-starts on login, ~400-600MB RAM)"
 
@@ -299,13 +299,13 @@ if [ "$SELECTED_BACKEND" = "llamacpp" ] && [ -n "$MODEL_FILE" ]; then
     echo ""
     echo "Setting up llama.cpp server auto-start..."
 
-    cat > ~/Library/LaunchAgents/com.quickllm.llama-server.plist << PLIST
+    cat > ~/Library/LaunchAgents/com.popdraft.llama-server.plist << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.quickllm.llama-server</string>
+    <string>com.popdraft.llama-server</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/llama-server</string>
@@ -335,14 +335,14 @@ PLIST
 
     # Check if llama-server is in /usr/local/bin instead (Intel Macs)
     if [ ! -f /opt/homebrew/bin/llama-server ] && [ -f /usr/local/bin/llama-server ]; then
-        sed -i '' "s|/opt/homebrew/bin/llama-server|/usr/local/bin/llama-server|g" ~/Library/LaunchAgents/com.quickllm.llama-server.plist
+        sed -i '' "s|/opt/homebrew/bin/llama-server|/usr/local/bin/llama-server|g" ~/Library/LaunchAgents/com.popdraft.llama-server.plist
     fi
 
     # Stop any existing llama server and load the LaunchAgent
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>/dev/null || true
     pkill -f "llama-server.*8080" 2>/dev/null || true
     sleep 1
-    launchctl load ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>/dev/null || true
 
     echo "  [OK] llama.cpp server configured (auto-starts on login)"
     echo "  [INFO] Server will start loading model in background..."
@@ -419,7 +419,7 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
     if [ -n "$SHELL_RC" ]; then
         if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$SHELL_RC"; then
             echo '' >> "$SHELL_RC"
-            echo '# QuickLLM tools' >> "$SHELL_RC"
+            echo '# PopDraft tools' >> "$SHELL_RC"
             echo 'export PATH="$HOME/bin:$PATH"' >> "$SHELL_RC"
             echo "[OK] Added ~/bin to PATH in $SHELL_RC"
         fi
@@ -456,8 +456,8 @@ echo ""
 echo "Usage: Select text, copy it (Cmd+C), then press Option+Space"
 echo "       Or use keyboard shortcuts directly on selected text"
 echo ""
-echo "Configuration: ~/.quickllm/config"
-echo "To switch backends, edit the config file and restart QuickLLM."
+echo "Configuration: ~/.popdraft/config"
+echo "To switch backends, edit the config file and restart PopDraft."
 echo ""
 echo "Note: You may need to restart apps for shortcuts to take effect."
 echo "      Customize shortcuts in: System Settings > Keyboard > Keyboard Shortcuts > Services"

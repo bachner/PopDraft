@@ -1,11 +1,11 @@
 #!/bin/bash
-# QuickLLM Uninstaller
+# PopDraft Uninstaller
 
-echo "QuickLLM Uninstaller"
+echo "PopDraft Uninstaller"
 echo "======================"
 echo ""
 
-read -p "This will remove all QuickLLM scripts and workflows. Continue? (y/n) " -n 1 -r
+read -p "This will remove all PopDraft scripts and workflows. Continue? (y/n) " -n 1 -r
 echo
 
 if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -13,24 +13,24 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Stopping services..."
 
     # TTS server
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
-    rm -f ~/Library/LaunchAgents/com.quickllm.tts-server.plist
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.tts-server.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.popdraft.tts-server.plist
     launchctl unload ~/Library/LaunchAgents/com.llm-mac.tts-server.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.llm-mac.tts-server.plist
     pkill -f llm-tts-server.py 2>/dev/null || true
 
     # llama.cpp server
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.llama-server.plist 2>/dev/null || true
-    rm -f ~/Library/LaunchAgents/com.quickllm.llama-server.plist
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.popdraft.llama-server.plist
     pkill -f "llama-server.*8080" 2>/dev/null || true
 
     # Popup app (PopDraft)
     launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.popdraft.app.plist
-    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
-    rm -f ~/Library/LaunchAgents/com.quickllm.app.plist
+    launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.popdraft.app.plist
     pkill -f PopDraft 2>/dev/null || true
-    pkill -f QuickLLMApp 2>/dev/null || true
+    pkill -f PopDraftApp 2>/dev/null || true
     echo "[OK] Services stopped"
 
     echo ""
@@ -50,7 +50,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f ~/bin/LLMChat
     rm -f ~/bin/LLMChat.swift
     rm -f ~/bin/PopDraft
-    rm -f ~/bin/QuickLLMApp
+    rm -f ~/bin/PopDraftApp
     rm -f ~/bin/setup-workflows.sh
     rm -f ~/.llm-tts-server.pid
     echo "[OK] Scripts and apps removed"
@@ -66,13 +66,13 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "[OK] Workflows removed"
 
     echo ""
-    read -p "Remove configuration and models (~/.quickllm)? (y/n) " -n 1 -r
+    read -p "Remove configuration and models (~/.popdraft)? (y/n) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf ~/.quickllm
+        rm -rf ~/.popdraft
         echo "[OK] Configuration and models removed"
     else
-        echo "[SKIP] Configuration preserved at ~/.quickllm"
+        echo "[SKIP] Configuration preserved at ~/.popdraft"
     fi
 
     echo ""

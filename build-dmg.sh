@@ -1,18 +1,18 @@
 #!/bin/bash
-# Build DMG installer for QuickLLM
+# Build DMG installer for PopDraft
 # Creates a distributable disk image with drag-to-install
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VERSION="${1:-1.0.0}"
-APP_NAME="QuickLLM"
-DMG_NAME="QuickLLM-${VERSION}"
+APP_NAME="PopDraft"
+DMG_NAME="PopDraft-${VERSION}"
 BUILD_DIR="${SCRIPT_DIR}/build"
 DMG_DIR="${BUILD_DIR}/dmg"
 APP_BUNDLE="${DMG_DIR}/${APP_NAME}.app"
 
-echo "Building QuickLLM DMG v${VERSION}..."
+echo "Building PopDraft DMG v${VERSION}..."
 
 # Clean previous build
 rm -rf "${BUILD_DIR}"
@@ -33,15 +33,15 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << 'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>QuickLLM Installer</string>
+    <string>PopDraft Installer</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.quickllm.installer</string>
+    <string>com.popdraft.installer</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>QuickLLM</string>
+    <string>PopDraft</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -59,9 +59,9 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << 'PLIST'
 PLIST
 
 # Create the installer launcher script
-cat > "${APP_BUNDLE}/Contents/MacOS/QuickLLM Installer" << 'LAUNCHER'
+cat > "${APP_BUNDLE}/Contents/MacOS/PopDraft Installer" << 'LAUNCHER'
 #!/bin/bash
-# QuickLLM Installer Launcher
+# PopDraft Installer Launcher
 # This script runs the installation from within the .app bundle
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -76,7 +76,7 @@ end tell
 EOF
 LAUNCHER
 
-chmod +x "${APP_BUNDLE}/Contents/MacOS/QuickLLM Installer"
+chmod +x "${APP_BUNDLE}/Contents/MacOS/PopDraft Installer"
 
 # Copy all necessary files to Resources
 echo "Copying resources..."
@@ -116,7 +116,7 @@ cp "${SCRIPT_DIR}/README.md" "${APP_BUNDLE}/Contents/Resources/"
 # Create a modified install.sh that works from the app bundle
 cat > "${APP_BUNDLE}/Contents/Resources/install.sh" << 'INSTALLER'
 #!/bin/bash
-# QuickLLM Installer (bundled version)
+# PopDraft Installer (bundled version)
 # Installs LLM text processing tools with system-wide keyboard shortcuts
 
 set -e
@@ -125,7 +125,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_SRC="${SCRIPT_DIR}/scripts"
 
 echo "=========================================="
-echo "  QuickLLM Installer"
+echo "  PopDraft Installer"
 echo "=========================================="
 echo ""
 
@@ -194,13 +194,13 @@ echo ""
 echo "Setting up TTS server auto-start..."
 mkdir -p ~/Library/LaunchAgents
 
-cat > ~/Library/LaunchAgents/com.quickllm.tts-server.plist << 'PLIST'
+cat > ~/Library/LaunchAgents/com.popdraft.tts-server.plist << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.quickllm.tts-server</string>
+    <string>com.popdraft.tts-server</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
@@ -221,11 +221,11 @@ cat > ~/Library/LaunchAgents/com.quickllm.tts-server.plist << 'PLIST'
 PLIST
 
 # Fix the path expansion in plist
-sed -i '' "s|~/bin|$HOME/bin|g" ~/Library/LaunchAgents/com.quickllm.tts-server.plist
+sed -i '' "s|~/bin|$HOME/bin|g" ~/Library/LaunchAgents/com.popdraft.tts-server.plist
 
 # Load the LaunchAgent
-launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
-launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist
+launchctl unload ~/Library/LaunchAgents/com.popdraft.tts-server.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.popdraft.tts-server.plist
 echo "  TTS server configured for auto-start"
 
 # Compile native apps
@@ -299,7 +299,7 @@ fi
 if [ -n "$SHELL_RC" ]; then
     if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$SHELL_RC" 2>/dev/null; then
         echo '' >> "$SHELL_RC"
-        echo '# QuickLLM tools' >> "$SHELL_RC"
+        echo '# PopDraft tools' >> "$SHELL_RC"
         echo 'export PATH="$HOME/bin:$PATH"' >> "$SHELL_RC"
         echo "  Added ~/bin to PATH in $SHELL_RC"
     else
@@ -388,10 +388,10 @@ ln -s /Applications "${DMG_DIR}/Applications"
 
 # Create README for the DMG
 cat > "${DMG_DIR}/README.txt" << 'README'
-QuickLLM - System-wide AI Text Processing for macOS
+PopDraft - System-wide AI Text Processing for macOS
 
 INSTALLATION:
-1. Double-click "QuickLLM.app" to run the installer
+1. Double-click "PopDraft.app" to run the installer
 2. Follow the prompts in Terminal
 3. Grant Accessibility permissions when prompted
 

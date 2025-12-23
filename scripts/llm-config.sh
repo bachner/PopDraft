@@ -1,8 +1,8 @@
 #!/bin/bash
-# QuickLLM Configuration Helper
+# PopDraft Configuration Helper
 # Provides functions for reading config and API abstraction
 
-CONFIG_DIR="$HOME/.quickllm"
+CONFIG_DIR="$HOME/.popdraft"
 CONFIG_FILE="$CONFIG_DIR/config"
 
 # Default values
@@ -10,14 +10,14 @@ DEFAULT_BACKEND="ollama"
 DEFAULT_OLLAMA_URL="http://localhost:11434"
 DEFAULT_LLAMACPP_URL="http://localhost:8080"
 DEFAULT_MODEL="qwen2.5:7b"
-DEFAULT_LLAMACPP_MODEL="$HOME/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf"
+DEFAULT_LLAMACPP_MODEL="$HOME/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf"
 
 # Initialize config if it doesn't exist
 init_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         mkdir -p "$CONFIG_DIR"
         cat > "$CONFIG_FILE" << EOF
-# QuickLLM Configuration
+# PopDraft Configuration
 # Backend: ollama or llamacpp
 BACKEND=ollama
 
@@ -27,7 +27,7 @@ OLLAMA_MODEL=qwen2.5:7b
 
 # llama.cpp settings
 LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=$HOME/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
+LLAMACPP_MODEL_PATH=$HOME/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
 EOF
     fi
 }
@@ -257,7 +257,7 @@ select_backend() {
 # If script is run directly, show config
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     load_config
-    echo "QuickLLM Configuration:"
+    echo "PopDraft Configuration:"
     echo "  Configured backend: $BACKEND"
     echo ""
     echo "Backend Status:"

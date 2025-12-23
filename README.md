@@ -1,11 +1,11 @@
-# QuickLLM
+# PopDraft
 
 System-wide AI text processing for macOS. Select text, press a shortcut, and get AI-powered improvements instantly.
 
 ## Features
 
 ### Popup Menu (Option+Space)
-The easiest way to use QuickLLM - a floating action menu that appears near your cursor:
+The easiest way to use PopDraft - a floating action menu that appears near your cursor:
 
 - **Fix grammar and spelling** - Correct errors while preserving tone
 - **Articulate** - Make text clearer and more professional
@@ -40,16 +40,16 @@ Direct shortcuts for common actions:
 
 ### From DMG (Recommended)
 
-1. Download `QuickLLM-x.x.x.dmg` from [Releases](../../releases)
-2. Open the DMG and double-click **QuickLLM.app**
+1. Download `PopDraft-x.x.x.dmg` from [Releases](../../releases)
+2. Open the DMG and double-click **PopDraft.app**
 3. Follow the Terminal prompts to choose your backend
 4. Grant Accessibility permissions when prompted
 
 ### From Source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/quickllm.git
-cd quickllm
+git clone https://github.com/YOUR_USERNAME/popdraft.git
+cd popdraft
 ./install.sh
 ```
 
@@ -61,7 +61,7 @@ The installer will prompt you to choose:
 
 ```bash
 ./build-dmg.sh 1.0.0
-# Output: build/QuickLLM-1.0.0.dmg
+# Output: build/PopDraft-1.0.0.dmg
 ```
 
 ## Backend Options
@@ -92,7 +92,7 @@ Convenient model management with automatic updates.
 **Setup:**
 1. Install from [ollama.ai](https://ollama.ai)
 2. Run `ollama pull qwen2.5:7b` (or your preferred model)
-3. Choose Ollama during QuickLLM installation
+3. Choose Ollama during PopDraft installation
 
 ## Usage
 
@@ -137,7 +137,7 @@ llm-tts.py -o output.wav "Save to file"
 
 ## Configuration
 
-Configuration file: `~/.quickllm/config`
+Configuration file: `~/.popdraft/config`
 
 ```bash
 # Backend: ollama or llamacpp
@@ -149,21 +149,21 @@ OLLAMA_MODEL=qwen2.5:7b
 
 # llama.cpp settings
 LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
+LLAMACPP_MODEL_PATH=~/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
 ```
 
 ### Switch Backends
 
-1. Edit `~/.quickllm/config`
+1. Edit `~/.popdraft/config`
 2. Change `BACKEND=ollama` or `BACKEND=llamacpp`
 3. Restart PopDraft (or log out/in)
 
 ### Change Model
 
 **For llama.cpp:**
-1. Download a GGUF model to `~/.quickllm/models/`
+1. Download a GGUF model to `~/.popdraft/models/`
 2. Update `LLAMACPP_MODEL_PATH` in config
-3. Restart the llama server: `launchctl kickstart -k gui/$(id -u)/com.quickllm.llama-server`
+3. Restart the llama server: `launchctl kickstart -k gui/$(id -u)/com.popdraft.llama-server`
 
 **For Ollama:**
 1. Pull the model: `ollama pull model-name`
@@ -174,7 +174,7 @@ LLAMACPP_MODEL_PATH=~/.quickllm/models/qwen2.5-7b-instruct-q4_k_m.gguf
 
 **System Settings** -> **Keyboard** -> **Keyboard Shortcuts** -> **Services**
 
-Find QuickLLM services under "Text" and double-click to change.
+Find PopDraft services under "Text" and double-click to change.
 
 ### Change Popup Hotkey
 
@@ -183,7 +183,7 @@ Edit and recompile `scripts/PopDraft.swift` - modify the `registerGlobalHotKey()
 ## File Structure
 
 ```
-quickllm/
+popdraft/
 ├── install.sh              # Installer (backend selection, model download)
 ├── uninstall.sh            # Uninstaller
 ├── build-dmg.sh            # DMG builder
@@ -203,7 +203,7 @@ quickllm/
 │   ├── llm-tts.sh          # TTS wrapper
 │   ├── LLMChat.swift       # Native chat app
 │   └── setup-workflows.sh  # Workflow generator
-├── ~/.quickllm/
+├── ~/.popdraft/
 │   ├── config              # Backend configuration
 │   └── models/             # GGUF models (llama.cpp)
 └── README.md
@@ -234,7 +234,7 @@ curl http://localhost:8080/health
 tail -f /tmp/llm-llama-server.log
 
 # Restart server
-launchctl kickstart -k gui/$(id -u)/com.quickllm.llama-server
+launchctl kickstart -k gui/$(id -u)/com.popdraft.llama-server
 ```
 
 **For Ollama:**

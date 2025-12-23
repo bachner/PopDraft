@@ -17,7 +17,7 @@ struct LLMConfig {
     static func load() -> LLMConfig {
         var config = LLMConfig()
         let configPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".quickllm/config")
+            .appendingPathComponent(".popdraft/config")
 
         guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else {
             return config
