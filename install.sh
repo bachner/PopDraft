@@ -118,12 +118,13 @@ echo "  [OK] TTS server configured (auto-starts on login, ~400-600MB RAM)"
 
 # Compile and install native chat app
 echo ""
-echo "Compiling native chat app..."
+echo "Compiling native apps..."
+
+# Chat app
 if swiftc -o ~/bin/LLMChat "$SCRIPT_DIR/scripts/LLMChat.swift" -framework Cocoa 2>/dev/null; then
     echo "[OK] Native chat app compiled"
 else
     echo "[WARN] Could not compile native chat app, falling back to Terminal"
-    # Create fallback script
     echo '#!/bin/bash
     export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
     CONTEXT_FILE="$1"
@@ -132,6 +133,37 @@ else
         do script \"\\\"$HOME/bin/llm-chat-session.sh\\\" \\\"$CONTEXT_FILE\\\"\"
     end tell"' > ~/bin/LLMChat
     chmod +x ~/bin/LLMChat
+fi
+
+# Popup app (menu bar)
+if swiftc -O -o ~/bin/QuickLLMApp "$SCRIPT_DIR/scripts/QuickLLMApp.swift" -framework Cocoa -framework Carbon 2>/dev/null; then
+    echo "[OK] QuickLLM popup app compiled"
+
+    # Create LaunchAgent for popup app
+    cat > ~/Library/LaunchAgents/com.quickllm.app.plist << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quickllm.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>HOME_DIR/bin/QuickLLMApp</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+PLIST
+    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.quickllm.app.plist
+    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
+    echo "[OK] QuickLLM popup app set to auto-start"
+else
+    echo "[WARN] Could not compile QuickLLM popup app"
 fi
 
 # Make executable
@@ -171,21 +203,20 @@ echo "==========================================="
 echo "[OK] Installation complete!"
 echo "==========================================="
 echo ""
-echo "Everything is set up! You can now use these shortcuts:"
+echo "POPUP MENU (Recommended):"
+echo "  Option+Space  ->  Show action popup (copy text first)"
+echo "  Look for the ✨ icon in your menu bar"
 echo ""
+echo "KEYBOARD SHORTCUTS:"
 echo "  Ctrl+Option+G  ->  Grammar Check"
 echo "  Ctrl+Option+A  ->  Articulate"
 echo "  Ctrl+Option+C  ->  Craft Answer"
 echo "  Ctrl+Option+P  ->  Custom Prompt"
-echo "  Ctrl+Option+L  ->  Chat with Context (opens Terminal)"
+echo "  Ctrl+Option+L  ->  Chat with Context"
 echo "  Ctrl+Option+S  ->  Speak (Text-to-Speech)"
 echo ""
-echo "Usage: Select any text, then press the shortcut."
-echo ""
-echo "TTS server is running in background (~400-600MB RAM)."
-echo "  View logs: tail -f /tmp/llm-tts-server.log"
-echo "  Stop:      launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist"
-echo "  Start:     launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist"
+echo "Usage: Select text, copy it (Cmd+C), then press Option+Space"
+echo "       Or use keyboard shortcuts directly on selected text"
 echo ""
 echo "Note: You may need to restart apps for shortcuts to take effect."
 echo "      Customize shortcuts in: System Settings > Keyboard > Keyboard Shortcuts > Services"

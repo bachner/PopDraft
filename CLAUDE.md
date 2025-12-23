@@ -47,12 +47,23 @@ curl http://localhost:11434/api/tags
 
 ### Data Flow
 ```
-Selected Text → Cmd+C → Clipboard → llm-clipboard.sh → llm-process.sh → Ollama API → Result pasted/displayed
+# Popup Menu Flow (Recommended)
+Copy Text → Option+Space → Popup Menu → Select Action → Ollama API → Result pasted
+
+# Keyboard Shortcut Flow
+Selected Text → Keyboard Shortcut → Automator Workflow → llm-clipboard.sh → Ollama API → Result pasted
 ```
 
 ### Component Layers
 
-**Core Engine:**
+**Popup Menu App (Primary Interface):**
+- `QuickLLMApp.swift` - Native macOS menu bar app with floating popup
+  - Global hotkey: Option+Space
+  - Searchable action list
+  - Direct Ollama API integration
+  - LaunchAgent: `~/Library/LaunchAgents/com.quickllm.app.plist`
+
+**Core Engine (for keyboard shortcuts):**
 - `llm-process.sh` - Ollama API client (`/api/generate`), handles JSON escaping
 - `llm-clipboard.sh` - Clipboard capture, LLM processing, auto-paste with clipboard restoration
 

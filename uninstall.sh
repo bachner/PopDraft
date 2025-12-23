@@ -10,17 +10,22 @@ echo
 
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo ""
-    echo "Stopping TTS server..."
+    echo "Stopping services..."
+    # TTS server
     launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.quickllm.tts-server.plist
-    # Also clean up old naming if present
     launchctl unload ~/Library/LaunchAgents/com.llm-mac.tts-server.plist 2>/dev/null || true
     rm -f ~/Library/LaunchAgents/com.llm-mac.tts-server.plist
     pkill -f llm-tts-server.py 2>/dev/null || true
-    echo "[OK] TTS server stopped"
+
+    # Popup app
+    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.quickllm.app.plist
+    pkill -f QuickLLMApp 2>/dev/null || true
+    echo "[OK] Services stopped"
 
     echo ""
-    echo "Removing scripts from ~/bin/..."
+    echo "Removing scripts and apps from ~/bin/..."
     rm -f ~/bin/llm-process.sh
     rm -f ~/bin/llm-clipboard.sh
     rm -f ~/bin/llm-grammar.sh
@@ -34,9 +39,10 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f ~/bin/llm-tts-server.py
     rm -f ~/bin/LLMChat
     rm -f ~/bin/LLMChat.swift
+    rm -f ~/bin/QuickLLMApp
     rm -f ~/bin/setup-workflows.sh
     rm -f ~/.llm-tts-server.pid
-    echo "[OK] Scripts removed"
+    echo "[OK] Scripts and apps removed"
 
     echo ""
     echo "Removing Quick Action workflows..."

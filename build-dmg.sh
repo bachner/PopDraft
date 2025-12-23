@@ -96,11 +96,15 @@ cp "${SCRIPT_DIR}/scripts/llm-tts-server.py" "${APP_BUNDLE}/Contents/Resources/s
 cp "${SCRIPT_DIR}/scripts/llm-chat-gui.py" "${APP_BUNDLE}/Contents/Resources/scripts/" 2>/dev/null || true
 cp "${SCRIPT_DIR}/scripts/llm-chat-gui.sh" "${APP_BUNDLE}/Contents/Resources/scripts/" 2>/dev/null || true
 cp "${SCRIPT_DIR}/scripts/LLMChat.swift" "${APP_BUNDLE}/Contents/Resources/scripts/"
+cp "${SCRIPT_DIR}/scripts/QuickLLMApp.swift" "${APP_BUNDLE}/Contents/Resources/scripts/"
 cp "${SCRIPT_DIR}/scripts/setup-workflows.sh" "${APP_BUNDLE}/Contents/Resources/scripts/"
 
-# Copy pre-compiled binary if it exists
+# Copy pre-compiled binaries if they exist
 if [ -f "${SCRIPT_DIR}/scripts/LLMChat" ]; then
     cp "${SCRIPT_DIR}/scripts/LLMChat" "${APP_BUNDLE}/Contents/Resources/scripts/"
+fi
+if [ -f "${SCRIPT_DIR}/scripts/QuickLLMApp" ]; then
+    cp "${SCRIPT_DIR}/scripts/QuickLLMApp" "${APP_BUNDLE}/Contents/Resources/scripts/"
 fi
 
 # Copy root files
@@ -224,9 +228,11 @@ launchctl unload ~/Library/LaunchAgents/com.quickllm.tts-server.plist 2>/dev/nul
 launchctl load ~/Library/LaunchAgents/com.quickllm.tts-server.plist
 echo "  TTS server configured for auto-start"
 
-# Compile native chat app
+# Compile native apps
 echo ""
-echo "Compiling native chat app..."
+echo "Compiling native apps..."
+
+# Chat app
 if [ -f "${SCRIPTS_SRC}/LLMChat" ]; then
     cp "${SCRIPTS_SRC}/LLMChat" ~/bin/
     chmod +x ~/bin/LLMChat
@@ -238,6 +244,46 @@ elif [ -f "${SCRIPTS_SRC}/LLMChat.swift" ]; then
     else
         echo "  WARNING: Could not compile LLMChat. Chat will use Terminal fallback."
     fi
+fi
+
+# Popup app
+if [ -f "${SCRIPTS_SRC}/QuickLLMApp" ]; then
+    cp "${SCRIPTS_SRC}/QuickLLMApp" ~/bin/
+    chmod +x ~/bin/QuickLLMApp
+    echo "  Installed pre-compiled QuickLLMApp"
+elif [ -f "${SCRIPTS_SRC}/QuickLLMApp.swift" ]; then
+    cp "${SCRIPTS_SRC}/QuickLLMApp.swift" ~/bin/
+    if swiftc -O -o ~/bin/QuickLLMApp ~/bin/QuickLLMApp.swift -framework Cocoa -framework Carbon 2>/dev/null; then
+        echo "  Compiled QuickLLMApp successfully"
+    else
+        echo "  WARNING: Could not compile QuickLLMApp"
+    fi
+fi
+
+# Setup popup app auto-start
+if [ -f ~/bin/QuickLLMApp ]; then
+    cat > ~/Library/LaunchAgents/com.quickllm.app.plist << 'LAUNCHPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quickllm.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>HOME_DIR/bin/QuickLLMApp</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+LAUNCHPLIST
+    sed -i '' "s|HOME_DIR|$HOME|g" ~/Library/LaunchAgents/com.quickllm.app.plist
+    launchctl unload ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.quickllm.app.plist 2>/dev/null || true
+    echo "  QuickLLM popup app set to auto-start"
 fi
 
 # Add ~/bin to PATH if not already there
@@ -278,7 +324,11 @@ echo "=========================================="
 echo "  Installation Complete!"
 echo "=========================================="
 echo ""
-echo "Keyboard shortcuts (Ctrl+Option+...):"
+echo "POPUP MENU (Recommended):"
+echo "  Option+Space -> Show action popup"
+echo "  Look for the sparkles icon in menu bar"
+echo ""
+echo "KEYBOARD SHORTCUTS (Ctrl+Option+...):"
 echo "  G - Grammar Check"
 echo "  A - Articulate"
 echo "  C - Craft Answer"
@@ -286,9 +336,7 @@ echo "  P - Custom Prompt"
 echo "  L - Chat"
 echo "  S - Speak (TTS)"
 echo ""
-echo "Requirements:"
-echo "  - Ollama must be running at localhost:11434"
-echo "  - Grant Accessibility permissions if prompted"
+echo "Usage: Copy text (Cmd+C), then press Option+Space"
 echo ""
 echo "To uninstall, run: ~/bin/uninstall.sh"
 echo ""
