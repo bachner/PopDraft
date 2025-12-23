@@ -789,6 +789,7 @@ class PopupWindowController: NSWindowController {
                 set: { newValue in
                     self.searchText = newValue
                     self.selectedIndex = 0  // Reset selection when searching
+                    self.updateView()  // Trigger UI update
                 }
             ),
             selectedIndex: Binding(get: { self.selectedIndex }, set: { self.selectedIndex = $0 }),
