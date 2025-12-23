@@ -506,7 +506,7 @@ struct PopupView: View {
                                 action: action,
                                 isSelected: index == selectedIndex
                             )
-                            .id(index)
+                            .id(action.id)
                             .onTapGesture {
                                 onSelect(action)
                             }
@@ -515,8 +515,10 @@ struct PopupView: View {
                     .padding(.vertical, 4)
                 }
                 .onChange(of: selectedIndex) { _, newIndex in
-                    withAnimation {
-                        proxy.scrollTo(newIndex, anchor: .center)
+                    if newIndex < actions.count {
+                        withAnimation {
+                            proxy.scrollTo(actions[newIndex].id, anchor: .center)
+                        }
                     }
                 }
             }
