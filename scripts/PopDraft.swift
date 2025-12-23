@@ -814,7 +814,13 @@ class PopupWindowController: NSWindowController {
             hostingView?.rootView = view
         }
 
-        window?.setContentSize(hostingView?.fittingSize ?? NSSize(width: 320, height: 400))
+        // Defer resize to next run loop so SwiftUI can finish layout
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let hostingView = self.hostingView else { return }
+            var size = hostingView.fittingSize
+            size.height = min(size.height, 400)  // Maximum height
+            self.window?.setContentSize(size)
+        }
     }
 
     private func captureSelectedText() {
