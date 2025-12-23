@@ -8,13 +8,9 @@ System-wide AI text processing for macOS. Select text, press a shortcut, and get
 The easiest way to use QuickLLM - a floating action menu that appears near your cursor:
 
 - **Fix grammar and spelling** - Correct errors while preserving tone
-- **Improve writing** - Make text clearer and more professional
-- **Make it shorter/longer** - Condense or expand content
-- **Summarize** - Get key points quickly
+- **Articulate** - Make text clearer and more professional
 - **Explain simply** - Break down complex text
 - **Craft a reply** - Generate thoughtful responses
-- **Change tone** - Switch between formal and casual
-- **Translate to English** - Convert any language
 - **Continue writing** - Extend your text
 - **Custom prompt** - Enter any instruction
 

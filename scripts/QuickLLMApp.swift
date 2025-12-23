@@ -102,28 +102,10 @@ class ActionManager {
             shortcut: "G"
         ),
         LLMAction(
-            name: "Improve writing",
+            name: "Articulate",
             icon: "pencil.circle.fill",
             prompt: "Improve this text to be clearer and more professional while keeping the same meaning and tone. Only output the improved text, nothing else. Preserve the original language.",
             shortcut: "A"
-        ),
-        LLMAction(
-            name: "Make it shorter",
-            icon: "arrow.down.right.and.arrow.up.left",
-            prompt: "Make this text more concise while keeping the key points. Only output the shortened text, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Make it longer",
-            icon: "arrow.up.left.and.arrow.down.right",
-            prompt: "Expand this text with more details and context while keeping the same meaning. Only output the expanded text, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Summarize",
-            icon: "doc.text.fill",
-            prompt: "Summarize this text in a few sentences, capturing the main points. Only output the summary, nothing else. Preserve the original language.",
-            shortcut: nil
         ),
         LLMAction(
             name: "Explain simply",
@@ -136,24 +118,6 @@ class ActionManager {
             icon: "arrowshape.turn.up.left.fill",
             prompt: "Write a thoughtful and helpful reply to this message. Be professional and friendly. Only output the reply, nothing else. Preserve the original language.",
             shortcut: "C"
-        ),
-        LLMAction(
-            name: "Change tone to formal",
-            icon: "person.crop.circle.fill",
-            prompt: "Rewrite this text in a formal, professional tone. Only output the rewritten text, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Change tone to casual",
-            icon: "face.smiling.fill",
-            prompt: "Rewrite this text in a casual, friendly tone. Only output the rewritten text, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Translate to English",
-            icon: "globe",
-            prompt: "Translate this text to English. Only output the translation, nothing else.",
-            shortcut: nil
         ),
         LLMAction(
             name: "Continue writing",
