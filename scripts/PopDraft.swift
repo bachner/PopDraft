@@ -135,7 +135,60 @@ struct LLMConfig {
         }
     }
 
+    struct LlamaModel {
+        let id: String
+        let name: String
+        let size: String
+        let languages: String
+        let url: String
+        let filename: String
+    }
+
+    static let llamaModels: [LlamaModel] = [
+        LlamaModel(
+            id: "qwen2.5-3b",
+            name: "Qwen 2.5 3B",
+            size: "~2.5GB",
+            languages: "29+ languages",
+            url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+            filename: "qwen2.5-3b-instruct-q4_k_m.gguf"
+        ),
+        LlamaModel(
+            id: "qwen2.5-7b",
+            name: "Qwen 2.5 7B",
+            size: "~5GB",
+            languages: "29+ languages",
+            url: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
+            filename: "qwen2.5-7b-instruct-q4_k_m.gguf"
+        ),
+        LlamaModel(
+            id: "llama-3.2-3b",
+            name: "Llama 3.2 3B",
+            size: "~2.5GB",
+            languages: "8 languages",
+            url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+        ),
+        LlamaModel(
+            id: "gemma-2-2b",
+            name: "Gemma 2 2B",
+            size: "~1.5GB",
+            languages: "Multilingual",
+            url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
+            filename: "gemma-2-2b-it-Q4_K_M.gguf"
+        ),
+        LlamaModel(
+            id: "phi-3-mini",
+            name: "Phi-3 Mini",
+            size: "~2.5GB",
+            languages: "Multilingual",
+            url: "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf",
+            filename: "Phi-3-mini-4k-instruct-q4.gguf"
+        )
+    ]
+
     var provider: Provider = .llamacpp
+    var llamaModel: String = "qwen2.5-3b"
     var llamacppURL: String = "http://localhost:8080"
     var ollamaURL: String = "http://localhost:11434"
     var ollamaModel: String = "qwen2.5:7b"
@@ -264,6 +317,8 @@ struct LLMConfig {
                 config.provider = Provider(rawValue: value) ?? .llamacpp
             case "LLAMACPP_URL":
                 config.llamacppURL = value
+            case "LLAMA_MODEL":
+                config.llamaModel = value
             case "OLLAMA_URL":
                 config.ollamaURL = value
             case "OLLAMA_MODEL":
@@ -308,6 +363,7 @@ struct LLMConfig {
         var lines: [String] = []
         lines.append("PROVIDER=\(provider.rawValue)")
         lines.append("LLAMACPP_URL=\(llamacppURL)")
+        lines.append("LLAMA_MODEL=\(llamaModel)")
         lines.append("OLLAMA_URL=\(ollamaURL)")
         lines.append("OLLAMA_MODEL=\(ollamaModel)")
         lines.append("OPENAI_API_KEY=\(openaiAPIKey)")
@@ -1806,6 +1862,10 @@ struct SettingsView: View {
     @State private var editingShortcutFor: String? = nil  // actionId currently being edited
     @State private var popupHotkey: String = "Space"
     @State private var editingPopupHotkey: Bool = false
+    @State private var selectedLlamaModel: String = "qwen2.5-3b"
+    @State private var isDownloadingModel: Bool = false
+    @State private var downloadProgress: Double = 0.0
+    @State private var downloadStatus: String = ""
     let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
@@ -2334,18 +2394,142 @@ struct SettingsView: View {
     // MARK: - Provider Settings Views
 
     private var llamacppSettings: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("llama.cpp runs locally on your machine.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
 
-            Text("Server URL: http://localhost:8080")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Model")
+                    .font(.system(size: 12, weight: .medium))
+                Picker("", selection: $selectedLlamaModel) {
+                    ForEach(LLMConfig.llamaModels, id: \.id) { model in
+                        Text("\(model.name) (\(model.size))").tag(model.id)
+                    }
+                }
+                .labelsHidden()
+            }
+
+            if let model = LLMConfig.llamaModels.first(where: { $0.id == selectedLlamaModel }) {
+                Text("Languages: \(model.languages)")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            // Download status
+            if isDownloadingModel {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: downloadProgress, total: 100)
+                        .progressViewStyle(.linear)
+                    Text(downloadStatus)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            } else if !DependencyManager.shared.isModelDownloaded(selectedLlamaModel) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .font(.system(size: 12))
+                        Text("Model not downloaded")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    Button("Download Model") {
+                        downloadSelectedModel()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            } else {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 12))
+                    Text("Model ready")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Text("Server: http://localhost:8080")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
+        }
+    }
 
-            Text("No configuration needed - uses the model loaded in llama-server.")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
+    private func downloadSelectedModel() {
+        guard let model = LLMConfig.llamaModels.first(where: { $0.id == selectedLlamaModel }) else { return }
+
+        isDownloadingModel = true
+        downloadProgress = 0
+        downloadStatus = "Starting download..."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Stop llama-server if running
+            let stopProcess = Process()
+            stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
+            try? stopProcess.run()
+            stopProcess.waitUntilExit()
+
+            // Create models directory
+            let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
+
+            let modelPath = "\(modelsDir)/\(model.filename)"
+
+            // Download using curl with progress
+            let curlProcess = Process()
+            curlProcess.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curlProcess.arguments = ["-L", "-o", modelPath, "--progress-bar", model.url]
+
+            let pipe = Pipe()
+            curlProcess.standardError = pipe
+
+            try? curlProcess.run()
+
+            // Monitor progress
+            DispatchQueue.main.async {
+                self.downloadStatus = "Downloading \(model.name)..."
+            }
+
+            curlProcess.waitUntilExit()
+
+            if curlProcess.terminationStatus == 0 {
+                // Update config and restart server
+                DispatchQueue.main.async {
+                    self.downloadStatus = "Restarting server..."
+                    self.downloadProgress = 90
+                }
+
+                // Update LaunchAgent with new model
+                DependencyManager.shared.createLlamaLaunchAgentForModel(model)
+
+                // Start server
+                let startProcess = Process()
+                startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                startProcess.arguments = ["bootstrap", "gui/\(getuid())",
+                    NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath]
+                try? startProcess.run()
+                startProcess.waitUntilExit()
+
+                DispatchQueue.main.async {
+                    self.downloadProgress = 100
+                    self.downloadStatus = "Complete!"
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.isDownloadingModel = false
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.downloadStatus = "Download failed"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        self.isDownloadingModel = false
+                    }
+                }
+            }
         }
     }
 
@@ -2442,6 +2626,7 @@ struct SettingsView: View {
     private func loadCurrentConfig() {
         let config = LLMConfig.load()
         selectedProvider = config.provider
+        selectedLlamaModel = config.llamaModel
         ollamaModel = config.ollamaModel
         openaiAPIKey = config.openaiAPIKey
         openaiModel = LLMConfig.openaiModels.contains(config.openaiModel) ? config.openaiModel : "Custom..."
@@ -2489,6 +2674,7 @@ struct SettingsView: View {
     private func saveSettings() {
         var config = LLMConfig()
         config.provider = selectedProvider
+        config.llamaModel = selectedLlamaModel
         config.ollamaModel = ollamaModel
         config.openaiAPIKey = openaiAPIKey
         config.openaiModel = openaiModel == "Custom..." ? customOpenAIModel : openaiModel
@@ -2765,9 +2951,6 @@ class SettingsWindowController: NSWindowController {
 class DependencyManager {
     static let shared = DependencyManager()
 
-    private let modelURL = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
-    private let modelName = "qwen2.5-3b-instruct-q4_k_m.gguf"
-
     struct DependencyStatus {
         var hasHomebrew: Bool = false
         var hasEspeak: Bool = false
@@ -2775,6 +2958,24 @@ class DependencyManager {
         var hasLlamaCpp: Bool = false
         var hasLlamaModel: Bool = false
         var isLlamaServerRunning: Bool = false
+    }
+
+    // Get current model from config
+    func getCurrentModel() -> LLMConfig.LlamaModel {
+        let config = LLMConfig.load()
+        return LLMConfig.llamaModels.first { $0.id == config.llamaModel } ?? LLMConfig.llamaModels[0]
+    }
+
+    // Get model by ID
+    func getModel(byId id: String) -> LLMConfig.LlamaModel? {
+        return LLMConfig.llamaModels.first { $0.id == id }
+    }
+
+    // Check if a specific model is downloaded
+    func isModelDownloaded(_ modelId: String) -> Bool {
+        guard let model = getModel(byId: modelId) else { return false }
+        let modelPath = NSString(string: "~/.popdraft/models/\(model.filename)").expandingTildeInPath
+        return FileManager.default.fileExists(atPath: modelPath)
     }
 
     func checkDependencies() -> DependencyStatus {
@@ -2798,8 +2999,9 @@ class DependencyManager {
         status.hasLlamaCpp = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server") ||
                             FileManager.default.fileExists(atPath: "/usr/local/bin/llama-server")
 
-        // Check for model
-        let modelPath = NSString(string: "~/.popdraft/models/\(modelName)").expandingTildeInPath
+        // Check for configured model
+        let currentModel = getCurrentModel()
+        let modelPath = NSString(string: "~/.popdraft/models/\(currentModel.filename)").expandingTildeInPath
         status.hasLlamaModel = FileManager.default.fileExists(atPath: modelPath)
 
         // Check if server is running
@@ -2841,9 +3043,17 @@ class DependencyManager {
         }
     }
 
-    func installLlamaCpp(statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
+    func installLlamaCpp(modelId: String? = nil, statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var status = self.checkDependencies()
+
+            // Get the model to install (use provided ID or current config)
+            let model: LLMConfig.LlamaModel
+            if let modelId = modelId, let m = self.getModel(byId: modelId) {
+                model = m
+            } else {
+                model = self.getCurrentModel()
+            }
 
             // Install llama.cpp if missing
             if !status.hasLlamaCpp && status.hasHomebrew {
@@ -2857,14 +3067,14 @@ class DependencyManager {
             }
 
             // Download model if missing
-            if !status.hasLlamaModel {
-                DispatchQueue.main.async { statusCallback("Downloading AI model (~2GB, please wait)...") }
+            let modelPath = NSString(string: "~/.popdraft/models/\(model.filename)").expandingTildeInPath
+            if !FileManager.default.fileExists(atPath: modelPath) {
+                DispatchQueue.main.async { statusCallback("Downloading \(model.name) (\(model.size), please wait)...") }
 
                 let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
                 try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
 
-                let modelPath = modelsDir + "/\(self.modelName)"
-                let result = self.runShellCommand("curl -L --progress-bar -o '\(modelPath)' '\(self.modelURL)' 2>&1")
+                let result = self.runShellCommand("curl -L --progress-bar -o '\(modelPath)' '\(model.url)' 2>&1")
                 if result.contains("error") || result.contains("Error") {
                     print("Model download warning: \(result)")
                 }
@@ -2872,9 +3082,12 @@ class DependencyManager {
             }
 
             // Create LaunchAgent for llama-server
-            if status.hasLlamaCpp && status.hasLlamaModel {
+            if status.hasLlamaCpp {
                 DispatchQueue.main.async { statusCallback("Configuring llama server...") }
-                self.createLlamaLaunchAgent()
+                self.createLlamaLaunchAgent(model: model)
+
+                // Unload existing agent if any
+                _ = self.runShellCommand("launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>&1")
 
                 // Start the server
                 DispatchQueue.main.async { statusCallback("Starting llama server...") }
@@ -2885,16 +3098,18 @@ class DependencyManager {
             }
 
             DispatchQueue.main.async {
-                completion(status.hasLlamaCpp && status.hasLlamaModel)
+                let modelExists = FileManager.default.fileExists(atPath: modelPath)
+                completion(status.hasLlamaCpp && modelExists)
             }
         }
     }
 
-    private func createLlamaLaunchAgent() {
+    private func createLlamaLaunchAgent(model: LLMConfig.LlamaModel? = nil) {
         let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
 
-        let modelPath = NSString(string: "~/.popdraft/models/\(modelName)").expandingTildeInPath
+        let selectedModel = model ?? getCurrentModel()
+        let modelPath = NSString(string: "~/.popdraft/models/\(selectedModel.filename)").expandingTildeInPath
         let llamaServerPath = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server")
             ? "/opt/homebrew/bin/llama-server"
             : "/usr/local/bin/llama-server"
@@ -2929,6 +3144,11 @@ class DependencyManager {
 """
         let plistPath = launchAgentsDir + "/com.popdraft.llama-server.plist"
         try? plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+    }
+
+    // Public method to update LaunchAgent for a specific model (used by Settings)
+    func createLlamaLaunchAgentForModel(_ model: LLMConfig.LlamaModel) {
+        createLlamaLaunchAgent(model: model)
     }
 
     private func runShellCommand(_ command: String) -> String {
@@ -3093,6 +3313,7 @@ struct OnboardingView: View {
     @State private var selectedProvider: LLMConfig.Provider = .llamacpp
     @State private var apiKey = ""
     @State private var selectedModel = ""
+    @State private var selectedLlamaModel: String = "qwen2.5-3b"
     @State private var ollamaModels: [String] = []
     @State private var checkingPermission = false
     @State private var isSettingUp = false
@@ -3169,6 +3390,29 @@ struct OnboardingView: View {
                 Text(providerDescription)
                     .font(.callout)
                     .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Model selection for llama.cpp
+                if selectedProvider == .llamacpp {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Model:")
+                                .font(.callout)
+                            Picker("", selection: $selectedLlamaModel) {
+                                ForEach(LLMConfig.llamaModels, id: \.id) { model in
+                                    Text("\(model.name) (\(model.size))").tag(model.id)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        if let model = LLMConfig.llamaModels.first(where: { $0.id == selectedLlamaModel }) {
+                            Text("Languages: \(model.languages)")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .disabled(!hasAccessibility)
+                }
 
                 // Model selection for Ollama
                 if selectedProvider == .ollama {
@@ -3276,7 +3520,7 @@ struct OnboardingView: View {
             .padding(.bottom, 20)
         }
         .padding(.horizontal, 24)
-        .frame(width: 450, height: 520)
+        .frame(width: 450, height: 620)
         .onAppear {
             // Prompt system to add this app to Accessibility list (shows up disabled)
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -3349,6 +3593,8 @@ struct OnboardingView: View {
             config.provider = selectedProvider
 
             switch selectedProvider {
+            case .llamacpp:
+                config.llamaModel = selectedLlamaModel
             case .ollama:
                 config.ollamaModel = selectedModel.isEmpty ? "qwen2.5:7b" : selectedModel
             case .openai:
@@ -3357,8 +3603,6 @@ struct OnboardingView: View {
             case .claude:
                 config.claudeAPIKey = apiKey
                 config.claudeModel = selectedModel.isEmpty ? "claude-sonnet-4-20250514" : selectedModel
-            case .llamacpp:
-                break
             }
             config.save()
 
@@ -3372,8 +3616,10 @@ struct OnboardingView: View {
                     // Install llama.cpp if selected
                     if selectedProvider == .llamacpp {
                         let depStatus = DependencyManager.shared.checkDependencies()
-                        if !depStatus.hasLlamaCpp || !depStatus.hasLlamaModel {
+                        let modelDownloaded = DependencyManager.shared.isModelDownloaded(selectedLlamaModel)
+                        if !depStatus.hasLlamaCpp || !modelDownloaded {
                             DependencyManager.shared.installLlamaCpp(
+                                modelId: selectedLlamaModel,
                                 statusCallback: { status in
                                     self.setupStatus = status
                                 },
