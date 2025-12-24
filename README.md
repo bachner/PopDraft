@@ -25,7 +25,6 @@ Direct shortcuts for common actions:
 | `Ctrl+Option+A` | Articulate |
 | `Ctrl+Option+C` | Craft Answer |
 | `Ctrl+Option+P` | Custom Prompt |
-| `Ctrl+Option+L` | Chat |
 | `Ctrl+Option+S` | Speak (TTS) |
 
 ## Requirements
@@ -43,9 +42,12 @@ Direct shortcuts for common actions:
 ### From DMG (Recommended)
 
 1. Download `PopDraft-x.x.x.dmg` from [Releases](../../releases)
-2. Open the DMG and double-click **PopDraft.app**
-3. Follow the Terminal prompts to choose your backend
-4. Grant Accessibility permissions when prompted
+2. Open the DMG and drag **PopDraft.app** to Applications
+3. Launch PopDraft from Applications
+4. Complete the onboarding:
+   - Grant Accessibility permissions when prompted
+   - Choose your LLM backend (llama.cpp, Ollama, OpenAI, or Claude)
+   - Enter API key if using OpenAI or Claude
 
 ### From Source
 
@@ -54,11 +56,6 @@ git clone https://github.com/YOUR_USERNAME/popdraft.git
 cd popdraft
 ./install.sh
 ```
-
-The installer will prompt you to choose:
-1. **Backend**: llama.cpp (default), Ollama, OpenAI, or Claude
-2. **Model** (if llama.cpp): Download size from 2GB to 8.5GB
-3. **API Key** (if OpenAI/Claude): Enter your API key
 
 ### Build DMG
 

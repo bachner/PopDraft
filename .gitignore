@@ -9,7 +9,7 @@ build/
 ._*
 
 # Compiled binaries
-scripts/LLMChat
+scripts/PopDraft
 
 # Python
 __pycache__/

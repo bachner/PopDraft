@@ -1356,6 +1356,53 @@ class PopupWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func showWithAction(actionName: String) {
+        // Capture selected text by simulating Cmd+C
+        captureSelectedText()
+
+        // Find the action by name
+        guard let action = ActionManager.shared.actions.first(where: { $0.name == actionName }) else {
+            showAtMouseLocation() // Fall back to showing popup
+            return
+        }
+
+        // Reset state and prepare for direct action
+        searchText = ""
+        selectedIndex = 0
+        customPromptText = ""
+        resultText = ""
+
+        // Position near mouse
+        let mouseLocation = NSEvent.mouseLocation
+        var frame = window?.frame ?? .zero
+        frame.origin = NSPoint(
+            x: mouseLocation.x - frame.width / 2,
+            y: mouseLocation.y - frame.height - 10
+        )
+
+        // Make sure it's on screen
+        if let screen = NSScreen.main {
+            let screenFrame = screen.visibleFrame
+            if frame.minX < screenFrame.minX {
+                frame.origin.x = screenFrame.minX + 10
+            }
+            if frame.maxX > screenFrame.maxX {
+                frame.origin.x = screenFrame.maxX - frame.width - 10
+            }
+            if frame.minY < screenFrame.minY {
+                frame.origin.y = mouseLocation.y + 20
+            }
+        }
+
+        window?.setFrame(frame, display: true)
+        window?.makeKeyAndOrderFront(nil)
+        startKeyboardMonitoring()
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Directly trigger the action (skip action list)
+        selectAction(action)
+    }
+
     func dismiss() {
         stopTTSStatusPolling()
         stopKeyboardMonitoring()
@@ -1590,11 +1637,13 @@ class PopupWindowController: NSWindowController {
 
 struct SettingsView: View {
     enum SettingsTab: String, CaseIterable {
+        case general = "General"
         case llm = "LLM"
         case tts = "Text-to-Speech"
     }
 
-    @State private var selectedTab: SettingsTab = .llm
+    @State private var selectedTab: SettingsTab = .general
+    @State private var launchAtLogin: Bool = LaunchAtLoginManager.shared.isEnabled
     @State private var selectedProvider: LLMConfig.Provider = .llamacpp
     @State private var ollamaModel: String = ""
     @State private var openaiAPIKey: String = ""
@@ -1648,13 +1697,18 @@ struct SettingsView: View {
             Divider()
                 .padding(.top, 8)
 
-            // Tab content
-            switch selectedTab {
-            case .llm:
-                llmSettingsTab
-            case .tts:
-                ttsSettingsTab
+            // Tab content - fixed height container
+            Group {
+                switch selectedTab {
+                case .general:
+                    generalSettingsTab
+                case .llm:
+                    llmSettingsTab
+                case .tts:
+                    ttsSettingsTab
+                }
             }
+            .frame(height: 340)
 
             Divider()
 
@@ -1671,7 +1725,7 @@ struct SettingsView: View {
             }
             .padding(16)
         }
-        .frame(width: 420, height: 440)
+        .frame(width: 420, height: 480)
         .onAppear {
             loadCurrentConfig()
             if selectedProvider == .ollama {
@@ -1682,6 +1736,64 @@ struct SettingsView: View {
             if newValue == .ollama {
                 fetchOllamaModels()
             }
+        }
+    }
+
+    // MARK: - General Settings Tab
+
+    private var generalSettingsTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Launch at Login toggle
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $launchAtLogin) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Launch at Login")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Start PopDraft automatically when you log in")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .onChange(of: launchAtLogin) { _, newValue in
+                    LaunchAtLoginManager.shared.setEnabled(newValue)
+                }
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+
+            // Keyboard shortcuts info
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Keyboard Shortcuts")
+                    .font(.system(size: 13, weight: .medium))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    shortcutRow(keys: "Option + Space", action: "Show popup menu")
+                    shortcutRow(keys: "Ctrl + Option + G", action: "Fix grammar")
+                    shortcutRow(keys: "Ctrl + Option + A", action: "Articulate")
+                    shortcutRow(keys: "Ctrl + Option + C", action: "Craft reply")
+                    shortcutRow(keys: "Ctrl + Option + P", action: "Custom prompt")
+                    shortcutRow(keys: "Ctrl + Option + S", action: "Speak text")
+                }
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+
+            Spacer()
+        }
+        .padding(16)
+    }
+
+    private func shortcutRow(keys: String, action: String) -> some View {
+        HStack {
+            Text(keys)
+                .fontWeight(.medium)
+                .frame(width: 140, alignment: .leading)
+            Text(action)
         }
     }
 
@@ -1994,7 +2106,7 @@ class SettingsWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 440),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -2057,18 +2169,582 @@ class SettingsWindowController: NSWindowController {
     }
 }
 
+// MARK: - TTS Server Manager
+
+class TTSServerManager {
+    static let shared = TTSServerManager()
+
+    private var serverProcess: Process?
+    private let serverScript = "~/.popdraft/llm-tts-server.py"
+    private let serverURL = "http://127.0.0.1:7865"
+
+    func ensureRunning() {
+        // First ensure script exists
+        ensureScriptExists()
+
+        // Check if server is already running
+        TTSClient.shared.checkHealth { [weak self] isHealthy in
+            if !isHealthy {
+                DispatchQueue.main.async {
+                    self?.startServer()
+                }
+            }
+        }
+    }
+
+    private func ensureScriptExists() {
+        let destPath = NSString(string: serverScript).expandingTildeInPath
+        let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
+
+        // Create config dir if needed
+        try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true, attributes: nil)
+
+        // If script doesn't exist, copy from bundle
+        if !FileManager.default.fileExists(atPath: destPath) {
+            if let bundlePath = Bundle.main.path(forResource: "llm-tts-server", ofType: "py") {
+                do {
+                    try FileManager.default.copyItem(atPath: bundlePath, toPath: destPath)
+                    // Make executable
+                    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath)
+                    print("TTS server script copied from bundle to \(destPath)")
+                } catch {
+                    print("Failed to copy TTS server script: \(error)")
+                }
+            } else {
+                print("TTS server script not found in bundle")
+            }
+        }
+    }
+
+    private func startServer() {
+        let expandedPath = NSString(string: serverScript).expandingTildeInPath
+
+        // Check if script exists
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            print("TTS server script not found at: \(expandedPath)")
+            return
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [expandedPath]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            serverProcess = process
+            print("TTS server started (PID: \(process.processIdentifier))")
+        } catch {
+            print("Failed to start TTS server: \(error)")
+        }
+    }
+
+    func stopServer() {
+        if let process = serverProcess, process.isRunning {
+            process.terminate()
+            print("TTS server stopped")
+        }
+        serverProcess = nil
+    }
+}
+
+// MARK: - Launch at Login Manager
+
+class LaunchAtLoginManager {
+    static let shared = LaunchAtLoginManager()
+
+    private let launchAgentPath: String
+    private let bundleIdentifier = "com.popdraft.app"
+
+    init() {
+        let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
+        launchAgentPath = "\(launchAgentsDir)/\(bundleIdentifier).plist"
+    }
+
+    var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: launchAgentPath)
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        if enabled {
+            createLaunchAgent()
+        } else {
+            removeLaunchAgent()
+        }
+    }
+
+    private func createLaunchAgent() {
+        // Get the app bundle path
+        let appPath = Bundle.main.bundlePath
+
+        // Create LaunchAgents directory if needed
+        let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+
+        // Create plist content
+        let plistContent: [String: Any] = [
+            "Label": bundleIdentifier,
+            "ProgramArguments": [appPath + "/Contents/MacOS/PopDraft"],
+            "RunAtLoad": true,
+            "KeepAlive": false
+        ]
+
+        // Write plist
+        let plistData = try? PropertyListSerialization.data(fromPropertyList: plistContent, format: .xml, options: 0)
+        try? plistData?.write(to: URL(fileURLWithPath: launchAgentPath))
+
+        print("Launch at Login enabled: \(launchAgentPath)")
+    }
+
+    private func removeLaunchAgent() {
+        try? FileManager.default.removeItem(atPath: launchAgentPath)
+        print("Launch at Login disabled")
+    }
+}
+
+// MARK: - Onboarding Window
+
+struct OnboardingView: View {
+    @State private var hasAccessibility = false
+    @State private var selectedProvider: LLMConfig.Provider = .llamacpp
+    @State private var apiKey = ""
+    @State private var selectedModel = ""
+    @State private var ollamaModels: [String] = []
+    @State private var checkingPermission = false
+    @State private var isSettingUp = false
+    @State private var setupStatus = ""
+    let onComplete: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // Header
+            VStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 48))
+                    .foregroundColor(.accentColor)
+                Text("Welcome to PopDraft")
+                    .font(.title)
+                    .fontWeight(.bold)
+                Text("System-wide AI text processing for macOS")
+                    .foregroundColor(.secondary)
+            }
+            .padding(.top, 20)
+
+            Divider()
+
+            // Step 1: Accessibility
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: hasAccessibility ? "checkmark.circle.fill" : "1.circle.fill")
+                        .foregroundColor(hasAccessibility ? .green : .accentColor)
+                        .font(.title2)
+                    Text("Grant Accessibility Access")
+                        .font(.headline)
+                    Spacer()
+                }
+
+                Text("PopDraft needs accessibility permission to capture selected text and register keyboard shortcuts.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !hasAccessibility {
+                    Button("Open System Settings") {
+                        openAccessibilitySettings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    Label("Permission granted", systemImage: "checkmark")
+                        .foregroundColor(.green)
+                }
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+
+            // Step 2: Provider Selection
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: hasAccessibility ? "2.circle.fill" : "2.circle")
+                        .foregroundColor(hasAccessibility ? .accentColor : .secondary)
+                        .font(.title2)
+                    Text("Choose Your LLM Backend")
+                        .font(.headline)
+                    Spacer()
+                }
+
+                Picker("", selection: $selectedProvider) {
+                    ForEach(LLMConfig.Provider.allCases, id: \.self) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(!hasAccessibility)
+
+                Text(providerDescription)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+
+                // Model selection for Ollama
+                if selectedProvider == .ollama {
+                    HStack {
+                        Text("Model:")
+                            .font(.callout)
+                        if ollamaModels.isEmpty {
+                            TextField("e.g., qwen2.5:7b", text: $selectedModel)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            Picker("", selection: $selectedModel) {
+                                ForEach(ollamaModels, id: \.self) { model in
+                                    Text(model).tag(model)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                    }
+                    .disabled(!hasAccessibility)
+                }
+
+                // Model selection for OpenAI
+                if selectedProvider == .openai {
+                    TextField("API Key", text: $apiKey)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(!hasAccessibility)
+                    HStack {
+                        Text("Model:")
+                            .font(.callout)
+                        Picker("", selection: $selectedModel) {
+                            ForEach(LLMConfig.openaiModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    .disabled(!hasAccessibility)
+                }
+
+                // Model selection for Claude
+                if selectedProvider == .claude {
+                    TextField("API Key", text: $apiKey)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(!hasAccessibility)
+                    HStack {
+                        Text("Model:")
+                            .font(.callout)
+                        Picker("", selection: $selectedModel) {
+                            ForEach(LLMConfig.claudeModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    .disabled(!hasAccessibility)
+                }
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+            .opacity(hasAccessibility ? 1.0 : 0.6)
+            .onChange(of: selectedProvider) { _, newValue in
+                // Set default model for provider
+                switch newValue {
+                case .llamacpp:
+                    selectedModel = ""
+                case .ollama:
+                    selectedModel = ollamaModels.first ?? "qwen2.5:7b"
+                    fetchOllamaModels()
+                case .openai:
+                    selectedModel = LLMConfig.openaiModels.first ?? "gpt-4o"
+                case .claude:
+                    selectedModel = LLMConfig.claudeModels.first ?? "claude-sonnet-4-20250514"
+                }
+            }
+
+            Spacer()
+
+            // Get Started button with progress
+            VStack(spacing: 8) {
+                if isSettingUp {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        Text(setupStatus)
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(height: 44)
+                } else {
+                    Button(action: completeOnboarding) {
+                        Text("Get Started")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!hasAccessibility)
+                }
+            }
+            .padding(.bottom, 20)
+        }
+        .padding(.horizontal, 24)
+        .frame(width: 450, height: 520)
+        .onAppear {
+            // Prompt system to add this app to Accessibility list (shows up disabled)
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+
+            checkAccessibility()
+            // Start polling for permission
+            Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+                checkAccessibility()
+                if hasAccessibility {
+                    timer.invalidate()
+                }
+            }
+        }
+    }
+
+    private var providerDescription: String {
+        switch selectedProvider {
+        case .llamacpp:
+            return "Runs locally using llama.cpp. Private and free, but requires downloading a model."
+        case .ollama:
+            return "Local models with Ollama. Easy model management with 'ollama pull'."
+        case .openai:
+            return "Use GPT-4o and other OpenAI models. Requires an API key."
+        case .claude:
+            return "Use Claude 3.5/4 models. Requires an Anthropic API key."
+        }
+    }
+
+    private func checkAccessibility() {
+        hasAccessibility = AXIsProcessTrusted()
+    }
+
+    private func openAccessibilitySettings() {
+        // Use AXIsProcessTrustedWithOptions to prompt the system to add THIS app
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+
+        // Also open settings so user can see and toggle
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
+    private func fetchOllamaModels() {
+        guard let url = URL(string: "http://localhost:11434/api/tags") else { return }
+
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["models"] as? [[String: Any]] else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                ollamaModels = models.compactMap { $0["name"] as? String }.sorted()
+                if selectedModel.isEmpty, let first = ollamaModels.first {
+                    selectedModel = first
+                }
+            }
+        }.resume()
+    }
+
+    private func completeOnboarding() {
+        isSettingUp = true
+        setupStatus = "Saving configuration..."
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Save config
+            var config = LLMConfig.load()
+            config.provider = selectedProvider
+
+            switch selectedProvider {
+            case .ollama:
+                config.ollamaModel = selectedModel.isEmpty ? "qwen2.5:7b" : selectedModel
+            case .openai:
+                config.openaiAPIKey = apiKey
+                config.openaiModel = selectedModel.isEmpty ? "gpt-4o" : selectedModel
+            case .claude:
+                config.claudeAPIKey = apiKey
+                config.claudeModel = selectedModel.isEmpty ? "claude-sonnet-4-20250514" : selectedModel
+            case .llamacpp:
+                break
+            }
+            config.save()
+
+            setupStatus = "Enabling launch at login..."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                LaunchAtLoginManager.shared.setEnabled(true)
+
+                setupStatus = "Finalizing setup..."
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    // Mark onboarding complete
+                    let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
+                    try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true, attributes: nil)
+                    let completePath = configDir + "/onboarding_complete"
+                    FileManager.default.createFile(atPath: completePath, contents: nil)
+
+                    setupStatus = "Starting PopDraft..."
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        onComplete()
+                    }
+                }
+            }
+        }
+    }
+}
+
+class OnboardingWindowController: NSWindowController {
+    private var hostingView: NSHostingView<OnboardingView>?
+
+    init(onComplete: @escaping () -> Void) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 450, height: 520),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Welcome to PopDraft"
+        window.center()
+
+        super.init(window: window)
+
+        let view = OnboardingView(onComplete: { [weak self] in
+            onComplete()
+            self?.window?.close()
+        })
+
+        hostingView = NSHostingView(rootView: view)
+        window.contentView = hostingView
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func showWindow() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// MARK: - Hotkey Manager
+
+class HotkeyManager {
+    static let shared = HotkeyManager()
+
+    struct HotkeyConfig {
+        let id: UInt32
+        let keyCode: UInt32
+        let modifiers: UInt32
+        let actionID: String
+        let description: String
+    }
+
+    // Key codes: Space=49, G=5, A=0, C=8, P=35, S=1
+    let hotkeys: [HotkeyConfig] = [
+        HotkeyConfig(id: 1, keyCode: 49, modifiers: UInt32(optionKey), actionID: "popup", description: "Option+Space"),
+        HotkeyConfig(id: 2, keyCode: 5, modifiers: UInt32(controlKey | optionKey), actionID: "grammar", description: "Ctrl+Option+G"),
+        HotkeyConfig(id: 3, keyCode: 0, modifiers: UInt32(controlKey | optionKey), actionID: "articulate", description: "Ctrl+Option+A"),
+        HotkeyConfig(id: 4, keyCode: 8, modifiers: UInt32(controlKey | optionKey), actionID: "answer", description: "Ctrl+Option+C"),
+        HotkeyConfig(id: 5, keyCode: 35, modifiers: UInt32(controlKey | optionKey), actionID: "custom", description: "Ctrl+Option+P"),
+        HotkeyConfig(id: 6, keyCode: 1, modifiers: UInt32(controlKey | optionKey), actionID: "speak", description: "Ctrl+Option+S"),
+    ]
+
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
+    private var eventHandlerRef: EventHandlerRef?
+
+    func registerAll() {
+        // Install single event handler for all hotkeys
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+
+        let handler: EventHandlerUPP = { (_, event, _) -> OSStatus in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+
+            DispatchQueue.main.async {
+                HotkeyManager.shared.handleHotkey(id: hotKeyID.id)
+            }
+            return noErr
+        }
+
+        InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandlerRef)
+
+        // Register each hotkey
+        for config in hotkeys {
+            let hotKeyID = EventHotKeyID(signature: OSType(0x504450), id: config.id) // "PDP" signature
+            var hotKeyRef: EventHotKeyRef?
+
+            let status = RegisterEventHotKey(config.keyCode, config.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+
+            if status == noErr, let ref = hotKeyRef {
+                hotKeyRefs[config.id] = ref
+                print("Registered hotkey: \(config.description) -> \(config.actionID)")
+            } else {
+                print("Failed to register hotkey: \(config.description) (status: \(status))")
+            }
+        }
+    }
+
+    func unregisterAll() {
+        for (_, ref) in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+
+        if let handlerRef = eventHandlerRef {
+            RemoveEventHandler(handlerRef)
+            eventHandlerRef = nil
+        }
+    }
+
+    func handleHotkey(id: UInt32) {
+        guard let config = hotkeys.first(where: { $0.id == id }) else { return }
+
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.triggerAction(actionID: config.actionID)
+        }
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popupController: PopupWindowController?
     var settingsController: SettingsWindowController?
-    var globalHotKeyRef: EventHotKeyRef?
+    var onboardingController: OnboardingWindowController?
+
+    private var isOnboardingComplete: Bool {
+        let path = NSString(string: "~/.popdraft/onboarding_complete").expandingTildeInPath
+        return FileManager.default.fileExists(atPath: path)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create Edit menu for standard text editing commands
         setupEditMenu()
 
+        // Check if onboarding needed
+        if !isOnboardingComplete {
+            showOnboarding()
+            return
+        }
+
+        // Normal startup
+        completeStartup()
+    }
+
+    private func showOnboarding() {
+        onboardingController = OnboardingWindowController(onComplete: { [weak self] in
+            self?.onboardingController = nil
+            self?.completeStartup()
+        })
+        onboardingController?.showWindow()
+    }
+
+    private func completeStartup() {
         // Create status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -2091,8 +2767,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popupController = PopupWindowController()
         settingsController = SettingsWindowController()
 
-        // Register global hotkey (Option + Space)
-        registerGlobalHotKey()
+        // Start TTS server if needed
+        TTSServerManager.shared.ensureRunning()
+
+        // Register all global hotkeys
+        HotkeyManager.shared.registerAll()
 
         print("PopDraft started. Press Option+Space to show popup.")
     }
@@ -2121,11 +2800,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        unregisterGlobalHotKey()
+        HotkeyManager.shared.unregisterAll()
+        TTSServerManager.shared.stopServer()
     }
 
     @objc func showPopup() {
         popupController?.showAtMouseLocation()
+    }
+
+    func triggerAction(actionID: String) {
+        switch actionID {
+        case "popup":
+            showPopup()
+        case "grammar":
+            popupController?.showWithAction(actionName: "Fix grammar and spelling")
+        case "articulate":
+            popupController?.showWithAction(actionName: "Articulate")
+        case "answer":
+            popupController?.showWithAction(actionName: "Craft a reply")
+        case "custom":
+            popupController?.showWithAction(actionName: "Custom prompt...")
+        case "speak":
+            popupController?.showWithAction(actionName: "Read aloud")
+        default:
+            showPopup()
+        }
     }
 
     @objc func showSettings() {
@@ -2141,45 +2840,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    // MARK: - Global Hotkey
-
-    func registerGlobalHotKey() {
-        let hotKeyID = EventHotKeyID(signature: OSType(0x514C4D), id: 1)
-        let modifiers: UInt32 = UInt32(optionKey)
-        let keyCode: UInt32 = 49 // Space
-
-        var hotKeyRef: EventHotKeyRef?
-        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
-
-        if status == noErr {
-            globalHotKeyRef = hotKeyRef
-
-            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-            InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
-                var hotKeyID = EventHotKeyID()
-                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
-
-                if hotKeyID.id == 1 {
-                    DispatchQueue.main.async {
-                        if let appDelegate = NSApp.delegate as? AppDelegate {
-                            appDelegate.showPopup()
-                        }
-                    }
-                }
-                return noErr
-            }, 1, &eventType, nil, nil)
-
-            print("Global hotkey registered: Option+Space")
-        } else {
-            print("Failed to register global hotkey: \(status)")
-        }
-    }
-
-    func unregisterGlobalHotKey() {
-        if let hotKeyRef = globalHotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-        }
-    }
 }
 
 // MARK: - Main

@@ -22,13 +22,8 @@ jobs:
       - name: Build PopDraft
         timeout-minutes: 5
         run: |
-          # Show Swift version
           swiftc --version
-
-          # Compile the Swift app (with optimization for faster build)
           swiftc -O -o PopDraft scripts/PopDraft.swift -framework Cocoa -framework Carbon
-
-          # Verify build
           ls -la PopDraft
           echo "Binary built successfully"
 
@@ -47,7 +42,6 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Create app bundle structure
           APP_NAME="PopDraft"
           DMG_NAME="${APP_NAME}-${VERSION}"
           BUILD_DIR="build/dmg"
@@ -59,7 +53,7 @@ jobs:
           # Copy binary
           cp PopDraft "${APP_BUNDLE}/Contents/MacOS/"
 
-          # Create Info.plist using printf to avoid heredoc issues
+          # Create Info.plist
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -85,27 +79,16 @@ jobs:
             '    <true/>' \
             '    <key>NSHighResolutionCapable</key>' \
             '    <true/>' \
+            '    <key>NSAppleEventsUsageDescription</key>' \
+            '    <string>PopDraft needs to send keystrokes to capture selected text.</string>' \
             '</dict>' \
             '</plist>' > "${APP_BUNDLE}/Contents/Info.plist"
 
-          # Copy resources
-          cp -r scripts/ "${APP_BUNDLE}/Contents/Resources/"
+          # Copy resources (minimal - just what's needed)
+          cp scripts/llm-tts-server.py "${APP_BUNDLE}/Contents/Resources/"
           cp install.sh "${APP_BUNDLE}/Contents/Resources/"
           cp uninstall.sh "${APP_BUNDLE}/Contents/Resources/"
           cp README.md "${APP_BUNDLE}/Contents/Resources/"
-
-          # Create launcher script
-          cat > "${APP_BUNDLE}/Contents/MacOS/PopDraft-Launcher" << 'LAUNCHER'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          RESOURCES="$DIR/../Resources"
-          if [ ! -f ~/.popdraft/installed ]; then
-              osascript -e 'tell app "Terminal" to do script "'"$RESOURCES/install.sh"'"'
-          else
-              exec "$DIR/PopDraft"
-          fi
-          LAUNCHER
-          chmod +x "${APP_BUNDLE}/Contents/MacOS/PopDraft-Launcher"
 
           # Create Applications symlink
           ln -s /Applications "${BUILD_DIR}/Applications"

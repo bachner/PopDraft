@@ -11,148 +11,98 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PopDraft is a macOS tool that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp or Ollama) for text generation and Kokoro-82M for neural TTS, accessible from any application.
+PopDraft is a macOS menu bar app that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp, Ollama, OpenAI, Claude) for text generation and Kokoro-82M for neural TTS.
 
 ## Key Commands
 
 ```bash
-# Installation (idempotent - safe to run multiple times)
-./install.sh              # Full install: scripts, workflows, TTS dependencies
-./uninstall.sh            # Clean removal
+# Installation from source
+./install.sh              # Compile and install PopDraft
 
 # Build DMG for distribution
-./build-dmg.sh 1.0.0      # Creates build/PopDraft-1.0.0.dmg
+./build-dmg.sh 2.0.0      # Creates build/PopDraft-2.0.0.dmg
 
-# Workflow setup (regenerate shortcuts)
-./scripts/setup-workflows.sh
+# Clean removal
+./uninstall.sh
 
-# Compile native chat app manually
-swiftc -o ~/bin/LLMChat scripts/LLMChat.swift -framework Cocoa
-
-# TTS dependency installation
+# TTS dependencies (installed by install.sh)
 brew install espeak-ng
 pip install kokoro soundfile numpy
 
-# TTS server management
-launchctl load ~/Library/LaunchAgents/com.popdraft.tts-server.plist    # Start
-launchctl unload ~/Library/LaunchAgents/com.popdraft.tts-server.plist  # Stop
-tail -f /tmp/llm-tts-server.log                                         # Logs
-curl http://127.0.0.1:7865/health                                       # Health check
-
-# llama.cpp server management (if using llama.cpp backend)
-launchctl load ~/Library/LaunchAgents/com.popdraft.llama-server.plist   # Start
-launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist # Stop
-tail -f /tmp/llm-llama-server.log                                        # Logs
-curl http://localhost:8080/health                                        # Health check
-
-# Test backend connectivity
-# For llama.cpp:
-curl http://localhost:8080/health
-# For Ollama:
-curl http://localhost:11434/api/tags
+# Test TTS server
+curl http://127.0.0.1:7865/health
 ```
 
 ## Architecture
 
 ### Data Flow
 ```
-# Popup Menu Flow (Recommended)
-Copy Text -> Option+Space -> Popup Menu -> Select Action -> LLM API -> Result Preview -> Copy Button
-
-# Keyboard Shortcut Flow
-Selected Text -> Keyboard Shortcut -> Automator Workflow -> llm-clipboard.sh -> LLM API -> Result pasted
+Selected Text -> Option+Space -> Popup Menu -> Select Action -> LLM API -> Result Preview -> Copy
+                      OR
+Selected Text -> Ctrl+Option+Shortcut -> Direct Action -> LLM API -> Result Preview -> Copy
 ```
 
-### Component Layers
+### Files
 
-**Configuration:**
-- `~/.popdraft/config` - Backend selection and settings (ollama or llamacpp)
-- `~/.popdraft/models/` - GGUF model storage for llama.cpp
-- `llm-config.sh` - Configuration helper with unified API abstraction
+**Main App:**
+- `scripts/PopDraft.swift` - Complete macOS app including:
+  - Menu bar with sparkles icon
+  - Popup window for text processing
+  - HotkeyManager for global keyboard shortcuts
+  - OnboardingWindowController for first-run setup
+  - TTSServerManager for TTS subprocess
+  - LaunchAtLoginManager for auto-start
+  - Multi-provider LLM support (llama.cpp, Ollama, OpenAI, Claude)
+  - Settings window with General/LLM/TTS tabs
 
-**Popup Menu App (Primary Interface):**
-- `PopDraft.swift` - Native macOS menu bar app with floating popup
-  - Global hotkey: Option+Space
-  - Searchable action list with 7 actions (including TTS)
-  - Result preview with Copy button (no auto-paste)
-  - State machine: actionList -> processing -> result/error
-  - Reads config from ~/.popdraft/config for backend selection
-  - TTS integration via HTTP server at localhost:7865
-  - LaunchAgent: `~/Library/LaunchAgents/com.popdraft.app.plist`
+**TTS Server:**
+- `scripts/llm-tts-server.py` - Kokoro TTS HTTP server
 
-**Core Engine (for keyboard shortcuts):**
-- `llm-config.sh` - Unified API abstraction for both backends
-- `llm-process.sh` - Text processing using llm-config.sh
-- `llm-clipboard.sh` - Clipboard capture, LLM processing, auto-paste with clipboard restoration
+**Config:**
+- `scripts/llm-config.sh` - Backend configuration helper (for debugging)
 
-**Feature Wrappers (thin scripts calling llm-clipboard.sh):**
-- `llm-grammar.sh`, `llm-articulate.sh`, `llm-answer.sh`, `llm-custom.sh`
+**Build & Install:**
+- `install.sh` - Source installation script
+- `uninstall.sh` - Clean removal
+- `build-dmg.sh` - DMG creation for distribution
+- `.github/workflows/build.yml` - CI/CD for GitHub releases
 
-**Chat System:**
-- `llm-chat.sh` - Launcher, saves context to temp file
-- `llm-chat-session.sh` - Interactive Terminal chat with JSON message history
-- `LLMChat.swift` - Native macOS GUI (Cocoa), async URLSession requests
-
-**TTS:**
-- `llm-tts-server.py` - Persistent TTS server (keeps model loaded, ~400-600MB RAM)
-- `llm-tts.py` - Client that uses server if running, falls back to direct loading
-- `llm-tts.sh` - Shell wrapper for clipboard integration
-- LaunchAgent: `~/Library/LaunchAgents/com.popdraft.tts-server.plist` (auto-start on login)
-
-**LLM Server (llama.cpp backend only):**
-- LaunchAgent: `~/Library/LaunchAgents/com.popdraft.llama-server.plist`
-- Runs `llama-server` with configured model on port 8080
-
-**System Integration:**
-- `setup-workflows.sh` - Generates Automator Quick Action `.workflow` bundles in `~/Library/Services/`
-
-### Keyboard Shortcuts (set via `defaults write pbs NSServicesStatus`)
+### Keyboard Shortcuts (registered in Swift)
+- `Option+Space` - Show popup menu
 - `Ctrl+Option+G` - Grammar Check
 - `Ctrl+Option+A` - Articulate
 - `Ctrl+Option+C` - Craft Answer
 - `Ctrl+Option+P` - Custom Prompt
-- `Ctrl+Option+L` - Chat
 - `Ctrl+Option+S` - Speak (TTS)
 
 ## Configuration
 
-**Config file:** `~/.popdraft/config`
+**Config file:** `~/.popdraft/config.json`
 
-```bash
-# Backend: ollama or llamacpp
-BACKEND=llamacpp
-
-# Ollama settings
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
-
-# llama.cpp settings
-LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=~/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
+```json
+{
+  "provider": "llamacpp",
+  "ollamaModel": "qwen2.5:7b",
+  "openaiAPIKey": "",
+  "openaiModel": "gpt-4o",
+  "claudeAPIKey": "",
+  "claudeModel": "claude-sonnet-4-20250514",
+  "ttsVoice": "af_heart",
+  "ttsSpeed": 1.0
+}
 ```
 
-**Switching backends:** Edit `~/.popdraft/config`, change `BACKEND=`, then restart PopDraft.
-
 **API endpoints:**
-- llama.cpp: `http://localhost:8080` (OpenAI-compatible `/v1/chat/completions`)
-- Ollama: `http://localhost:11434` (`/api/generate`, `/api/chat`)
+- llama.cpp: `http://localhost:8080` (OpenAI-compatible)
+- Ollama: `http://localhost:11434`
+- OpenAI: `https://api.openai.com/v1/chat/completions`
+- Claude: `https://api.anthropic.com/v1/messages`
 
-**TTS voices:** American (`af_heart`, `af_bella`, `am_adam`...) and British (`bf_emma`, `bm_george`...)
-
-## Key Patterns
-
-- Temp files via `mktemp /tmp/llm-*.XXXXXX` for context passing
-- Clipboard state preserved and restored after operations
-- System notifications via `osascript -e 'display notification'`
-- All prompts include language preservation instruction
-- Feature scripts are 3-line wrappers delegating to `llm-clipboard.sh`
-- Unified API in `llm-config.sh` handles backend differences
+**TTS server:** `http://127.0.0.1:7865`
 
 ## Installation Targets
 
-- Scripts: `~/bin/`
-- Config: `~/.popdraft/config`
-- Models: `~/.popdraft/models/`
-- Workflows: `~/Library/Services/`
-- LaunchAgents: `~/Library/LaunchAgents/`
-- PATH update: `~/.zshrc` or `~/.bashrc`
+- App: `/Applications/PopDraft.app`
+- Config: `~/.popdraft/config.json`
+- TTS Script: `~/.popdraft/llm-tts-server.py`
+- LaunchAgent: `~/Library/LaunchAgents/com.popdraft.app.plist` (auto-created by app)
