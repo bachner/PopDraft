@@ -134,6 +134,21 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'ok')
             return
 
+        if parsed.path == '/status':
+            with playback_lock:
+                if current_playback is None:
+                    status = 'idle'
+                elif current_playback.poll() is not None:
+                    status = 'idle'
+                else:
+                    # Check if paused (we need to track this)
+                    status = 'playing'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(status.encode())
+            return
+
         if parsed.path == '/stop':
             stop_playback()
             self.send_response(200)
@@ -169,7 +184,6 @@ class TTSHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/speak':
-            global current_playback, current_audio_file
             params = parse_qs(parsed.query)
             text = params.get('text', [''])[0]
             voice = params.get('voice', ['af_heart'])[0]

@@ -673,6 +673,24 @@ class TTSClient {
         }.resume()
     }
 
+    func checkStatus(completion: @escaping (String) -> Void) {
+        guard let url = URL(string: "\(serverURL)/status") else {
+            completion("error")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let data = data, let status = String(data: data, encoding: .utf8) {
+                completion(status)
+            } else {
+                completion("error")
+            }
+        }.resume()
+    }
+
     func checkHealth(completion: @escaping (Bool) -> Void) {
         guard let url = URL(string: "\(serverURL)/health") else {
             completion(false)
@@ -1182,6 +1200,7 @@ class PopupWindowController: NSWindowController {
     private var clipboardText = ""
     private var resultText = ""
     private var localMonitor: Any?
+    private var ttsStatusTimer: Timer?
 
     init() {
         let window = KeyPanel(
@@ -1338,6 +1357,7 @@ class PopupWindowController: NSWindowController {
     }
 
     func dismiss() {
+        stopTTSStatusPolling()
         stopKeyboardMonitoring()
         window?.orderOut(nil)
     }
@@ -1466,8 +1486,8 @@ class PopupWindowController: NSWindowController {
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
-                        // Playback finished naturally
-                        self?.dismiss()
+                        // Playback started - start polling for completion
+                        self?.startTTSStatusPolling()
                     case .failure(let error):
                         self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
                         self?.updateView()
@@ -1510,7 +1530,27 @@ class PopupWindowController: NSWindowController {
 
     // MARK: - TTS Controls
 
+    private func startTTSStatusPolling() {
+        stopTTSStatusPolling()
+        ttsStatusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            TTSClient.shared.checkStatus { status in
+                DispatchQueue.main.async {
+                    if status == "idle" {
+                        self?.stopTTSStatusPolling()
+                        self?.dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopTTSStatusPolling() {
+        ttsStatusTimer?.invalidate()
+        ttsStatusTimer = nil
+    }
+
     private func stopTTS() {
+        stopTTSStatusPolling()
         TTSClient.shared.stop()
         dismiss()
     }
