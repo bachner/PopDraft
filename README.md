@@ -43,8 +43,13 @@ Direct shortcuts for common actions:
 
 1. Download `PopDraft-x.x.x.dmg` from [Releases](../../releases)
 2. Open the DMG and drag **PopDraft.app** to Applications
-3. Launch PopDraft from Applications
-4. Complete the onboarding:
+3. **First launch (important):** If macOS says the app is "damaged", run this in Terminal:
+   ```bash
+   xattr -cr /Applications/PopDraft.app
+   ```
+   This removes the quarantine flag from unsigned apps downloaded from the internet.
+4. Launch PopDraft from Applications
+5. Complete the onboarding:
    - Grant Accessibility permissions when prompted
    - Choose your LLM backend (llama.cpp, Ollama, OpenAI, or Claude)
    - Enter API key if using OpenAI or Claude
