@@ -2467,14 +2467,19 @@ struct OnboardingView: View {
             // Get Started button with progress
             VStack(spacing: 8) {
                 if isSettingUp {
-                    HStack(spacing: 12) {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                        Text(setupStatus)
-                            .font(.system(size: 13))
+                    VStack(spacing: 6) {
+                        HStack(spacing: 12) {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text(setupStatus)
+                                .font(.system(size: 13))
+                                .foregroundColor(.primary)
+                        }
+                        Text("This may take a few moments...")
+                            .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     }
-                    .frame(height: 44)
+                    .frame(height: 54)
                 } else {
                     Button(action: completeOnboarding) {
                         Text("Get Started")
@@ -2578,7 +2583,7 @@ struct OnboardingView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 LaunchAtLoginManager.shared.setEnabled(true)
 
-                setupStatus = "Finalizing setup..."
+                setupStatus = "Registering keyboard shortcuts..."
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     // Mark onboarding complete
                     let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
@@ -2586,9 +2591,15 @@ struct OnboardingView: View {
                     let completePath = configDir + "/onboarding_complete"
                     FileManager.default.createFile(atPath: completePath, contents: nil)
 
-                    setupStatus = "Starting PopDraft..."
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        onComplete()
+                    setupStatus = "Starting text-to-speech server..."
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        // Pre-start TTS server (the slow part)
+                        TTSServerManager.shared.ensureRunning()
+
+                        setupStatus = "Almost ready..."
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            onComplete()
+                        }
                     }
                 }
             }
