@@ -2174,10 +2174,16 @@ class SettingsWindowController: NSWindowController {
 class DependencyManager {
     static let shared = DependencyManager()
 
+    private let modelURL = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+    private let modelName = "qwen2.5-3b-instruct-q4_k_m.gguf"
+
     struct DependencyStatus {
         var hasHomebrew: Bool = false
         var hasEspeak: Bool = false
         var hasPythonPackages: Bool = false
+        var hasLlamaCpp: Bool = false
+        var hasLlamaModel: Bool = false
+        var isLlamaServerRunning: Bool = false
     }
 
     func checkDependencies() -> DependencyStatus {
@@ -2196,6 +2202,18 @@ class DependencyManager {
         let checkScript = "python3 -c 'import kokoro; import soundfile; import numpy' 2>/dev/null && echo OK"
         let result = runShellCommand(checkScript)
         status.hasPythonPackages = result.contains("OK")
+
+        // Check llama.cpp
+        status.hasLlamaCpp = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server") ||
+                            FileManager.default.fileExists(atPath: "/usr/local/bin/llama-server")
+
+        // Check for model
+        let modelPath = NSString(string: "~/.popdraft/models/\(modelName)").expandingTildeInPath
+        status.hasLlamaModel = FileManager.default.fileExists(atPath: modelPath)
+
+        // Check if server is running
+        let healthCheck = runShellCommand("curl -s http://localhost:8080/health 2>/dev/null")
+        status.isLlamaServerRunning = healthCheck.contains("ok") || healthCheck.contains("OK")
 
         return status
     }
@@ -2230,6 +2248,96 @@ class DependencyManager {
                 completion(success)
             }
         }
+    }
+
+    func installLlamaCpp(statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var status = self.checkDependencies()
+
+            // Install llama.cpp if missing
+            if !status.hasLlamaCpp && status.hasHomebrew {
+                DispatchQueue.main.async { statusCallback("Installing llama.cpp (this may take a few minutes)...") }
+                let brewPath = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/brew") ? "/opt/homebrew/bin/brew" : "/usr/local/bin/brew"
+                let result = self.runShellCommand("\(brewPath) install llama.cpp 2>&1")
+                if result.contains("Error") && !result.contains("already installed") {
+                    print("llama.cpp install warning: \(result)")
+                }
+                status = self.checkDependencies()
+            }
+
+            // Download model if missing
+            if !status.hasLlamaModel {
+                DispatchQueue.main.async { statusCallback("Downloading AI model (~2GB, please wait)...") }
+
+                let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+                try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
+
+                let modelPath = modelsDir + "/\(self.modelName)"
+                let result = self.runShellCommand("curl -L --progress-bar -o '\(modelPath)' '\(self.modelURL)' 2>&1")
+                if result.contains("error") || result.contains("Error") {
+                    print("Model download warning: \(result)")
+                }
+                status = self.checkDependencies()
+            }
+
+            // Create LaunchAgent for llama-server
+            if status.hasLlamaCpp && status.hasLlamaModel {
+                DispatchQueue.main.async { statusCallback("Configuring llama server...") }
+                self.createLlamaLaunchAgent()
+
+                // Start the server
+                DispatchQueue.main.async { statusCallback("Starting llama server...") }
+                _ = self.runShellCommand("launchctl load ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>&1")
+
+                // Wait a moment for server to start
+                Thread.sleep(forTimeInterval: 2.0)
+            }
+
+            DispatchQueue.main.async {
+                completion(status.hasLlamaCpp && status.hasLlamaModel)
+            }
+        }
+    }
+
+    private func createLlamaLaunchAgent() {
+        let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+
+        let modelPath = NSString(string: "~/.popdraft/models/\(modelName)").expandingTildeInPath
+        let llamaServerPath = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server")
+            ? "/opt/homebrew/bin/llama-server"
+            : "/usr/local/bin/llama-server"
+
+        let plistContent = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.popdraft.llama-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>\(llamaServerPath)</string>
+        <string>-m</string>
+        <string>\(modelPath)</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>-ngl</string>
+        <string>99</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/llm-llama-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/llm-llama-server.log</string>
+</dict>
+</plist>
+"""
+        let plistPath = launchAgentsDir + "/com.popdraft.llama-server.plist"
+        try? plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
     }
 
     private func runShellCommand(_ command: String) -> String {
@@ -2667,27 +2775,51 @@ struct OnboardingView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 LaunchAtLoginManager.shared.setEnabled(true)
 
-                // Check and install TTS dependencies
+                // Check and install dependencies
                 setupStatus = "Checking dependencies..."
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    let depStatus = DependencyManager.shared.checkDependencies()
-
-                    if depStatus.hasPythonPackages {
-                        // Dependencies already installed, continue
-                        self.finishOnboarding()
+                    // Install llama.cpp if selected
+                    if selectedProvider == .llamacpp {
+                        let depStatus = DependencyManager.shared.checkDependencies()
+                        if !depStatus.hasLlamaCpp || !depStatus.hasLlamaModel {
+                            DependencyManager.shared.installLlamaCpp(
+                                statusCallback: { status in
+                                    self.setupStatus = status
+                                },
+                                completion: { _ in
+                                    self.installTTSDependencies()
+                                }
+                            )
+                        } else {
+                            self.installTTSDependencies()
+                        }
                     } else {
-                        // Need to install dependencies
-                        DependencyManager.shared.installDependencies(
-                            statusCallback: { status in
-                                self.setupStatus = status
-                            },
-                            completion: { _ in
-                                self.finishOnboarding()
-                            }
-                        )
+                        self.installTTSDependencies()
                     }
                 }
             }
+        }
+    }
+
+    private func installTTSDependencies() {
+        let depStatus = DependencyManager.shared.checkDependencies()
+        if depStatus.hasPythonPackages && depStatus.hasEspeak {
+            // TTS dependencies already installed
+            self.finishOnboarding()
+        } else {
+            // Install TTS dependencies
+            DependencyManager.shared.installDependencies(
+                statusCallback: { status in
+                    DispatchQueue.main.async {
+                        self.setupStatus = status
+                    }
+                },
+                completion: { _ in
+                    DispatchQueue.main.async {
+                        self.finishOnboarding()
+                    }
+                }
+            )
         }
     }
 
