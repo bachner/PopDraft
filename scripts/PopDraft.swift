@@ -36,16 +36,123 @@ struct LLMAction: Identifiable, Hashable {
 // MARK: - LLM Configuration
 
 struct LLMConfig {
-    enum Backend: String {
-        case ollama
-        case llamacpp
+    enum Provider: String, CaseIterable {
+        case llamacpp = "llamacpp"
+        case ollama = "ollama"
+        case openai = "openai"
+        case claude = "claude"
+
+        var displayName: String {
+            switch self {
+            case .llamacpp: return "llama.cpp (Local)"
+            case .ollama: return "Ollama"
+            case .openai: return "OpenAI"
+            case .claude: return "Claude"
+            }
+        }
     }
 
-    var backend: Backend = .ollama
-    var ollamaURL: String = "http://localhost:11434"
+    var provider: Provider = .llamacpp
     var llamacppURL: String = "http://localhost:8080"
-    var ollamaModel: String = "qwen3-coder:480b-cloud"
-    var ollamaFallbackModel: String? = "qwen2.5-coder:7b"
+    var ollamaURL: String = "http://localhost:11434"
+    var ollamaModel: String = "qwen2.5:7b"
+    var openaiAPIKey: String = ""
+    var openaiModel: String = "gpt-4o"
+    var claudeAPIKey: String = ""
+    var claudeModel: String = "claude-sonnet-4-5-20250514"
+    var ttsVoice: String = "af_heart"
+    var ttsSpeed: Double = 1.0
+
+    // TTS voice list
+    static let ttsVoices: [(id: String, name: String, grade: String)] = [
+        // American English - Female
+        ("af_heart", "Heart (American Female)", "A"),
+        ("af_bella", "Bella (American Female)", "A-"),
+        ("af_nicole", "Nicole (American Female)", "B-"),
+        ("af_aoede", "Aoede (American Female)", "C+"),
+        ("af_kore", "Kore (American Female)", "C+"),
+        ("af_sarah", "Sarah (American Female)", "C+"),
+        ("af_alloy", "Alloy (American Female)", "C"),
+        ("af_nova", "Nova (American Female)", "C"),
+        ("af_sky", "Sky (American Female)", "C-"),
+        ("af_jessica", "Jessica (American Female)", "D"),
+        ("af_river", "River (American Female)", "D"),
+        // American English - Male
+        ("am_fenrir", "Fenrir (American Male)", "C+"),
+        ("am_michael", "Michael (American Male)", "C+"),
+        ("am_puck", "Puck (American Male)", "C+"),
+        ("am_echo", "Echo (American Male)", "D"),
+        ("am_eric", "Eric (American Male)", "D"),
+        ("am_liam", "Liam (American Male)", "D"),
+        ("am_onyx", "Onyx (American Male)", "D"),
+        ("am_adam", "Adam (American Male)", "F+"),
+        ("am_santa", "Santa (American Male)", "D-"),
+        // British English - Female
+        ("bf_emma", "Emma (British Female)", "B-"),
+        ("bf_isabella", "Isabella (British Female)", "C"),
+        ("bf_alice", "Alice (British Female)", "D"),
+        ("bf_lily", "Lily (British Female)", "D"),
+        // British English - Male
+        ("bm_fable", "Fable (British Male)", "C"),
+        ("bm_george", "George (British Male)", "C"),
+        ("bm_lewis", "Lewis (British Male)", "D+"),
+        ("bm_daniel", "Daniel (British Male)", "D"),
+        // French
+        ("ff_siwis", "Siwis (French Female)", "B-"),
+        // Italian
+        ("if_sara", "Sara (Italian Female)", "C"),
+        ("im_nicola", "Nicola (Italian Male)", "C"),
+        // Japanese
+        ("jf_alpha", "Alpha (Japanese Female)", "C+"),
+        ("jf_gongitsune", "Gongitsune (Japanese Female)", "C"),
+        ("jf_tebukuro", "Tebukuro (Japanese Female)", "C"),
+        ("jf_nezumi", "Nezumi (Japanese Female)", "C-"),
+        ("jm_kumo", "Kumo (Japanese Male)", "C-"),
+        // Hindi
+        ("hf_alpha", "Alpha (Hindi Female)", "C"),
+        ("hf_beta", "Beta (Hindi Female)", "C"),
+        ("hm_omega", "Omega (Hindi Male)", "C"),
+        ("hm_psi", "Psi (Hindi Male)", "C"),
+        // Spanish
+        ("ef_dora", "Dora (Spanish Female)", "-"),
+        ("em_alex", "Alex (Spanish Male)", "-"),
+        // Mandarin Chinese
+        ("zf_xiaobei", "Xiaobei (Chinese Female)", "D"),
+        ("zf_xiaoni", "Xiaoni (Chinese Female)", "D"),
+        ("zf_xiaoxiao", "Xiaoxiao (Chinese Female)", "D"),
+        ("zf_xiaoyi", "Xiaoyi (Chinese Female)", "D"),
+        ("zm_yunjian", "Yunjian (Chinese Male)", "D"),
+        ("zm_yunxi", "Yunxi (Chinese Male)", "D"),
+        ("zm_yunxia", "Yunxia (Chinese Male)", "D"),
+        ("zm_yunyang", "Yunyang (Chinese Male)", "D"),
+        // Brazilian Portuguese
+        ("pf_dora", "Dora (Portuguese Female)", "-"),
+        ("pm_alex", "Alex (Portuguese Male)", "-"),
+    ]
+
+    // Model lists
+    static let openaiModels = [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "o1",
+        "o1-mini",
+        "o1-pro",
+        "o3-mini",
+        "Custom..."
+    ]
+
+    static let claudeModels = [
+        "claude-sonnet-4-5-20250514",
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-4-20250514",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+        "Custom..."
+    ]
 
     static func load() -> LLMConfig {
         var config = LLMConfig()
@@ -67,22 +174,56 @@ struct LLMConfig {
             let value = parts[1].trimmingCharacters(in: .whitespaces)
 
             switch key {
-            case "BACKEND":
-                config.backend = Backend(rawValue: value) ?? .ollama
-            case "OLLAMA_URL":
-                config.ollamaURL = value
+            case "PROVIDER":
+                config.provider = Provider(rawValue: value) ?? .llamacpp
             case "LLAMACPP_URL":
                 config.llamacppURL = value
+            case "OLLAMA_URL":
+                config.ollamaURL = value
             case "OLLAMA_MODEL":
                 config.ollamaModel = value
-            case "OLLAMA_FALLBACK_MODEL":
-                config.ollamaFallbackModel = value.isEmpty ? nil : value
+            case "OPENAI_API_KEY":
+                config.openaiAPIKey = value
+            case "OPENAI_MODEL":
+                config.openaiModel = value
+            case "CLAUDE_API_KEY":
+                config.claudeAPIKey = value
+            case "CLAUDE_MODEL":
+                config.claudeModel = value
+            case "TTS_VOICE":
+                config.ttsVoice = value
+            case "TTS_SPEED":
+                config.ttsSpeed = Double(value) ?? 1.0
             default:
                 break
             }
         }
 
         return config
+    }
+
+    func save() {
+        let configDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".popdraft")
+        let configPath = configDir.appendingPathComponent("config")
+
+        // Create directory if needed
+        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        var lines: [String] = []
+        lines.append("PROVIDER=\(provider.rawValue)")
+        lines.append("LLAMACPP_URL=\(llamacppURL)")
+        lines.append("OLLAMA_URL=\(ollamaURL)")
+        lines.append("OLLAMA_MODEL=\(ollamaModel)")
+        lines.append("OPENAI_API_KEY=\(openaiAPIKey)")
+        lines.append("OPENAI_MODEL=\(openaiModel)")
+        lines.append("CLAUDE_API_KEY=\(claudeAPIKey)")
+        lines.append("CLAUDE_MODEL=\(claudeModel)")
+        lines.append("TTS_VOICE=\(ttsVoice)")
+        lines.append("TTS_SPEED=\(ttsSpeed)")
+
+        let content = lines.joined(separator: "\n")
+        try? content.write(to: configPath, atomically: true, encoding: .utf8)
     }
 }
 
@@ -91,7 +232,7 @@ struct LLMConfig {
 class LLMClient {
     static let shared = LLMClient()
     private var config: LLMConfig
-    private var activeBackend: LLMConfig.Backend?
+    private var activeProvider: LLMConfig.Provider?
 
     init() {
         config = LLMConfig.load()
@@ -99,17 +240,27 @@ class LLMClient {
 
     func reloadConfig() {
         config = LLMConfig.load()
-        activeBackend = nil
+        activeProvider = nil
     }
 
-    var backendName: String {
-        let backend = activeBackend ?? config.backend
-        return backend == .llamacpp ? "llama.cpp" : "Ollama"
+    var providerName: String {
+        return (activeProvider ?? config.provider).displayName
     }
 
-    // Check if a backend is available (synchronous, with short timeout)
-    private func isBackendAvailable(_ backend: LLMConfig.Backend) -> Bool {
-        let urlString = backend == .llamacpp
+    var currentModel: String {
+        switch activeProvider ?? config.provider {
+        case .llamacpp: return "Local Model"
+        case .ollama: return config.ollamaModel
+        case .openai: return config.openaiModel
+        case .claude: return config.claudeModel
+        }
+    }
+
+    // Check if a local backend is available
+    private func isLocalBackendAvailable(_ provider: LLMConfig.Provider) -> Bool {
+        guard provider == .llamacpp || provider == .ollama else { return true }
+
+        let urlString = provider == .llamacpp
             ? "\(config.llamacppURL)/health"
             : "\(config.ollamaURL)/api/tags"
 
@@ -132,37 +283,64 @@ class LLMClient {
         return isAvailable
     }
 
-    // Select backend with fallback
-    private func selectBackend() -> LLMConfig.Backend? {
-        // Try configured backend first
-        if isBackendAvailable(config.backend) {
-            activeBackend = config.backend
-            return config.backend
+    private func logError(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let logMessage = "[\(timestamp)] PopDraft: \(message)\n"
+        let logPath = "/tmp/popdraft.log"
+        if let data = logMessage.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logPath) {
+                if let handle = FileHandle(forWritingAtPath: logPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: logPath, contents: data)
+            }
         }
-
-        // Try fallback
-        let fallback: LLMConfig.Backend = config.backend == .llamacpp ? .ollama : .llamacpp
-        if isBackendAvailable(fallback) {
-            activeBackend = fallback
-            return fallback
-        }
-
-        activeBackend = nil
-        return nil
+        print(logMessage, terminator: "")
     }
 
     func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<String, Error>) -> Void) {
-        // Auto-select backend with fallback
-        guard let backend = selectBackend() else {
-            completion(.failure(NSError(domain: "No LLM backend available. Start llama-server or Ollama.", code: -1)))
-            return
-        }
+        let provider = config.provider
+        activeProvider = provider
 
-        switch backend {
+        // Generate with the configured provider, fallback to llama.cpp on failure
+        generateWithProvider(provider, prompt: prompt, systemPrompt: systemPrompt) { [weak self] result in
+            switch result {
+            case .success:
+                completion(result)
+            case .failure(let error):
+                // If not already using llama.cpp, try falling back to it
+                if provider != .llamacpp {
+                    self?.logError("Provider \(provider.displayName) failed: \(error.localizedDescription). Falling back to llama.cpp.")
+                    self?.activeProvider = .llamacpp
+                    self?.generateWithProvider(.llamacpp, prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+                } else {
+                    completion(result)
+                }
+            }
+        }
+    }
+
+    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        switch provider {
         case .llamacpp:
             generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
         case .ollama:
             generateOllama(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        case .openai:
+            if config.openaiAPIKey.isEmpty {
+                completion(.failure(NSError(domain: "OpenAI API key not configured", code: -1)))
+                return
+            }
+            generateOpenAI(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        case .claude:
+            if config.claudeAPIKey.isEmpty {
+                completion(.failure(NSError(domain: "Claude API key not configured", code: -1)))
+                return
+            }
+            generateClaude(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
         }
     }
 
@@ -236,23 +414,6 @@ class LLMClient {
     // MARK: - Ollama Backend
 
     private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
-        // Try primary model first, then fallback
-        generateOllamaWithModel(model: config.ollamaModel, prompt: prompt, systemPrompt: systemPrompt) { [weak self] result in
-            switch result {
-            case .success:
-                completion(result)
-            case .failure(let error):
-                // If primary model fails and we have a fallback, try it
-                if let fallback = self?.config.ollamaFallbackModel {
-                    self?.generateOllamaWithModel(model: fallback, prompt: prompt, systemPrompt: systemPrompt, completion: completion)
-                } else {
-                    completion(.failure(error))
-                }
-            }
-        }
-    }
-
-    private func generateOllamaWithModel(model: String, prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
         guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -264,7 +425,7 @@ class LLMClient {
         request.timeoutInterval = 120
 
         var body: [String: Any] = [
-            "model": model,
+            "model": config.ollamaModel,
             "prompt": prompt,
             "stream": false
         ]
@@ -301,10 +462,135 @@ class LLMClient {
                     completion(.success(cleaned))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorMsg = json["error"] as? String {
-                    // Model not found or other Ollama error - trigger fallback
                     completion(.failure(NSError(domain: errorMsg, code: -1)))
                 } else {
                     completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - OpenAI Backend
+
+    private func generateOpenAI(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(config.openaiAPIKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 120
+
+        var messages: [[String: String]] = []
+        if let system = systemPrompt {
+            messages.append(["role": "system", "content": system])
+        }
+        messages.append(["role": "user", "content": prompt])
+
+        let body: [String: Any] = [
+            "model": config.openaiModel,
+            "messages": messages,
+            "max_tokens": 4096
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "No data", code: -1)))
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let message = first["message"] as? [String: Any],
+                   let content = message["content"] as? String {
+                    completion(.success(content))
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorObj = json["error"] as? [String: Any],
+                          let message = errorObj["message"] as? String {
+                    completion(.failure(NSError(domain: "OpenAI: \(message)", code: -1)))
+                } else {
+                    completion(.failure(NSError(domain: "Invalid OpenAI response", code: -1)))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - Claude Backend
+
+    private func generateClaude(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(config.claudeAPIKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.timeoutInterval = 120
+
+        var body: [String: Any] = [
+            "model": config.claudeModel,
+            "max_tokens": 4096,
+            "messages": [["role": "user", "content": prompt]]
+        ]
+
+        if let system = systemPrompt {
+            body["system"] = system
+        }
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "No data", code: -1)))
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let content = json["content"] as? [[String: Any]],
+                   let first = content.first,
+                   let text = first["text"] as? String {
+                    completion(.success(text))
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorObj = json["error"] as? [String: Any],
+                          let message = errorObj["message"] as? String {
+                    completion(.failure(NSError(domain: "Claude: \(message)", code: -1)))
+                } else {
+                    completion(.failure(NSError(domain: "Invalid Claude response", code: -1)))
                 }
             } catch {
                 completion(.failure(error))
@@ -318,17 +604,24 @@ class LLMClient {
 class TTSClient {
     static let shared = TTSClient()
     private let serverURL = "http://127.0.0.1:7865"
+    var isPaused = false
 
-    func speak(text: String, completion: @escaping (Result<Void, Error>) -> Void) {
-        // URL encode the text
+    func speak(text: String, voice: String? = nil, speed: Double? = nil, completion: @escaping (Result<Void, Error>) -> Void) {
+        isPaused = false
+
+        // Load config for defaults
+        let config = LLMConfig.load()
+        let useVoice = voice ?? config.ttsVoice
+        let useSpeed = speed ?? config.ttsSpeed
+
         guard let encodedText = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "\(serverURL)/speak?text=\(encodedText)&play=1") else {
+              let url = URL(string: "\(serverURL)/speak?text=\(encodedText)&voice=\(useVoice)&speed=\(useSpeed)&play=1") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 60
+        request.timeoutInterval = 300  // Long timeout for TTS
 
         URLSession.shared.dataTask(with: request) { _, response, error in
             if let error = error {
@@ -341,6 +634,42 @@ class TTSClient {
             } else {
                 completion(.failure(NSError(domain: "TTS server error", code: -1)))
             }
+        }.resume()
+    }
+
+    func stop(completion: ((Bool) -> Void)? = nil) {
+        guard let url = URL(string: "\(serverURL)/stop") else {
+            completion?(false)
+            return
+        }
+        isPaused = false
+        URLSession.shared.dataTask(with: url) { _, response, _ in
+            let success = (response as? HTTPURLResponse)?.statusCode == 200
+            completion?(success)
+        }.resume()
+    }
+
+    func pause(completion: ((Bool) -> Void)? = nil) {
+        guard let url = URL(string: "\(serverURL)/pause") else {
+            completion?(false)
+            return
+        }
+        URLSession.shared.dataTask(with: url) { [weak self] _, response, _ in
+            let success = (response as? HTTPURLResponse)?.statusCode == 200
+            if success { self?.isPaused = true }
+            completion?(success)
+        }.resume()
+    }
+
+    func resume(completion: ((Bool) -> Void)? = nil) {
+        guard let url = URL(string: "\(serverURL)/resume") else {
+            completion?(false)
+            return
+        }
+        URLSession.shared.dataTask(with: url) { [weak self] _, response, _ in
+            let success = (response as? HTTPURLResponse)?.statusCode == 200
+            if success { self?.isPaused = false }
+            completion?(success)
         }.resume()
     }
 
@@ -428,6 +757,7 @@ enum PopupState {
     case actionList
     case customPrompt
     case processing
+    case ttsPlaying(isPaused: Bool)
     case result(String)
     case error(String)
 }
@@ -446,6 +776,9 @@ struct PopupView: View {
     let onCopy: () -> Void
     let onBack: () -> Void
     let onDismiss: () -> Void
+    let onTTSStop: () -> Void
+    let onTTSPause: () -> Void
+    let onTTSResume: () -> Void
 
     // Computed filtered actions - recomputes when searchText changes
     private var actions: [LLMAction] {
@@ -464,6 +797,8 @@ struct PopupView: View {
                 customPromptView
             case .processing:
                 processingView
+            case .ttsPlaying(let isPaused):
+                ttsPlayingView(isPaused: isPaused)
             case .result(let text):
                 resultView(text: text)
             case .error(let message):
@@ -474,6 +809,25 @@ struct PopupView: View {
         .background(VisualEffectView(material: .popover, blendingMode: .behindWindow))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .shadow(color: .black.opacity(0.2), radius: 10, x: 0, y: 5)
+        .onChange(of: stateKey) { _, newKey in
+            if newKey == "customPrompt" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    isCustomPromptFocused = true
+                }
+            }
+        }
+    }
+
+    // Helper to get state key for onChange comparison
+    private var stateKey: String {
+        switch state {
+        case .actionList: return "actionList"
+        case .customPrompt: return "customPrompt"
+        case .processing: return "processing"
+        case .ttsPlaying: return "ttsPlaying"
+        case .result: return "result"
+        case .error: return "error"
+        }
     }
 
     // MARK: - Action List View
@@ -587,6 +941,74 @@ struct PopupView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding()
+    }
+
+    // MARK: - TTS Playing View
+
+    private func ttsPlayingView(isPaused: Bool) -> some View {
+        VStack(spacing: 8) {
+            // Header with status
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.wave.2.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.accentColor)
+
+                Text(isPaused ? "Paused" : "Reading...")
+                    .font(.system(size: 12, weight: .medium))
+
+                Spacer()
+
+                // Keyboard hints
+                Text("Space: \(isPaused ? "Play" : "Pause") | Esc: Stop")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+
+            // Compact control buttons
+            HStack(spacing: 8) {
+                // Pause/Resume button
+                Button(action: {
+                    if isPaused {
+                        onTTSResume()
+                    } else {
+                        onTTSPause()
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isPaused ? "play.fill" : "pause.fill")
+                            .font(.system(size: 10))
+                        Text(isPaused ? "Play" : "Pause")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+
+                // Stop button
+                Button(action: onTTSStop) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10))
+                        Text("Stop")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Color.red.opacity(0.15))
+                    .foregroundColor(.red)
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Result View
@@ -804,7 +1226,10 @@ class PopupWindowController: NSWindowController {
             onSelect: { [weak self] action in self?.selectAction(action) },
             onCopy: { [weak self] in self?.copyResult() },
             onBack: { [weak self] in self?.goBack() },
-            onDismiss: { [weak self] in self?.dismiss() }
+            onDismiss: { [weak self] in self?.dismiss() },
+            onTTSStop: { [weak self] in self?.stopTTS() },
+            onTTSPause: { [weak self] in self?.pauseTTS() },
+            onTTSResume: { [weak self] in self?.resumeTTS() }
         )
 
         if hostingView == nil {
@@ -927,6 +1352,21 @@ class PopupWindowController: NSWindowController {
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self = self else { return event }
 
+            // Handle Cmd+C in result state - copy and close
+            if event.modifierFlags.contains(.command) {
+                let key = event.charactersIgnoringModifiers?.lowercased()
+                if key == "c" {
+                    if case .result = self.state {
+                        self.copyResult()
+                        return nil
+                    }
+                }
+                // Allow Cmd+C/V/X/A through for text editing in other states
+                if key == "c" || key == "v" || key == "x" || key == "a" {
+                    return event  // Pass through to text field
+                }
+            }
+
             let actions = ActionManager.shared.filteredActions(searchText: self.searchText)
 
             switch event.keyCode {
@@ -934,10 +1374,23 @@ class PopupWindowController: NSWindowController {
                 switch self.state {
                 case .actionList:
                     self.dismiss()
+                case .ttsPlaying:
+                    self.stopTTS()  // Stop TTS and dismiss
                 default:
                     self.goBack()
                 }
                 return nil
+
+            case 49: // Space - pause/play TTS
+                if case .ttsPlaying(let isPaused) = self.state {
+                    if isPaused {
+                        self.resumeTTS()
+                    } else {
+                        self.pauseTTS()
+                    }
+                    return nil
+                }
+                return event
 
             case 125: // Down arrow
                 if case .actionList = self.state, self.selectedIndex < actions.count - 1 {
@@ -1006,14 +1459,14 @@ class PopupWindowController: NSWindowController {
 
         // Handle TTS action
         if action.isTTS {
-            state = .processing
+            state = .ttsPlaying(isPaused: false)
             updateView()
 
             TTSClient.shared.speak(text: clipboardText) { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
-                        self?.showNotification(title: "PopDraft", message: "Reading aloud...")
+                        // Playback finished naturally
                         self?.dismiss()
                     case .failure(let error):
                         self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
@@ -1055,6 +1508,33 @@ class PopupWindowController: NSWindowController {
         dismiss()
     }
 
+    // MARK: - TTS Controls
+
+    private func stopTTS() {
+        TTSClient.shared.stop()
+        dismiss()
+    }
+
+    private func pauseTTS() {
+        TTSClient.shared.pause { [weak self] success in
+            guard success else { return }
+            DispatchQueue.main.async {
+                self?.state = .ttsPlaying(isPaused: true)
+                self?.updateView()
+            }
+        }
+    }
+
+    private func resumeTTS() {
+        TTSClient.shared.resume { [weak self] success in
+            guard success else { return }
+            DispatchQueue.main.async {
+                self?.state = .ttsPlaying(isPaused: false)
+                self?.updateView()
+            }
+        }
+    }
+
     private func showNotification(title: String, message: String) {
         let script = """
         display notification "\(message.replacingOccurrences(of: "\"", with: "\\\""))" with title "\(title.replacingOccurrences(of: "\"", with: "\\\""))"
@@ -1069,103 +1549,368 @@ class PopupWindowController: NSWindowController {
 // MARK: - Settings Window
 
 struct SettingsView: View {
-    @State private var primaryModel: String = ""
-    @State private var fallbackModel: String = ""
-    @State private var availableModels: [String] = []
+    enum SettingsTab: String, CaseIterable {
+        case llm = "LLM"
+        case tts = "Text-to-Speech"
+    }
+
+    @State private var selectedTab: SettingsTab = .llm
+    @State private var selectedProvider: LLMConfig.Provider = .llamacpp
+    @State private var ollamaModel: String = ""
+    @State private var openaiAPIKey: String = ""
+    @State private var openaiModel: String = ""
+    @State private var claudeAPIKey: String = ""
+    @State private var claudeModel: String = ""
+    @State private var availableOllamaModels: [String] = []
     @State private var isLoading = false
-    @State private var statusMessage: String = ""
-    let onSave: (String, String) -> Void
+    @State private var customOpenAIModel: String = ""
+    @State private var customClaudeModel: String = ""
+    @State private var ttsVoice: String = "af_heart"
+    @State private var ttsSpeed: Double = 1.0
+    @State private var voiceSearchText: String = ""
+    let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Model Settings")
-                .font(.headline)
-
-            if isLoading {
-                ProgressView("Loading models...")
-                    .padding()
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Primary model
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Primary Model")
-                            .font(.system(size: 12, weight: .medium))
-                        if availableModels.isEmpty {
-                            TextField("e.g., qwen3-coder:480b-cloud", text: $primaryModel)
-                                .textFieldStyle(.roundedBorder)
-                        } else {
-                            Picker("", selection: $primaryModel) {
-                                ForEach(availableModels, id: \.self) { model in
-                                    Text(model).tag(model)
-                                }
-                            }
-                            .labelsHidden()
-                        }
-                        Text("Cloud models (e.g., *-cloud) use Ollama's servers")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    }
-
-                    // Fallback model
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Fallback Model")
-                            .font(.system(size: 12, weight: .medium))
-                        if availableModels.isEmpty {
-                            TextField("e.g., qwen2.5-coder:7b", text: $fallbackModel)
-                                .textFieldStyle(.roundedBorder)
-                        } else {
-                            Picker("", selection: $fallbackModel) {
-                                Text("None").tag("")
-                                ForEach(availableModels, id: \.self) { model in
-                                    Text(model).tag(model)
-                                }
-                            }
-                            .labelsHidden()
-                        }
-                        Text("Used when primary model is unavailable")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(.horizontal)
-
-                if !statusMessage.isEmpty {
-                    Text(statusMessage)
-                        .font(.system(size: 11))
-                        .foregroundColor(.green)
-                }
-
-                HStack(spacing: 12) {
-                    Button("Cancel") {
-                        onCancel()
-                    }
-                    .keyboardShortcut(.cancelAction)
-
-                    Button("Save") {
-                        onSave(primaryModel, fallbackModel)
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(primaryModel.isEmpty)
-                }
-                .padding(.top, 8)
-            }
+    private var filteredVoices: [(id: String, name: String, grade: String)] {
+        if voiceSearchText.isEmpty {
+            return LLMConfig.ttsVoices
         }
-        .padding(20)
-        .frame(width: 350)
-        .onAppear {
-            loadCurrentConfig()
-            fetchModels()
+        return LLMConfig.ttsVoices.filter {
+            $0.name.localizedCaseInsensitiveContains(voiceSearchText) ||
+            $0.id.localizedCaseInsensitiveContains(voiceSearchText)
         }
     }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Tab bar
+            HStack(spacing: 0) {
+                ForEach(SettingsTab.allCases, id: \.self) { tab in
+                    Button(action: { selectedTab = tab }) {
+                        Text(tab.rawValue)
+                            .font(.system(size: 12, weight: selectedTab == tab ? .semibold : .regular))
+                            .foregroundColor(selectedTab == tab ? .accentColor : .secondary)
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 16)
+                            .background(
+                                selectedTab == tab ?
+                                Color.accentColor.opacity(0.1) : Color.clear
+                            )
+                            .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+
+            Divider()
+                .padding(.top, 8)
+
+            // Tab content
+            switch selectedTab {
+            case .llm:
+                llmSettingsTab
+            case .tts:
+                ttsSettingsTab
+            }
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    onCancel()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Save") {
+                    saveSettings()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+        }
+        .frame(width: 420, height: 440)
+        .onAppear {
+            loadCurrentConfig()
+            if selectedProvider == .ollama {
+                fetchOllamaModels()
+            }
+        }
+        .onChange(of: selectedProvider) { _, newValue in
+            if newValue == .ollama {
+                fetchOllamaModels()
+            }
+        }
+    }
+
+    // MARK: - LLM Settings Tab
+
+    private var llmSettingsTab: some View {
+        VStack(spacing: 12) {
+            // Provider selection
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Provider")
+                    .font(.system(size: 12, weight: .medium))
+                Picker("", selection: $selectedProvider) {
+                    ForEach(LLMConfig.Provider.allCases, id: \.self) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+
+            // Provider-specific settings
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    switch selectedProvider {
+                    case .llamacpp:
+                        llamacppSettings
+                    case .ollama:
+                        ollamaSettings
+                    case .openai:
+                        openaiSettings
+                    case .claude:
+                        claudeSettings
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .frame(maxHeight: 200)
+        }
+    }
+
+    // MARK: - TTS Settings Tab
+
+    private var ttsSettingsTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Voice selection
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Voice")
+                    .font(.system(size: 12, weight: .medium))
+
+                // Search field
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 12))
+                    TextField("Search voices...", text: $voiceSearchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                }
+                .padding(6)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+
+                // Voice list
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(filteredVoices, id: \.id) { voice in
+                            HStack {
+                                Image(systemName: ttsVoice == voice.id ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(ttsVoice == voice.id ? .accentColor : .secondary)
+                                    .font(.system(size: 14))
+
+                                Text(voice.name)
+                                    .font(.system(size: 12))
+
+                                Spacer()
+
+                                Text("Grade: \(voice.grade)")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 6)
+                            .padding(.horizontal, 8)
+                            .background(ttsVoice == voice.id ? Color.accentColor.opacity(0.1) : Color.clear)
+                            .cornerRadius(4)
+                            .onTapGesture {
+                                ttsVoice = voice.id
+                            }
+                        }
+                    }
+                }
+                .frame(height: 160)
+                .background(Color(NSColor.textBackgroundColor))
+                .cornerRadius(6)
+            }
+
+            // Speed slider
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Speed")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text(String(format: "%.1fx", ttsSpeed))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+
+                HStack {
+                    Text("0.5x")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Slider(value: $ttsSpeed, in: 0.5...2.0, step: 0.1)
+                    Text("2.0x")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Test button
+            Button(action: testVoice) {
+                HStack {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 10))
+                    Text("Test Voice")
+                        .font(.system(size: 12))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.1))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+
+            Spacer()
+        }
+        .padding(16)
+    }
+
+    private func testVoice() {
+        TTSClient.shared.speak(text: "Hello! This is a test of the selected voice.", voice: ttsVoice, speed: ttsSpeed) { _ in }
+    }
+
+    // MARK: - Provider Settings Views
+
+    private var llamacppSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("llama.cpp runs locally on your machine.")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+
+            Text("Server URL: http://localhost:8080")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.secondary)
+
+            Text("No configuration needed - uses the model loaded in llama-server.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var ollamaSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if isLoading {
+                ProgressView("Loading models...")
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Model")
+                        .font(.system(size: 12, weight: .medium))
+                    if availableOllamaModels.isEmpty {
+                        TextField("e.g., qwen2.5:7b", text: $ollamaModel)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        Picker("", selection: $ollamaModel) {
+                            ForEach(availableOllamaModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                }
+
+                Text("If Ollama fails, PopDraft will fall back to llama.cpp")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var openaiSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("API Key")
+                    .font(.system(size: 12, weight: .medium))
+                SecureField("sk-...", text: $openaiAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                Text("Get your API key from platform.openai.com")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Model")
+                    .font(.system(size: 12, weight: .medium))
+                Picker("", selection: $openaiModel) {
+                    ForEach(LLMConfig.openaiModels, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
+                }
+                .labelsHidden()
+
+                if openaiModel == "Custom..." {
+                    TextField("Enter model name", text: $customOpenAIModel)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private var claudeSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("API Key")
+                    .font(.system(size: 12, weight: .medium))
+                SecureField("sk-ant-...", text: $claudeAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                Text("Get your API key from console.anthropic.com")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Model")
+                    .font(.system(size: 12, weight: .medium))
+                Picker("", selection: $claudeModel) {
+                    ForEach(LLMConfig.claudeModels, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
+                }
+                .labelsHidden()
+
+                if claudeModel == "Custom..." {
+                    TextField("Enter model name", text: $customClaudeModel)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    // MARK: - Helper Methods
 
     private func loadCurrentConfig() {
         let config = LLMConfig.load()
-        primaryModel = config.ollamaModel
-        fallbackModel = config.ollamaFallbackModel ?? ""
+        selectedProvider = config.provider
+        ollamaModel = config.ollamaModel
+        openaiAPIKey = config.openaiAPIKey
+        openaiModel = LLMConfig.openaiModels.contains(config.openaiModel) ? config.openaiModel : "Custom..."
+        if openaiModel == "Custom..." {
+            customOpenAIModel = config.openaiModel
+        }
+        claudeAPIKey = config.claudeAPIKey
+        claudeModel = LLMConfig.claudeModels.contains(config.claudeModel) ? config.claudeModel : "Custom..."
+        if claudeModel == "Custom..." {
+            customClaudeModel = config.claudeModel
+        }
+        ttsVoice = config.ttsVoice
+        ttsSpeed = config.ttsSpeed
     }
 
-    private func fetchModels() {
+    private func fetchOllamaModels() {
         isLoading = true
         guard let url = URL(string: "http://localhost:11434/api/tags") else {
             isLoading = false
@@ -1181,17 +1926,26 @@ struct SettingsView: View {
                     return
                 }
 
-                availableModels = models.compactMap { $0["name"] as? String }.sorted()
+                availableOllamaModels = models.compactMap { $0["name"] as? String }.sorted()
 
-                // Ensure current selections are in the list
-                if !primaryModel.isEmpty && !availableModels.contains(primaryModel) {
-                    availableModels.insert(primaryModel, at: 0)
-                }
-                if !fallbackModel.isEmpty && !availableModels.contains(fallbackModel) {
-                    availableModels.append(fallbackModel)
+                if !ollamaModel.isEmpty && !availableOllamaModels.contains(ollamaModel) {
+                    availableOllamaModels.insert(ollamaModel, at: 0)
                 }
             }
         }.resume()
+    }
+
+    private func saveSettings() {
+        var config = LLMConfig()
+        config.provider = selectedProvider
+        config.ollamaModel = ollamaModel
+        config.openaiAPIKey = openaiAPIKey
+        config.openaiModel = openaiModel == "Custom..." ? customOpenAIModel : openaiModel
+        config.claudeAPIKey = claudeAPIKey
+        config.claudeModel = claudeModel == "Custom..." ? customClaudeModel : claudeModel
+        config.ttsVoice = ttsVoice
+        config.ttsSpeed = ttsSpeed
+        onSave(config)
     }
 }
 
@@ -1200,7 +1954,7 @@ class SettingsWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 350, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 440),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1211,8 +1965,8 @@ class SettingsWindowController: NSWindowController {
         super.init(window: window)
 
         let view = SettingsView(
-            onSave: { [weak self] primary, fallback in
-                self?.saveConfig(primary: primary, fallback: fallback)
+            onSave: { [weak self] config in
+                self?.saveConfig(config)
                 self?.window?.close()
             },
             onCancel: { [weak self] in
@@ -1231,8 +1985,8 @@ class SettingsWindowController: NSWindowController {
     func showWindow() {
         // Recreate the view to refresh data
         let view = SettingsView(
-            onSave: { [weak self] primary, fallback in
-                self?.saveConfig(primary: primary, fallback: fallback)
+            onSave: { [weak self] config in
+                self?.saveConfig(config)
                 self?.window?.close()
             },
             onCancel: { [weak self] in
@@ -1246,47 +2000,15 @@ class SettingsWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func saveConfig(primary: String, fallback: String) {
-        let configPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".popdraft/config")
-
-        // Read existing config
-        var lines: [String] = []
-        if let contents = try? String(contentsOf: configPath, encoding: .utf8) {
-            lines = contents.components(separatedBy: .newlines)
-        }
-
-        // Update or add model settings
-        var foundPrimary = false
-        var foundFallback = false
-
-        for i in 0..<lines.count {
-            if lines[i].hasPrefix("OLLAMA_MODEL=") {
-                lines[i] = "OLLAMA_MODEL=\(primary)"
-                foundPrimary = true
-            } else if lines[i].hasPrefix("OLLAMA_FALLBACK_MODEL=") {
-                lines[i] = "OLLAMA_FALLBACK_MODEL=\(fallback)"
-                foundFallback = true
-            }
-        }
-
-        if !foundPrimary {
-            lines.append("OLLAMA_MODEL=\(primary)")
-        }
-        if !foundFallback {
-            lines.append("OLLAMA_FALLBACK_MODEL=\(fallback)")
-        }
-
-        // Write config
-        let newContent = lines.joined(separator: "\n")
-        try? newContent.write(to: configPath, atomically: true, encoding: .utf8)
+    private func saveConfig(_ config: LLMConfig) {
+        config.save()
 
         // Reload config in LLMClient
         LLMClient.shared.reloadConfig()
 
         // Show notification
         let script = """
-        display notification "Models updated: \(primary)" with title "PopDraft"
+        display notification "Settings saved - Provider: \(config.provider.displayName)" with title "PopDraft"
         """
         let task = Process()
         task.launchPath = "/usr/bin/osascript"
@@ -1304,6 +2026,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var globalHotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Create Edit menu for standard text editing commands
+        setupEditMenu()
+
         // Create status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -1314,12 +2039,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Show Popup (⌥Space)", action: #selector(showPopup), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Show Popup", action: #selector(showPopup), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "About PopDraft", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
         statusItem?.menu = menu
 
         // Create controllers
@@ -1330,6 +2055,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerGlobalHotKey()
 
         print("PopDraft started. Press Option+Space to show popup.")
+    }
+
+    private func setupEditMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu (required)
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit PopDraft", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Edit menu
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1347,7 +2095,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "PopDraft"
-        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nBackend: \(LLMClient.shared.backendName)\n\nBuilt by Ofer Bachner"
+        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nProvider: \(LLMClient.shared.providerName)\nModel: \(LLMClient.shared.currentModel)\n\nBuilt by Ofer Bachner"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

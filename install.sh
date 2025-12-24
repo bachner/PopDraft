@@ -21,23 +21,213 @@ mkdir -p "$MODELS_DIR"
 
 # Backend selection
 echo "Choose your LLM backend:"
-echo "  1) Ollama (recommended for beginners - easy model management)"
-echo "  2) llama.cpp (lighter weight - direct model loading)"
+echo "  1) llama.cpp [default] - runs locally, downloads model (~4GB)"
+echo "  2) Ollama - local/cloud models, easy management"
+echo "  3) OpenAI API - GPT-4o, GPT-4 (requires API key)"
+echo "  4) Claude API - Claude 3.5 Sonnet (requires API key)"
 echo ""
-read -p "Enter choice [1-2, default=1]: " BACKEND_CHOICE
+read -p "Enter choice [1-4, default=1]: " BACKEND_CHOICE
 BACKEND_CHOICE=${BACKEND_CHOICE:-1}
 
-SELECTED_BACKEND="ollama"
-if [ "$BACKEND_CHOICE" = "2" ]; then
-    SELECTED_BACKEND="llamacpp"
-fi
+case "$BACKEND_CHOICE" in
+    2) SELECTED_BACKEND="ollama" ;;
+    3) SELECTED_BACKEND="openai" ;;
+    4) SELECTED_BACKEND="claude" ;;
+    *) SELECTED_BACKEND="llamacpp" ;;
+esac
 
 echo ""
 echo "Selected backend: $SELECTED_BACKEND"
 echo ""
 
 # Backend-specific setup
-if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
+if [ "$SELECTED_BACKEND" = "openai" ]; then
+    echo "Setting up OpenAI API..."
+    echo ""
+    echo "Get your API key from: https://platform.openai.com/api-keys"
+    echo ""
+    read -p "Enter your OpenAI API key: " OPENAI_API_KEY
+
+    if [ -z "$OPENAI_API_KEY" ]; then
+        echo "[ERROR] API key is required for OpenAI backend"
+        exit 1
+    fi
+
+    echo ""
+    echo "Available models:"
+    echo "  1) gpt-4o [default] - best quality, faster"
+    echo "  2) gpt-4o-mini - cheaper, good quality"
+    echo "  3) gpt-4-turbo - high quality"
+    echo ""
+    read -p "Enter choice [1-3, default=1]: " MODEL_CHOICE
+
+    case "$MODEL_CHOICE" in
+        2) OPENAI_MODEL="gpt-4o-mini" ;;
+        3) OPENAI_MODEL="gpt-4-turbo" ;;
+        *) OPENAI_MODEL="gpt-4o" ;;
+    esac
+
+    echo "  [OK] Using model: $OPENAI_MODEL"
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+# PopDraft Configuration
+BACKEND=openai
+
+# OpenAI settings
+OPENAI_API_KEY=$OPENAI_API_KEY
+OPENAI_MODEL=$OPENAI_MODEL
+EOF
+
+    echo "  [OK] Configuration saved to $CONFIG_FILE"
+
+elif [ "$SELECTED_BACKEND" = "claude" ]; then
+    echo "Setting up Claude API..."
+    echo ""
+    echo "Get your API key from: https://console.anthropic.com/settings/keys"
+    echo ""
+    read -p "Enter your Anthropic API key: " CLAUDE_API_KEY
+
+    if [ -z "$CLAUDE_API_KEY" ]; then
+        echo "[ERROR] API key is required for Claude backend"
+        exit 1
+    fi
+
+    echo ""
+    echo "Available models:"
+    echo "  1) claude-sonnet-4-20250514 [default] - best balance"
+    echo "  2) claude-3-5-sonnet-20241022 - great for coding"
+    echo "  3) claude-3-5-haiku-20241022 - faster, cheaper"
+    echo ""
+    read -p "Enter choice [1-3, default=1]: " MODEL_CHOICE
+
+    case "$MODEL_CHOICE" in
+        2) CLAUDE_MODEL="claude-3-5-sonnet-20241022" ;;
+        3) CLAUDE_MODEL="claude-3-5-haiku-20241022" ;;
+        *) CLAUDE_MODEL="claude-sonnet-4-20250514" ;;
+    esac
+
+    echo "  [OK] Using model: $CLAUDE_MODEL"
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+# PopDraft Configuration
+BACKEND=claude
+
+# Claude/Anthropic settings
+CLAUDE_API_KEY=$CLAUDE_API_KEY
+CLAUDE_MODEL=$CLAUDE_MODEL
+EOF
+
+    echo "  [OK] Configuration saved to $CONFIG_FILE"
+
+elif [ "$SELECTED_BACKEND" = "ollama" ]; then
+    echo "Setting up Ollama..."
+
+    # Check if Ollama is installed
+    OLLAMA_INSTALLED=false
+    if command -v ollama &> /dev/null; then
+        OLLAMA_INSTALLED=true
+        echo "  [OK] Ollama is installed"
+    else
+        echo "  Ollama is not installed."
+        echo ""
+        read -p "Would you like to install Ollama via Homebrew? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if command -v brew &> /dev/null; then
+                echo "  Installing Ollama..."
+                brew install ollama
+                OLLAMA_INSTALLED=true
+                echo "  [OK] Ollama installed"
+                echo ""
+                echo "  Starting Ollama service..."
+                brew services start ollama
+                sleep 3
+            else
+                echo "  [ERROR] Homebrew not found. Please install Ollama manually from https://ollama.ai"
+                exit 1
+            fi
+        else
+            echo "  Please install Ollama from https://ollama.ai and run this installer again."
+            exit 1
+        fi
+    fi
+
+    # Check if Ollama is running
+    OLLAMA_RUNNING=false
+    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        OLLAMA_RUNNING=true
+        echo "  [OK] Ollama is running"
+    else
+        echo "  [WARN] Ollama is not running. Starting it..."
+        if command -v brew &> /dev/null; then
+            brew services start ollama 2>/dev/null || ollama serve &
+        else
+            ollama serve &
+        fi
+        sleep 3
+        if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            OLLAMA_RUNNING=true
+            echo "  [OK] Ollama started"
+        else
+            echo "  [WARN] Could not start Ollama. Please start it manually."
+        fi
+    fi
+
+    # Model selection
+    SELECTED_MODEL="qwen2.5:7b"
+    FALLBACK_MODEL=""
+
+    if [ "$OLLAMA_RUNNING" = true ]; then
+        echo ""
+        echo "Available Ollama models:"
+
+        MODELS=$(curl -s http://localhost:11434/api/tags | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    models = [m['name'] for m in data.get('models', [])]
+    for i, m in enumerate(models[:15], 1):
+        print(f'  {i}) {m}')
+    if len(models) > 15:
+        print(f'  ... and {len(models) - 15} more')
+except:
+    pass
+" 2>/dev/null)
+
+        if [ -n "$MODELS" ]; then
+            echo "$MODELS"
+        else
+            echo "  No models found. You can pull models with: ollama pull <model>"
+        fi
+
+        echo ""
+        echo "Enter model name (or press Enter for default):"
+        echo "  Cloud models: qwen3-coder:480b-cloud, llama3:70b-cloud"
+        echo "  Local models: qwen2.5:7b, llama3:8b, mistral:7b"
+        echo ""
+        read -p "Model [default: qwen2.5:7b]: " USER_MODEL
+        if [ -n "$USER_MODEL" ]; then
+            SELECTED_MODEL="$USER_MODEL"
+        fi
+    fi
+
+    echo "  [OK] Using model: $SELECTED_MODEL"
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+# PopDraft Configuration
+BACKEND=ollama
+
+# Ollama settings
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=$SELECTED_MODEL
+EOF
+
+    echo "  [OK] Configuration saved to $CONFIG_FILE"
+
+elif [ "$SELECTED_BACKEND" = "llamacpp" ]; then
     echo "Setting up llama.cpp..."
 
     # Install llama.cpp via Homebrew
@@ -105,99 +295,9 @@ if [ "$SELECTED_BACKEND" = "llamacpp" ]; then
 # PopDraft Configuration
 BACKEND=llamacpp
 
-# Ollama settings (not used when BACKEND=llamacpp)
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
-
 # llama.cpp settings
 LLAMACPP_URL=http://localhost:8080
 LLAMACPP_MODEL_PATH=$MODELS_DIR/${MODEL_FILE:-model.gguf}
-EOF
-
-    echo "  [OK] Configuration saved to $CONFIG_FILE"
-
-else
-    # Ollama setup
-    echo "Checking Ollama..."
-    OLLAMA_RUNNING=false
-    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-        OLLAMA_RUNNING=true
-        echo "  [OK] Ollama is running"
-    else
-        echo "  [WARN] Ollama doesn't appear to be running at localhost:11434"
-        echo "         Please install Ollama from https://ollama.ai and start it"
-        echo ""
-        read -p "Continue anyway? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-
-    # Model selection
-    SELECTED_MODEL="qwen3-coder:480b-cloud"
-    FALLBACK_MODEL="qwen2.5-coder:7b"
-
-    if [ "$OLLAMA_RUNNING" = true ]; then
-        echo ""
-        echo "Available Ollama models:"
-
-        # Get list of models
-        MODELS=$(curl -s http://localhost:11434/api/tags | python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    models = [m['name'] for m in data.get('models', [])]
-    for i, m in enumerate(models[:15], 1):
-        print(f'  {i}) {m}')
-    if len(models) > 15:
-        print(f'  ... and {len(models) - 15} more')
-except:
-    pass
-" 2>/dev/null)
-
-        if [ -n "$MODELS" ]; then
-            echo "$MODELS"
-            echo ""
-            echo "Enter model name for PRIMARY model (cloud models recommended):"
-            echo "  - Cloud models (e.g., qwen3-coder:480b-cloud) use Ollama's servers"
-            echo "  - Local models run on your machine"
-            echo ""
-            read -p "Primary model [default: qwen3-coder:480b-cloud]: " USER_MODEL
-            if [ -n "$USER_MODEL" ]; then
-                SELECTED_MODEL="$USER_MODEL"
-            fi
-
-            echo ""
-            echo "Enter model name for FALLBACK model (local model recommended):"
-            echo "  This is used when the primary model is unavailable."
-            echo ""
-            read -p "Fallback model [default: qwen2.5-coder:7b]: " USER_FALLBACK
-            if [ -n "$USER_FALLBACK" ]; then
-                FALLBACK_MODEL="$USER_FALLBACK"
-            fi
-        else
-            echo "  Could not fetch models. Using defaults."
-        fi
-    fi
-
-    echo ""
-    echo "  Primary model: $SELECTED_MODEL"
-    echo "  Fallback model: $FALLBACK_MODEL"
-
-    # Write config
-    cat > "$CONFIG_FILE" << EOF
-# PopDraft Configuration
-BACKEND=ollama
-
-# Ollama settings
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=$SELECTED_MODEL
-OLLAMA_FALLBACK_MODEL=$FALLBACK_MODEL
-
-# llama.cpp settings (not used when BACKEND=ollama)
-LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=$MODELS_DIR/model.gguf
 EOF
 
     echo "  [OK] Configuration saved to $CONFIG_FILE"

@@ -20,6 +20,10 @@ SAMPLE_RATE = 24000
 PID_FILE = os.path.expanduser("~/.llm-tts-server.pid")
 DEFAULT_PORT = 7865
 
+# Track current playback process
+current_playback = None
+current_audio_file = None
+
 def load_model():
     """Load Kokoro model once at startup."""
     global pipeline
@@ -52,11 +56,42 @@ def text_to_speech(text, voice='af_heart', speed=1.0):
 
     return audio_path
 
+def stop_playback():
+    """Stop current playback if any."""
+    global current_playback, current_audio_file
+    if current_playback and current_playback.poll() is None:
+        current_playback.terminate()
+        current_playback.wait()
+    current_playback = None
+    if current_audio_file and os.path.exists(current_audio_file):
+        try:
+            os.unlink(current_audio_file)
+        except:
+            pass
+    current_audio_file = None
+
+def pause_playback():
+    """Pause current playback using SIGSTOP."""
+    global current_playback
+    if current_playback and current_playback.poll() is None:
+        current_playback.send_signal(signal.SIGSTOP)
+        return True
+    return False
+
+def resume_playback():
+    """Resume paused playback using SIGCONT."""
+    global current_playback
+    if current_playback and current_playback.poll() is None:
+        current_playback.send_signal(signal.SIGCONT)
+        return True
+    return False
+
 class TTSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress logging
 
     def do_GET(self):
+        global current_playback, current_audio_file
         parsed = urlparse(self.path)
 
         if parsed.path == '/health':
@@ -64,6 +99,40 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'ok')
+            return
+
+        if parsed.path == '/stop':
+            stop_playback()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'stopped')
+            return
+
+        if parsed.path == '/pause':
+            if pause_playback():
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'paused')
+            else:
+                self.send_response(404)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'nothing playing')
+            return
+
+        if parsed.path == '/resume':
+            if resume_playback():
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'resumed')
+            else:
+                self.send_response(404)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'nothing to resume')
             return
 
         if parsed.path == '/speak':
@@ -81,11 +150,20 @@ class TTSHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                # Stop any existing playback
+                stop_playback()
+
                 audio_path = text_to_speech(text, voice=voice, speed=speed)
                 if audio_path:
                     if play:
-                        subprocess.run(["afplay", audio_path], check=True)
-                        os.unlink(audio_path)
+                        current_audio_file = audio_path
+                        current_playback = subprocess.Popen(["afplay", audio_path])
+                        current_playback.wait()  # Wait for playback to finish
+                        # Clean up after playback
+                        if current_audio_file and os.path.exists(current_audio_file):
+                            os.unlink(current_audio_file)
+                        current_audio_file = None
+                        current_playback = None
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/plain')
                         self.end_headers()

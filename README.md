@@ -33,8 +33,10 @@ Direct shortcuts for common actions:
 - macOS 13+ (Ventura or later)
 - Python 3.10+ (for TTS features)
 - **One of the following backends:**
-  - **llama.cpp** (recommended) - Lightweight, direct model loading
-  - **Ollama** - Easy model management
+  - **llama.cpp** (default) - Runs locally, no account needed
+  - **Ollama** - Local models with easy management
+  - **OpenAI API** - GPT-4o and other OpenAI models (requires API key)
+  - **Claude API** - Claude 3.5/4 models (requires API key)
 
 ## Installation
 
@@ -54,8 +56,9 @@ cd popdraft
 ```
 
 The installer will prompt you to choose:
-1. **Backend**: llama.cpp or Ollama
+1. **Backend**: llama.cpp (default), Ollama, OpenAI, or Claude
 2. **Model** (if llama.cpp): Download size from 2GB to 8.5GB
+3. **API Key** (if OpenAI/Claude): Enter your API key
 
 ### Build DMG
 
@@ -66,33 +69,64 @@ The installer will prompt you to choose:
 
 ## Backend Options
 
-### llama.cpp (Recommended)
+### llama.cpp (Default)
 
-Minimal inference server that loads GGUF models directly. No GUI app required.
+Minimal inference server that loads GGUF models directly. Runs completely locally.
 
 **Pros:**
-- Smaller footprint
-- Direct model control
+- No account or API key needed
+- Complete privacy - data never leaves your machine
 - Auto-starts with the system
 
 **Setup:** The installer handles everything:
 - Installs llama.cpp via Homebrew
-- Downloads your chosen model
+- Downloads your chosen model (~4GB)
 - Sets up auto-start LaunchAgent
 
 ### Ollama
 
-Convenient model management with automatic updates.
+Local model management with easy switching between models.
 
 **Pros:**
 - Easy model switching (`ollama pull model-name`)
-- Automatic model updates
-- Web UI available
+- Supports cloud models via Ollama's service
+- Good for trying different models
 
 **Setup:**
-1. Install from [ollama.ai](https://ollama.ai)
+1. Choose Ollama during installation (offers to install via Homebrew if needed)
 2. Run `ollama pull qwen2.5:7b` (or your preferred model)
-3. Choose Ollama during PopDraft installation
+
+### OpenAI API
+
+Use GPT-4o and other OpenAI models via their API.
+
+**Pros:**
+- Access to latest GPT models
+- No local compute needed
+- Fast responses
+
+**Setup:**
+1. Get an API key from [platform.openai.com](https://platform.openai.com)
+2. Choose OpenAI during installation
+3. Enter your API key when prompted
+
+**Available models:** gpt-4o, gpt-4o-mini, gpt-4.1, o1, o3-mini, and more
+
+### Claude API
+
+Use Claude 3.5/4 models via Anthropic's API.
+
+**Pros:**
+- Excellent at writing and analysis tasks
+- Strong reasoning capabilities
+- No local compute needed
+
+**Setup:**
+1. Get an API key from [console.anthropic.com](https://console.anthropic.com)
+2. Choose Claude during installation
+3. Enter your API key when prompted
+
+**Available models:** claude-sonnet-4-5, claude-opus-4-5, claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku
 
 ## Usage
 
@@ -140,35 +174,51 @@ llm-tts.py -o output.wav "Save to file"
 Configuration file: `~/.popdraft/config`
 
 ```bash
-# Backend: ollama or llamacpp
-BACKEND=llamacpp
+# Provider: llamacpp, ollama, openai, or claude
+PROVIDER=llamacpp
+
+# llama.cpp settings
+LLAMACPP_URL=http://localhost:8080
 
 # Ollama settings
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_FALLBACK_MODEL=
 
-# llama.cpp settings
-LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=~/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
+# OpenAI settings
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+
+# Claude settings
+CLAUDE_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-sonnet-4-5-20250514
 ```
 
-### Switch Backends
+### Switch Providers
 
+**Option 1: Use Settings UI**
+1. Click the sparkles icon in the menu bar
+2. Select **Settings...**
+3. Choose your provider and configure options
+
+**Option 2: Edit config file**
 1. Edit `~/.popdraft/config`
-2. Change `BACKEND=ollama` or `BACKEND=llamacpp`
-3. Restart PopDraft (or log out/in)
+2. Change `PROVIDER=` to your desired provider
+3. Restart PopDraft
 
 ### Change Model
 
 **For llama.cpp:**
 1. Download a GGUF model to `~/.popdraft/models/`
-2. Update `LLAMACPP_MODEL_PATH` in config
-3. Restart the llama server: `launchctl kickstart -k gui/$(id -u)/com.popdraft.llama-server`
+2. Restart the llama server: `launchctl kickstart -k gui/$(id -u)/com.popdraft.llama-server`
 
 **For Ollama:**
 1. Pull the model: `ollama pull model-name`
-2. Update `OLLAMA_MODEL` in config
-3. Restart PopDraft
+2. Update `OLLAMA_MODEL` in config or use Settings UI
+
+**For OpenAI/Claude:**
+1. Update the model in Settings UI, or
+2. Edit `OPENAI_MODEL` or `CLAUDE_MODEL` in config
 
 ### Change Keyboard Shortcuts
 
@@ -244,6 +294,11 @@ curl http://localhost:11434/api/tags
 
 # Start Ollama app if needed
 ```
+
+**For OpenAI/Claude:**
+- Verify your API key is correct in Settings
+- Check your account has available credits
+- Ensure you have network connectivity
 
 ### TTS issues
 
