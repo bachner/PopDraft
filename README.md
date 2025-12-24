@@ -146,6 +146,10 @@ Look for the sparkles icon in your menu bar.
 - `Escape` - Close popup / Go back
 - Type to filter actions
 
+**During TTS playback:**
+- `Space` - Pause / Resume
+- `Escape` - Stop and close
+
 ### Keyboard Shortcuts
 
 1. **Select text** in any application

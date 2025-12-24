@@ -11,8 +11,15 @@ import tempfile
 import subprocess
 import signal
 import atexit
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads."""
+    daemon_threads = True
 
 # Global pipeline (loaded once)
 pipeline = None
@@ -20,7 +27,8 @@ SAMPLE_RATE = 24000
 PID_FILE = os.path.expanduser("~/.llm-tts-server.pid")
 DEFAULT_PORT = 7865
 
-# Track current playback process
+# Track current playback process (thread-safe)
+playback_lock = threading.Lock()
 current_playback = None
 current_audio_file = None
 
@@ -59,32 +67,57 @@ def text_to_speech(text, voice='af_heart', speed=1.0):
 def stop_playback():
     """Stop current playback if any."""
     global current_playback, current_audio_file
-    if current_playback and current_playback.poll() is None:
-        current_playback.terminate()
-        current_playback.wait()
-    current_playback = None
-    if current_audio_file and os.path.exists(current_audio_file):
-        try:
-            os.unlink(current_audio_file)
-        except:
-            pass
-    current_audio_file = None
+    with playback_lock:
+        if current_playback and current_playback.poll() is None:
+            current_playback.terminate()
+            try:
+                current_playback.wait(timeout=1)
+            except:
+                current_playback.kill()
+        current_playback = None
+        if current_audio_file and os.path.exists(current_audio_file):
+            try:
+                os.unlink(current_audio_file)
+            except:
+                pass
+        current_audio_file = None
 
 def pause_playback():
     """Pause current playback using SIGSTOP."""
     global current_playback
-    if current_playback and current_playback.poll() is None:
-        current_playback.send_signal(signal.SIGSTOP)
-        return True
+    with playback_lock:
+        if current_playback and current_playback.poll() is None:
+            current_playback.send_signal(signal.SIGSTOP)
+            return True
     return False
 
 def resume_playback():
     """Resume paused playback using SIGCONT."""
     global current_playback
-    if current_playback and current_playback.poll() is None:
-        current_playback.send_signal(signal.SIGCONT)
-        return True
+    with playback_lock:
+        if current_playback and current_playback.poll() is None:
+            current_playback.send_signal(signal.SIGCONT)
+            return True
     return False
+
+def playback_monitor(audio_path):
+    """Monitor playback and cleanup when done."""
+    global current_playback, current_audio_file
+    while True:
+        with playback_lock:
+            if current_playback is None:
+                break
+            if current_playback.poll() is not None:
+                # Playback finished
+                if current_audio_file and os.path.exists(current_audio_file):
+                    try:
+                        os.unlink(current_audio_file)
+                    except:
+                        pass
+                current_audio_file = None
+                current_playback = None
+                break
+        threading.Event().wait(0.1)  # Check every 100ms
 
 class TTSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -136,6 +169,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/speak':
+            global current_playback, current_audio_file
             params = parse_qs(parsed.query)
             text = params.get('text', [''])[0]
             voice = params.get('voice', ['af_heart'])[0]
@@ -156,18 +190,16 @@ class TTSHandler(BaseHTTPRequestHandler):
                 audio_path = text_to_speech(text, voice=voice, speed=speed)
                 if audio_path:
                     if play:
-                        current_audio_file = audio_path
-                        current_playback = subprocess.Popen(["afplay", audio_path])
-                        current_playback.wait()  # Wait for playback to finish
-                        # Clean up after playback
-                        if current_audio_file and os.path.exists(current_audio_file):
-                            os.unlink(current_audio_file)
-                        current_audio_file = None
-                        current_playback = None
+                        with playback_lock:
+                            current_audio_file = audio_path
+                            current_playback = subprocess.Popen(["afplay", audio_path])
+                        # Start monitor thread to cleanup when done
+                        threading.Thread(target=playback_monitor, args=(audio_path,), daemon=True).start()
+                        # Return immediately - don't wait for playback
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/plain')
                         self.end_headers()
-                        self.wfile.write(b'ok')
+                        self.wfile.write(b'playing')
                     else:
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/plain')
@@ -269,8 +301,8 @@ def main():
     # Write PID file
     write_pid()
 
-    # Start server
-    server = HTTPServer(('127.0.0.1', args.port), TTSHandler)
+    # Start server (threaded to handle concurrent requests)
+    server = ThreadingHTTPServer(('127.0.0.1', args.port), TTSHandler)
     print(f"TTS server listening on http://127.0.0.1:{args.port}", file=sys.stderr)
     server.serve_forever()
 
