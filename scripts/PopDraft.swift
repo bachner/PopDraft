@@ -2169,6 +2169,90 @@ class SettingsWindowController: NSWindowController {
     }
 }
 
+// MARK: - Dependency Manager
+
+class DependencyManager {
+    static let shared = DependencyManager()
+
+    struct DependencyStatus {
+        var hasHomebrew: Bool = false
+        var hasEspeak: Bool = false
+        var hasPythonPackages: Bool = false
+    }
+
+    func checkDependencies() -> DependencyStatus {
+        var status = DependencyStatus()
+
+        // Check Homebrew
+        status.hasHomebrew = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/brew") ||
+                            FileManager.default.fileExists(atPath: "/usr/local/bin/brew")
+
+        // Check espeak-ng
+        status.hasEspeak = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/espeak-ng") ||
+                          FileManager.default.fileExists(atPath: "/usr/local/bin/espeak-ng") ||
+                          FileManager.default.fileExists(atPath: "/usr/bin/espeak")
+
+        // Check Python packages
+        let checkScript = "python3 -c 'import kokoro; import soundfile; import numpy' 2>/dev/null && echo OK"
+        let result = runShellCommand(checkScript)
+        status.hasPythonPackages = result.contains("OK")
+
+        return status
+    }
+
+    func installDependencies(statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var success = true
+
+            // Check current status
+            let status = self.checkDependencies()
+
+            // Install espeak-ng if missing (and homebrew available)
+            if !status.hasEspeak && status.hasHomebrew {
+                DispatchQueue.main.async { statusCallback("Installing espeak-ng...") }
+                let result = self.runShellCommand("/opt/homebrew/bin/brew install espeak-ng 2>&1 || /usr/local/bin/brew install espeak-ng 2>&1")
+                if result.contains("Error") {
+                    print("espeak-ng install warning: \(result)")
+                }
+            }
+
+            // Install Python packages if missing
+            if !status.hasPythonPackages {
+                DispatchQueue.main.async { statusCallback("Installing TTS packages (this may take a minute)...") }
+                let result = self.runShellCommand("python3 -m pip install --user --quiet kokoro soundfile numpy 2>&1")
+                if result.contains("ERROR") {
+                    print("pip install warning: \(result)")
+                    success = false
+                }
+            }
+
+            DispatchQueue.main.async {
+                completion(success)
+            }
+        }
+    }
+
+    private func runShellCommand(_ command: String) -> String {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", command]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return "Error: \(error)"
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
 // MARK: - TTS Server Manager
 
 class TTSServerManager {
@@ -2583,24 +2667,47 @@ struct OnboardingView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 LaunchAtLoginManager.shared.setEnabled(true)
 
-                setupStatus = "Registering keyboard shortcuts..."
+                // Check and install TTS dependencies
+                setupStatus = "Checking dependencies..."
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    // Mark onboarding complete
-                    let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
-                    try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true, attributes: nil)
-                    let completePath = configDir + "/onboarding_complete"
-                    FileManager.default.createFile(atPath: completePath, contents: nil)
+                    let depStatus = DependencyManager.shared.checkDependencies()
 
-                    setupStatus = "Starting text-to-speech server..."
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        // Pre-start TTS server (the slow part)
-                        TTSServerManager.shared.ensureRunning()
-
-                        setupStatus = "Almost ready..."
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            onComplete()
-                        }
+                    if depStatus.hasPythonPackages {
+                        // Dependencies already installed, continue
+                        self.finishOnboarding()
+                    } else {
+                        // Need to install dependencies
+                        DependencyManager.shared.installDependencies(
+                            statusCallback: { status in
+                                self.setupStatus = status
+                            },
+                            completion: { _ in
+                                self.finishOnboarding()
+                            }
+                        )
                     }
+                }
+            }
+        }
+    }
+
+    private func finishOnboarding() {
+        setupStatus = "Registering keyboard shortcuts..."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Mark onboarding complete
+            let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true, attributes: nil)
+            let completePath = configDir + "/onboarding_complete"
+            FileManager.default.createFile(atPath: completePath, contents: nil)
+
+            setupStatus = "Starting text-to-speech server..."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                // Pre-start TTS server
+                TTSServerManager.shared.ensureRunning()
+
+                setupStatus = "Almost ready..."
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    onComplete()
                 }
             }
         }
