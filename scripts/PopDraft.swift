@@ -2692,7 +2692,7 @@ struct OnboardingView: View {
     }
 
     private func finishOnboarding() {
-        setupStatus = "Registering keyboard shortcuts..."
+        setupStatus = "Finalizing setup..."
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             // Mark onboarding complete
             let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
@@ -2700,16 +2700,8 @@ struct OnboardingView: View {
             let completePath = configDir + "/onboarding_complete"
             FileManager.default.createFile(atPath: completePath, contents: nil)
 
-            setupStatus = "Starting text-to-speech server..."
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                // Pre-start TTS server
-                TTSServerManager.shared.ensureRunning()
-
-                setupStatus = "Almost ready..."
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    onComplete()
-                }
-            }
+            // Complete - TTS server will be started by completeStartup()
+            onComplete()
         }
     }
 }
