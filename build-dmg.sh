@@ -76,6 +76,7 @@ EOF
 
 # Copy TTS server to Resources
 echo "Copying resources..."
+cp "${SCRIPT_DIR}/resources/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/scripts/llm-tts-server.py" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/install.sh" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/uninstall.sh" "${APP_BUNDLE}/Contents/Resources/"

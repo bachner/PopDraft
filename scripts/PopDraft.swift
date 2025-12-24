@@ -3069,14 +3069,60 @@ class DependencyManager {
             // Download model if missing
             let modelPath = NSString(string: "~/.popdraft/models/\(model.filename)").expandingTildeInPath
             if !FileManager.default.fileExists(atPath: modelPath) {
-                DispatchQueue.main.async { statusCallback("Downloading \(model.name) (\(model.size), please wait)...") }
-
                 let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
                 try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
 
-                let result = self.runShellCommand("curl -L --progress-bar -o '\(modelPath)' '\(model.url)' 2>&1")
-                if result.contains("error") || result.contains("Error") {
-                    print("Model download warning: \(result)")
+                // Get expected file size from model (parse from size string like "~2.5GB")
+                let expectedSize: Int64
+                if model.size.contains("5GB") {
+                    expectedSize = 5_000_000_000
+                } else if model.size.contains("2.5GB") {
+                    expectedSize = 2_500_000_000
+                } else if model.size.contains("1.5GB") {
+                    expectedSize = 1_500_000_000
+                } else {
+                    expectedSize = 2_500_000_000 // default
+                }
+
+                DispatchQueue.main.async { statusCallback("Downloading \(model.name) (0%)...") }
+
+                // Start curl in background
+                let curlProcess = Process()
+                curlProcess.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                curlProcess.arguments = ["-L", "-o", modelPath, model.url]
+                curlProcess.standardOutput = FileHandle.nullDevice
+                curlProcess.standardError = FileHandle.nullDevice
+                try? curlProcess.run()
+
+                // Monitor progress
+                while curlProcess.isRunning {
+                    Thread.sleep(forTimeInterval: 1.0)
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath),
+                       let fileSize = attrs[.size] as? Int64 {
+                        let percent = min(99, Int((Double(fileSize) / Double(expectedSize)) * 100))
+                        let downloadedMB = fileSize / 1_000_000
+                        DispatchQueue.main.async {
+                            statusCallback("Downloading \(model.name) (\(percent)% - \(downloadedMB)MB)...")
+                        }
+                    }
+                }
+
+                if curlProcess.terminationStatus != 0 {
+                    DispatchQueue.main.async {
+                        statusCallback("Download failed (error \(curlProcess.terminationStatus)). Check internet connection.")
+                    }
+                    Thread.sleep(forTimeInterval: 3.0)
+                } else {
+                    // Verify file was downloaded completely
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath),
+                       let fileSize = attrs[.size] as? Int64, fileSize < 100_000_000 {
+                        // File too small, likely an error page or incomplete
+                        try? FileManager.default.removeItem(atPath: modelPath)
+                        DispatchQueue.main.async {
+                            statusCallback("Download failed - file incomplete. Please try again.")
+                        }
+                        Thread.sleep(forTimeInterval: 3.0)
+                    }
                 }
                 status = self.checkDependencies()
             }
