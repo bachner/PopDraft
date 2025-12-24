@@ -3691,8 +3691,9 @@ class OnboardingWindowController: NSWindowController {
         super.init(window: window)
 
         let view = OnboardingView(onComplete: { [weak self] in
-            onComplete()
+            // Close window BEFORE calling onComplete (which may nil out the controller)
             self?.window?.close()
+            onComplete()
         })
 
         hostingView = NSHostingView(rootView: view)
