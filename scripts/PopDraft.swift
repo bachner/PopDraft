@@ -1485,8 +1485,8 @@ class PopupWindowController: NSWindowController {
         keyUp?.flags = .maskCommand
         keyUp?.post(tap: .cghidEventTap)
 
-        // Wait for clipboard to update
-        usleep(50000)  // 50ms
+        // Wait for clipboard to update (100ms for slower apps like Slack/Electron)
+        usleep(100000)  // 100ms
 
         // Check if clipboard changed (meaning text was selected and copied)
         if pasteboard.changeCount != savedChangeCount {
