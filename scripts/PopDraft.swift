@@ -1472,21 +1472,23 @@ class PopupWindowController: NSWindowController {
         } ?? []
         let savedChangeCount = pasteboard.changeCount
 
-        // Simulate Cmd+C to copy selected text
-        let source = CGEventSource(stateID: .hidSystemState)
+        // Get the frontmost app name
+        let frontName = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
 
-        // Key down: Cmd+C
-        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
-        keyDown?.flags = .maskCommand
-        keyDown?.post(tap: .cghidEventTap)
+        // Use AppleScript to click Edit > Copy menu (works with Electron apps like Slack)
+        let script = NSAppleScript(source: """
+            tell application "\(frontName)" to activate
+            delay 0.1
+            tell application "System Events"
+                tell process "\(frontName)"
+                    click menu item "Copy" of menu "Edit" of menu bar 1
+                end tell
+            end tell
+        """)
+        script?.executeAndReturnError(nil)
 
-        // Key up: Cmd+C
-        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
-        keyUp?.flags = .maskCommand
-        keyUp?.post(tap: .cghidEventTap)
-
-        // Wait for clipboard to update (100ms for slower apps like Slack/Electron)
-        usleep(100000)  // 100ms
+        // Wait for clipboard to update (300ms for Electron apps)
+        usleep(300000)  // 300ms
 
         // Check if clipboard changed (meaning text was selected and copied)
         if pasteboard.changeCount != savedChangeCount {
