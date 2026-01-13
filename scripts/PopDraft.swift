@@ -1498,8 +1498,8 @@ class PopupWindowController: NSWindowController {
                 pasteboard.setData(data, forType: type)
             }
         } else {
-            // No selection - clipboard unchanged, use existing clipboard content
-            clipboardText = pasteboard.string(forType: .string) ?? ""
+            // No selection - clipboard unchanged, don't use clipboard as fallback
+            clipboardText = ""
         }
     }
 
