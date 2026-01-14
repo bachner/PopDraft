@@ -6,6 +6,76 @@ import Cocoa
 import SwiftUI
 import Carbon.HIToolbox
 
+// MARK: - Version
+
+struct AppVersion {
+    static var current: String {
+        // Try to get version from bundle Info.plist (official release)
+        if let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+           !bundleVersion.isEmpty,
+           bundleVersion != "1.0" {  // Default Xcode value
+            return bundleVersion
+        }
+
+        // Dev build - use compilation timestamp
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmm"
+        return "dev-\(formatter.string(from: AppVersion.buildDate))"
+    }
+
+    // Compilation timestamp (evaluated at compile time via static initialization)
+    private static let buildDate: Date = Date()
+}
+
+// MARK: - Logger
+
+class Logger {
+    static let shared = Logger()
+    private let logPath: String
+    private let maxLogSize: Int = 1_000_000  // 1MB max log size
+
+    private init() {
+        let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true)
+        logPath = "\(configDir)/debug.log"
+
+        // Rotate log if too large
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+           let size = attrs[.size] as? Int,
+           size > maxLogSize {
+            let backupPath = "\(configDir)/popdraft.log.old"
+            try? FileManager.default.removeItem(atPath: backupPath)
+            try? FileManager.default.moveItem(atPath: logPath, toPath: backupPath)
+        }
+    }
+
+    func log(_ message: String, level: String = "INFO") {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let logMessage = "[\(timestamp)] [\(level)] \(message)\n"
+
+        if let data = logMessage.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logPath) {
+                if let handle = FileHandle(forWritingAtPath: logPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: logPath, contents: data)
+            }
+        }
+        print(logMessage, terminator: "")
+    }
+
+    func error(_ message: String) {
+        log(message, level: "ERROR")
+    }
+
+    func info(_ message: String) {
+        log(message, level: "INFO")
+    }
+}
+
 // MARK: - Data Models
 
 struct LLMAction: Identifiable, Hashable {
@@ -446,26 +516,14 @@ class LLMClient {
     }
 
     private func logError(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let logMessage = "[\(timestamp)] PopDraft: \(message)\n"
-        let logPath = "/tmp/popdraft.log"
-        if let data = logMessage.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logPath) {
-                if let handle = FileHandle(forWritingAtPath: logPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: logPath, contents: data)
-            }
-        }
-        print(logMessage, terminator: "")
+        Logger.shared.log(message)
     }
 
     func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<String, Error>) -> Void) {
         let provider = config.provider
         activeProvider = provider
+
+        Logger.shared.info("Sending to \(provider.displayName) [\(currentModel)]")
 
         // Generate with the configured provider, fallback to llama.cpp on failure
         generateWithProvider(provider, prompt: prompt, systemPrompt: systemPrompt) { [weak self] result in
@@ -1395,6 +1453,7 @@ class PopupWindowController: NSWindowController {
     private var resultText = ""
     private var localMonitor: Any?
     private var ttsStatusTimer: Timer?
+    private var previousApp: NSRunningApplication?
 
     init() {
         let window = KeyPanel(
@@ -1416,6 +1475,18 @@ class PopupWindowController: NSWindowController {
         super.init(window: window)
 
         updateView()
+
+        // Dismiss when window loses focus
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResignKey),
+            name: NSWindow.didResignKeyNotification,
+            object: window
+        )
+    }
+
+    @objc private func windowDidResignKey(_ notification: Notification) {
+        dismiss()
     }
 
     required init?(coder: NSCoder) {
@@ -1472,8 +1543,10 @@ class PopupWindowController: NSWindowController {
         } ?? []
         let savedChangeCount = pasteboard.changeCount
 
-        // Get the frontmost app name
-        let frontName = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        // Get the frontmost app and store it for later refocus
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        previousApp = frontApp
+        let frontName = frontApp?.localizedName ?? "unknown"
 
         // Use AppleScript to click Edit > Copy menu (works with Electron apps like Slack)
         let script = NSAppleScript(source: """
@@ -1521,23 +1594,30 @@ class PopupWindowController: NSWindowController {
         let mouseLocation = NSEvent.mouseLocation
         var frame = window?.frame ?? .zero
 
-        // Adjust position to be near cursor but visible on screen
+        // Find the screen containing the mouse
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
+        let screenFrame = screen?.visibleFrame ?? .zero
+
+        // Try to position below cursor first
         frame.origin = NSPoint(
             x: mouseLocation.x - frame.width / 2,
             y: mouseLocation.y - frame.height - 10
         )
 
-        // Make sure it's on screen
-        if let screen = NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            if frame.minX < screenFrame.minX {
-                frame.origin.x = screenFrame.minX + 10
-            }
-            if frame.maxX > screenFrame.maxX {
-                frame.origin.x = screenFrame.maxX - frame.width - 10
-            }
-            if frame.minY < screenFrame.minY {
-                frame.origin.y = mouseLocation.y + 20
+        // Make sure it's on screen horizontally
+        if frame.minX < screenFrame.minX {
+            frame.origin.x = screenFrame.minX + 10
+        }
+        if frame.maxX > screenFrame.maxX {
+            frame.origin.x = screenFrame.maxX - frame.width - 10
+        }
+
+        // If popup would be cut off at bottom, show it above the cursor instead
+        if frame.minY < screenFrame.minY {
+            frame.origin.y = mouseLocation.y + 20
+            // If still cut off at top, clamp to screen
+            if frame.maxY > screenFrame.maxY {
+                frame.origin.y = screenFrame.maxY - frame.height - 10
             }
         }
 
@@ -1571,22 +1651,31 @@ class PopupWindowController: NSWindowController {
         // Position near mouse
         let mouseLocation = NSEvent.mouseLocation
         var frame = window?.frame ?? .zero
+
+        // Find the screen containing the mouse
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
+        let screenFrame = screen?.visibleFrame ?? .zero
+
+        // Try to position below cursor first
         frame.origin = NSPoint(
             x: mouseLocation.x - frame.width / 2,
             y: mouseLocation.y - frame.height - 10
         )
 
-        // Make sure it's on screen
-        if let screen = NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            if frame.minX < screenFrame.minX {
-                frame.origin.x = screenFrame.minX + 10
-            }
-            if frame.maxX > screenFrame.maxX {
-                frame.origin.x = screenFrame.maxX - frame.width - 10
-            }
-            if frame.minY < screenFrame.minY {
-                frame.origin.y = mouseLocation.y + 20
+        // Make sure it's on screen horizontally
+        if frame.minX < screenFrame.minX {
+            frame.origin.x = screenFrame.minX + 10
+        }
+        if frame.maxX > screenFrame.maxX {
+            frame.origin.x = screenFrame.maxX - frame.width - 10
+        }
+
+        // If popup would be cut off at bottom, show it above the cursor instead
+        if frame.minY < screenFrame.minY {
+            frame.origin.y = mouseLocation.y + 20
+            // If still cut off at top, clamp to screen
+            if frame.maxY > screenFrame.maxY {
+                frame.origin.y = screenFrame.maxY - frame.height - 10
             }
         }
 
@@ -1603,6 +1692,12 @@ class PopupWindowController: NSWindowController {
         stopTTSStatusPolling()
         stopKeyboardMonitoring()
         window?.orderOut(nil)
+
+        // Refocus the previous app
+        if let app = previousApp {
+            app.activate(options: [])
+        }
+        previousApp = nil
     }
 
     private func goBack() {
@@ -1708,6 +1803,7 @@ class PopupWindowController: NSWindowController {
     private func selectAction(_ action: LLMAction) {
         // Handle custom prompt
         if action.name == "Custom prompt..." {
+            Logger.shared.info("Action selected: Custom prompt")
             state = .customPrompt
             updateView()
             return
@@ -1715,10 +1811,14 @@ class PopupWindowController: NSWindowController {
 
         // Get selected text from clipboard
         guard !clipboardText.isEmpty else {
+            Logger.shared.error("Action '\(action.name)' failed: No text selected")
             state = .error("No text selected.\nSelect some text first.")
             updateView()
             return
         }
+
+        let textPreview = clipboardText.prefix(50).replacingOccurrences(of: "\n", with: " ")
+        Logger.shared.info("Action '\(action.name)' on \(clipboardText.count) chars: \"\(textPreview)...\"")
 
         // Handle TTS action
         if action.isTTS {
@@ -1729,9 +1829,11 @@ class PopupWindowController: NSWindowController {
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
+                        Logger.shared.info("TTS playback started")
                         // Playback started - start polling for completion
                         self?.startTTSStatusPolling()
                     case .failure(let error):
+                        Logger.shared.error("TTS failed: \(error.localizedDescription)")
                         self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
                         self?.updateView()
                     }
@@ -1748,13 +1850,17 @@ class PopupWindowController: NSWindowController {
         let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
 
         // Call LLM backend
+        let startTime = Date()
         LLMClient.shared.generate(prompt: fullPrompt) { [weak self] result in
+            let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
             DispatchQueue.main.async {
                 switch result {
                 case .success(let response):
+                    Logger.shared.info("LLM response received (\(elapsed), \(response.count) chars)")
                     self?.resultText = response
                     self?.state = .result(response)
                 case .failure(let error):
+                    Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
                     self?.state = .error(error.localizedDescription)
                 }
                 self?.updateView()
@@ -3969,7 +4075,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Register all global hotkeys
         HotkeyManager.shared.registerAll()
 
-        print("PopDraft started. Press Option+Space to show popup.")
+        Logger.shared.info("PopDraft \(AppVersion.current) started. Press Option+Space to show popup.")
     }
 
     private func setupEditMenu() {
@@ -4048,7 +4154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "PopDraft"
-        alert.informativeText = "System-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nProvider: \(LLMClient.shared.providerName)\nModel: \(LLMClient.shared.currentModel)\n\nBuilt by Ofer Bachner"
+        alert.informativeText = "Version: \(AppVersion.current)\n\nSystem-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nProvider: \(LLMClient.shared.providerName)\nModel: \(LLMClient.shared.currentModel)\n\nBuilt by Ofer Bachner"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
