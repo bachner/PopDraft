@@ -3153,6 +3153,8 @@ class DependencyManager {
             if !status.hasPythonPackages {
                 DispatchQueue.main.async { statusCallback("Creating Python environment...") }
                 let venvDir = NSString(string: "~/.popdraft/tts-venv").expandingTildeInPath
+                // Remove old venv to avoid issues with corrupted/partial venvs on Python 3.9
+                try? FileManager.default.removeItem(atPath: venvDir)
                 let venvResult = self.runShellCommand("python3 -m venv \"\(venvDir)\" 2>&1", timeout: 120, trackProcess: true)
                 if self.installCancelled { return }
                 if venvResult.contains("Error") {

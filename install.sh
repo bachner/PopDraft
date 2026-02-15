@@ -73,6 +73,8 @@ fi
 
 # Install Python packages into venv
 echo "  Creating Python virtual environment..."
+# Remove old venv to avoid issues with corrupted/partial venvs
+rm -rf "$CONFIG_DIR/tts-venv"
 if python3 -m venv "$CONFIG_DIR/tts-venv" 2>/dev/null; then
     echo "  [OK] Virtual environment created"
     echo "  Installing Python packages (this may take a few minutes)..."
