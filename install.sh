@@ -71,12 +71,21 @@ else
     echo "  [OK] espeak-ng is available"
 fi
 
-# Install Python packages
-echo "  Installing Python packages..."
-if python3 -m pip install --user kokoro soundfile numpy 2>/dev/null; then
-    echo "  [OK] TTS packages installed"
+# Install Python packages into venv
+echo "  Creating Python virtual environment..."
+if python3 -m venv "$CONFIG_DIR/tts-venv" 2>/dev/null; then
+    echo "  [OK] Virtual environment created"
+    echo "  Installing Python packages (this may take a few minutes)..."
+    if "$CONFIG_DIR/tts-venv/bin/pip" install kokoro soundfile numpy 2>/dev/null; then
+        echo "  [OK] TTS packages installed"
+    else
+        echo "  [WARN] Could not install TTS packages. Install manually:"
+        echo "         $CONFIG_DIR/tts-venv/bin/pip install kokoro soundfile numpy"
+    fi
 else
-    echo "  [WARN] Could not install TTS packages. Install manually: pip install kokoro soundfile numpy"
+    echo "  [WARN] Could not create Python venv. Install manually:"
+    echo "         python3 -m venv $CONFIG_DIR/tts-venv"
+    echo "         $CONFIG_DIR/tts-venv/bin/pip install kokoro soundfile numpy"
 fi
 
 # Create default config if it doesn't exist

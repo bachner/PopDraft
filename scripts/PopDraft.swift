@@ -3059,6 +3059,18 @@ class SettingsWindowController: NSWindowController {
 class DependencyManager {
     static let shared = DependencyManager()
 
+    var currentInstallProcess: Process?
+    var installCancelled = false
+
+    var ttsVenvPython: String {
+        NSString(string: "~/.popdraft/tts-venv/bin/python3").expandingTildeInPath
+    }
+
+    func cancelInstall() {
+        installCancelled = true
+        currentInstallProcess?.terminate()
+    }
+
     struct DependencyStatus {
         var hasHomebrew: Bool = false
         var hasEspeak: Bool = false
@@ -3098,8 +3110,8 @@ class DependencyManager {
                           FileManager.default.fileExists(atPath: "/usr/local/bin/espeak-ng") ||
                           FileManager.default.fileExists(atPath: "/usr/bin/espeak")
 
-        // Check Python packages
-        let checkScript = "python3 -c 'import kokoro; import soundfile; import numpy' 2>/dev/null && echo OK"
+        // Check Python packages (in venv)
+        let checkScript = "\(ttsVenvPython) -c 'import kokoro; import soundfile; import numpy' 2>/dev/null && echo OK"
         let result = runShellCommand(checkScript)
         status.hasPythonPackages = result.contains("OK")
 
@@ -3121,6 +3133,7 @@ class DependencyManager {
 
     func installDependencies(statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
+            self.installCancelled = false
             var success = true
 
             // Check current status
@@ -3129,19 +3142,31 @@ class DependencyManager {
             // Install espeak-ng if missing (and homebrew available)
             if !status.hasEspeak && status.hasHomebrew {
                 DispatchQueue.main.async { statusCallback("Installing espeak-ng...") }
-                let result = self.runShellCommand("/opt/homebrew/bin/brew install espeak-ng 2>&1 || /usr/local/bin/brew install espeak-ng 2>&1")
+                let result = self.runShellCommand("/opt/homebrew/bin/brew install espeak-ng 2>&1 || /usr/local/bin/brew install espeak-ng 2>&1", timeout: 300, trackProcess: true)
+                if self.installCancelled { return }
                 if result.contains("Error") {
                     print("espeak-ng install warning: \(result)")
                 }
             }
 
-            // Install Python packages if missing
+            // Install Python packages into venv if missing
             if !status.hasPythonPackages {
-                DispatchQueue.main.async { statusCallback("Installing TTS packages (this may take a minute)...") }
-                let result = self.runShellCommand("python3 -m pip install --user --quiet kokoro soundfile numpy 2>&1")
-                if result.contains("ERROR") {
-                    print("pip install warning: \(result)")
+                DispatchQueue.main.async { statusCallback("Creating Python environment...") }
+                let venvDir = NSString(string: "~/.popdraft/tts-venv").expandingTildeInPath
+                let venvResult = self.runShellCommand("python3 -m venv \"\(venvDir)\" 2>&1", timeout: 120, trackProcess: true)
+                if self.installCancelled { return }
+                if venvResult.contains("Error") {
+                    print("venv creation warning: \(venvResult)")
                     success = false
+                } else {
+                    DispatchQueue.main.async { statusCallback("Installing TTS packages (this may take a few minutes)...") }
+                    let pipPath = venvDir + "/bin/pip"
+                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet kokoro soundfile numpy 2>&1", timeout: 600, trackProcess: true)
+                    if self.installCancelled { return }
+                    if result.contains("ERROR") {
+                        print("pip install warning: \(result)")
+                        success = false
+                    }
                 }
             }
 
@@ -3305,7 +3330,7 @@ class DependencyManager {
         createLlamaLaunchAgent(model: model)
     }
 
-    private func runShellCommand(_ command: String) -> String {
+    private func runShellCommand(_ command: String, timeout: TimeInterval = 0, trackProcess: Bool = false) -> String {
         let process = Process()
         let pipe = Pipe()
 
@@ -3314,12 +3339,37 @@ class DependencyManager {
         process.standardOutput = pipe
         process.standardError = pipe
 
+        if trackProcess {
+            currentInstallProcess = process
+        }
+
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
+            if trackProcess { currentInstallProcess = nil }
             return "Error: \(error)"
         }
+
+        if timeout > 0 {
+            let deadline = Date().addingTimeInterval(timeout)
+            while process.isRunning {
+                if installCancelled {
+                    process.terminate()
+                    if trackProcess { currentInstallProcess = nil }
+                    return "Error: Cancelled"
+                }
+                if Date() > deadline {
+                    process.terminate()
+                    if trackProcess { currentInstallProcess = nil }
+                    return "Error: Timed out after \(Int(timeout))s"
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        } else {
+            process.waitUntilExit()
+        }
+
+        if trackProcess { currentInstallProcess = nil }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
@@ -3382,8 +3432,11 @@ class TTSServerManager {
             return
         }
 
+        let venvPython = NSString(string: "~/.popdraft/tts-venv/bin/python3").expandingTildeInPath
+        let pythonPath = FileManager.default.fileExists(atPath: venvPython) ? venvPython : "/usr/bin/python3"
+
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.executableURL = URL(fileURLWithPath: pythonPath)
         process.arguments = [expandedPath]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -3391,7 +3444,7 @@ class TTSServerManager {
         do {
             try process.run()
             serverProcess = process
-            print("TTS server started (PID: \(process.processIdentifier))")
+            print("TTS server started with \(pythonPath) (PID: \(process.processIdentifier))")
         } catch {
             print("Failed to start TTS server: \(error)")
         }
@@ -3659,8 +3712,17 @@ struct OnboardingView: View {
                         Text("This may take a few moments...")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
+                        Button(action: {
+                            DependencyManager.shared.cancelInstall()
+                            finishOnboarding()
+                        }) {
+                            Text("Skip TTS Setup")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .frame(height: 54)
+                    .frame(height: 74)
                 } else {
                     Button(action: completeOnboarding) {
                         Text("Get Started")
