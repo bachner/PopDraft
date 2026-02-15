@@ -2,6 +2,10 @@
 
 System-wide AI text processing for macOS. Select text, press a shortcut, and get AI-powered improvements instantly.
 
+<p align="center">
+  <img src="resources/demo.gif" alt="PopDraft Demo" width="640">
+</p>
+
 ## Features
 
 ### Popup Menu (Option+Space)
