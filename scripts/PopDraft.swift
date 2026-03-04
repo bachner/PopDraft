@@ -261,6 +261,8 @@ struct LLMConfig {
     var openaiModel: String = "gpt-4o"
     var claudeAPIKey: String = ""
     var claudeModel: String = "claude-sonnet-4-5-20250514"
+    var claudeExtendedThinking: Bool = false
+    var claudeThinkingBudget: Int = 10000
     var ttsVoice: String = "af_heart"
     var ttsSpeed: Double = 1.0
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
@@ -398,6 +400,10 @@ struct LLMConfig {
                 config.claudeAPIKey = value
             case "CLAUDE_MODEL":
                 config.claudeModel = value
+            case "CLAUDE_EXTENDED_THINKING":
+                config.claudeExtendedThinking = (value == "true")
+            case "CLAUDE_THINKING_BUDGET":
+                config.claudeThinkingBudget = Int(value) ?? 10000
             case "TTS_VOICE":
                 config.ttsVoice = value
             case "TTS_SPEED":
@@ -437,6 +443,8 @@ struct LLMConfig {
         lines.append("OPENAI_MODEL=\(openaiModel)")
         lines.append("CLAUDE_API_KEY=\(claudeAPIKey)")
         lines.append("CLAUDE_MODEL=\(claudeModel)")
+        lines.append("CLAUDE_EXTENDED_THINKING=\(claudeExtendedThinking)")
+        lines.append("CLAUDE_THINKING_BUDGET=\(claudeThinkingBudget)")
         lines.append("TTS_VOICE=\(ttsVoice)")
         lines.append("TTS_SPEED=\(ttsSpeed)")
         lines.append("POPUP_HOTKEY=\(popupHotkey)")
@@ -445,6 +453,13 @@ struct LLMConfig {
         try? content.write(to: configPath, atomically: true, encoding: .utf8)
     }
 
+}
+
+// MARK: - LLM Response
+
+struct LLMResponse {
+    let text: String
+    let thinking: String?
 }
 
 // MARK: - LLM Client
@@ -507,7 +522,7 @@ class LLMClient {
         Logger.shared.log(message)
     }
 
-    func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<String, Error>) -> Void) {
+    func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         let provider = config.provider
         activeProvider = provider
 
@@ -531,7 +546,7 @@ class LLMClient {
         }
     }
 
-    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         switch provider {
         case .llamacpp:
             generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
@@ -554,7 +569,7 @@ class LLMClient {
 
     // MARK: - llama.cpp Backend (OpenAI-compatible API)
 
-    private func generateLlamaCpp(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+    private func generateLlamaCpp(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "\(config.llamacppURL)/v1/chat/completions") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -605,7 +620,7 @@ class LLMClient {
                     if let range = cleaned.range(of: "</think>") {
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
-                    completion(.success(cleaned))
+                    completion(.success(LLMResponse(text: cleaned, thinking: nil)))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorObj = json["error"] as? [String: Any],
                           let message = errorObj["message"] as? String {
@@ -621,7 +636,7 @@ class LLMClient {
 
     // MARK: - Ollama Backend
 
-    private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+    private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -667,7 +682,7 @@ class LLMClient {
                     if let range = cleaned.range(of: "</think>") {
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
-                    completion(.success(cleaned))
+                    completion(.success(LLMResponse(text: cleaned, thinking: nil)))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorMsg = json["error"] as? String {
                     completion(.failure(NSError(domain: errorMsg, code: -1)))
@@ -682,7 +697,7 @@ class LLMClient {
 
     // MARK: - OpenAI Backend
 
-    private func generateOpenAI(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+    private func generateOpenAI(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -730,7 +745,7 @@ class LLMClient {
                    let first = choices.first,
                    let message = first["message"] as? [String: Any],
                    let content = message["content"] as? String {
-                    completion(.success(content))
+                    completion(.success(LLMResponse(text: content, thinking: nil)))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorObj = json["error"] as? [String: Any],
                           let message = errorObj["message"] as? String {
@@ -746,7 +761,7 @@ class LLMClient {
 
     // MARK: - Claude Backend
 
-    private func generateClaude(prompt: String, systemPrompt: String?, completion: @escaping (Result<String, Error>) -> Void) {
+    private func generateClaude(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
@@ -756,14 +771,20 @@ class LLMClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(config.claudeAPIKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        let useThinking = config.claudeExtendedThinking
+        request.setValue(useThinking ? "2025-04-15" : "2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.timeoutInterval = 120
 
+        let maxTokens = useThinking ? config.claudeThinkingBudget + 4096 : 4096
         var body: [String: Any] = [
             "model": config.claudeModel,
-            "max_tokens": 4096,
+            "max_tokens": maxTokens,
             "messages": [["role": "user", "content": prompt]]
         ]
+
+        if useThinking {
+            body["thinking"] = ["type": "enabled", "budget_tokens": config.claudeThinkingBudget]
+        }
 
         if let system = systemPrompt {
             body["system"] = system
@@ -789,10 +810,24 @@ class LLMClient {
 
             do {
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let content = json["content"] as? [[String: Any]],
-                   let first = content.first,
-                   let text = first["text"] as? String {
-                    completion(.success(text))
+                   let content = json["content"] as? [[String: Any]] {
+                    var thinkingParts: [String] = []
+                    var textParts: [String] = []
+                    for block in content {
+                        let blockType = block["type"] as? String ?? ""
+                        if blockType == "thinking", let t = block["thinking"] as? String {
+                            thinkingParts.append(t)
+                        } else if blockType == "text", let t = block["text"] as? String {
+                            textParts.append(t)
+                        }
+                    }
+                    let responseText = textParts.joined(separator: "\n")
+                    let thinkingText = thinkingParts.isEmpty ? nil : thinkingParts.joined(separator: "\n")
+                    if !responseText.isEmpty {
+                        completion(.success(LLMResponse(text: responseText, thinking: thinkingText)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid Claude response", code: -1)))
+                    }
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorObj = json["error"] as? [String: Any],
                           let message = errorObj["message"] as? String {
@@ -1180,7 +1215,7 @@ enum PopupState {
     case customPrompt
     case processing
     case ttsPlaying(isPaused: Bool)
-    case result(String)
+    case result(String, thinking: String?)
     case error(String)
 }
 
@@ -1222,8 +1257,8 @@ struct PopupView: View {
                 processingView
             case .ttsPlaying(let isPaused):
                 ttsPlayingView(isPaused: isPaused)
-            case .result(let text):
-                resultView(text: text)
+            case .result(let text, let thinking):
+                resultView(text: text, thinking: thinking)
             case .error(let message):
                 errorView(message: message)
             }
@@ -1436,7 +1471,9 @@ struct PopupView: View {
 
     // MARK: - Result View
 
-    private func resultView(text: String) -> some View {
+    @State private var isThinkingExpanded = false
+
+    private func resultView(text: String, thinking: String? = nil) -> some View {
         VStack(spacing: 0) {
             // Header
             HStack {
@@ -1467,11 +1504,37 @@ struct PopupView: View {
 
             // Result text
             ScrollView {
-                Text(text)
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+                VStack(alignment: .leading, spacing: 0) {
+                    if let thinking = thinking, !thinking.isEmpty {
+                        DisclosureGroup(isExpanded: $isThinkingExpanded) {
+                            Text(thinking)
+                                .font(.system(size: 11))
+                                .italic()
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 4)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "brain.head.profile")
+                                    .font(.system(size: 11))
+                                Text("Thinking")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .foregroundColor(.secondary)
+                        }
+                        .padding(.bottom, 8)
+
+                        Divider()
+                            .padding(.bottom, 8)
+                    }
+
+                    Text(text)
+                        .font(.system(size: 13))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
             }
             .frame(maxHeight: 250)
 
@@ -2098,7 +2161,7 @@ class PopupWindowController: NSWindowController {
                         if process.terminationStatus == 0 {
                             Logger.shared.info("Command completed, output: \(stdout.count) chars")
                             self.resultText = stdout
-                            self.state = .result(stdout)
+                            self.state = .result(stdout, thinking: nil)
                         } else {
                             let errorMsg = stderr.isEmpty ? "Command exited with code \(process.terminationStatus)" : stderr
                             Logger.shared.error("Command failed: \(errorMsg)")
@@ -2124,9 +2187,9 @@ class PopupWindowController: NSWindowController {
                 DispatchQueue.main.async {
                     switch result {
                     case .success(let response):
-                        Logger.shared.info("LLM response received (\(elapsed), \(response.count) chars)")
-                        self?.resultText = response
-                        self?.state = .result(response)
+                        Logger.shared.info("LLM response received (\(elapsed), \(response.text.count) chars)")
+                        self?.resultText = response.text
+                        self?.state = .result(response.text, thinking: response.thinking)
                     case .failure(let error):
                         Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
                         self?.state = .error(error.localizedDescription)
@@ -2229,6 +2292,8 @@ struct SettingsView: View {
     @State private var openaiModel: String = ""
     @State private var claudeAPIKey: String = ""
     @State private var claudeModel: String = ""
+    @State private var claudeExtendedThinking: Bool = false
+    @State private var claudeThinkingBudget: Double = 10000
     @State private var availableOllamaModels: [String] = []
     @State private var isLoading = false
     @State private var customOpenAIModel: String = ""
@@ -3043,6 +3108,24 @@ struct SettingsView: View {
                         .textFieldStyle(.roundedBorder)
                 }
             }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Extended Thinking", isOn: $claudeExtendedThinking)
+                    .font(.system(size: 12, weight: .medium))
+                if claudeExtendedThinking {
+                    HStack {
+                        Text("Budget:")
+                            .font(.system(size: 11))
+                        Slider(value: $claudeThinkingBudget, in: 1000...100000, step: 1000)
+                        Text("\(Int(claudeThinkingBudget / 1000))K tokens")
+                            .font(.system(size: 11))
+                            .frame(width: 65, alignment: .trailing)
+                    }
+                }
+                Text("Let Claude think step-by-step before responding")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
         }
     }
 
@@ -3063,6 +3146,8 @@ struct SettingsView: View {
         if claudeModel == "Custom..." {
             customClaudeModel = config.claudeModel
         }
+        claudeExtendedThinking = config.claudeExtendedThinking
+        claudeThinkingBudget = Double(config.claudeThinkingBudget)
         ttsVoice = config.ttsVoice
         ttsSpeed = config.ttsSpeed
         popupHotkey = config.popupHotkey
@@ -3105,6 +3190,8 @@ struct SettingsView: View {
         config.openaiModel = openaiModel == "Custom..." ? customOpenAIModel : openaiModel
         config.claudeAPIKey = claudeAPIKey
         config.claudeModel = claudeModel == "Custom..." ? customClaudeModel : claudeModel
+        config.claudeExtendedThinking = claudeExtendedThinking
+        config.claudeThinkingBudget = Int(claudeThinkingBudget)
         config.ttsVoice = ttsVoice
         config.ttsSpeed = ttsSpeed
         config.popupHotkey = popupHotkey
