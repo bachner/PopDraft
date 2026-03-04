@@ -78,112 +78,107 @@ class Logger {
 
 // MARK: - Data Models
 
-struct LLMAction: Identifiable, Hashable {
-    let id: String  // Stable string ID for built-in actions
-    let name: String
-    let icon: String
-    let prompt: String
-    let shortcut: String?
-    let isTTS: Bool
-    let isBuiltIn: Bool
+enum ActionType: String, Codable, CaseIterable {
+    case llm = "llm"
+    case tts = "tts"
+    case command = "command"
 
-    init(id: String? = nil, name: String, icon: String, prompt: String, shortcut: String?, isTTS: Bool = false, isBuiltIn: Bool = true) {
-        self.id = id ?? name.lowercased().replacingOccurrences(of: " ", with: "_")
+    var label: String {
+        switch self {
+        case .llm: return "LLM"
+        case .tts: return "TTS"
+        case .command: return "CMD"
+        }
+    }
+}
+
+struct Action: Identifiable, Hashable {
+    var id: String
+    var name: String
+    var icon: String
+    var prompt: String
+    var shortcut: String?
+    var actionType: ActionType
+    var isEnabled: Bool
+    var order: Int
+    var isDefault: Bool  // Was originally a built-in (enables "Reset to default")
+
+    init(id: String, name: String, icon: String, prompt: String, shortcut: String? = nil,
+         actionType: ActionType = .llm, isEnabled: Bool = true, order: Int = 0, isDefault: Bool = false) {
+        self.id = id
         self.name = name
         self.icon = icon
         self.prompt = prompt
         self.shortcut = shortcut
-        self.isTTS = isTTS
-        self.isBuiltIn = isBuiltIn
+        self.actionType = actionType
+        self.isEnabled = isEnabled
+        self.order = order
+        self.isDefault = isDefault
     }
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
 
-    static func == (lhs: LLMAction, rhs: LLMAction) -> Bool {
+    static func == (lhs: Action, rhs: Action) -> Bool {
         lhs.id == rhs.id
     }
 }
 
-// MARK: - Custom Actions (User-defined)
+extension Action: Codable {
+    enum CodingKeys: String, CodingKey {
+        case id, name, icon, prompt, shortcut, actionType, isEnabled, order, isDefault
+        case isTTS  // legacy field for backward compatibility
+    }
 
-struct CustomAction: Codable, Identifiable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        icon = try container.decode(String.self, forKey: .icon)
+        prompt = try container.decode(String.self, forKey: .prompt)
+        shortcut = try container.decodeIfPresent(String.self, forKey: .shortcut)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        order = try container.decode(Int.self, forKey: .order)
+        isDefault = try container.decode(Bool.self, forKey: .isDefault)
+
+        // Try new actionType first, fall back to legacy isTTS
+        if let type = try container.decodeIfPresent(ActionType.self, forKey: .actionType) {
+            actionType = type
+        } else if let isTTS = try container.decodeIfPresent(Bool.self, forKey: .isTTS) {
+            actionType = isTTS ? .tts : .llm
+        } else {
+            actionType = .llm
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(icon, forKey: .icon)
+        try container.encode(prompt, forKey: .prompt)
+        try container.encodeIfPresent(shortcut, forKey: .shortcut)
+        try container.encode(actionType, forKey: .actionType)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encode(order, forKey: .order)
+        try container.encode(isDefault, forKey: .isDefault)
+    }
+}
+
+struct ActionsFile: Codable {
+    var version: Int = 3
+    var actions: [Action]
+    var customPromptShortcut: String?
+    var customPromptEnabled: Bool?
+}
+
+// Legacy type for migration from old actions.json format
+private struct LegacyCustomAction: Codable {
     var id: UUID
     var name: String
     var icon: String
     var prompt: String
-
-    init(id: UUID = UUID(), name: String, icon: String, prompt: String) {
-        self.id = id
-        self.name = name
-        self.icon = icon
-        self.prompt = prompt
-    }
-
-    func toLLMAction() -> LLMAction {
-        return LLMAction(id: "custom_\(id.uuidString)", name: name, icon: icon, prompt: prompt, shortcut: nil, isBuiltIn: false)
-    }
-}
-
-class CustomActionManager {
-    static let shared = CustomActionManager()
-
-    private let actionsFile = "~/.popdraft/actions.json"
-    var customActions: [CustomAction] = []
-
-    init() {
-        load()
-    }
-
-    func load() {
-        let path = NSString(string: actionsFile).expandingTildeInPath
-        guard let data = FileManager.default.contents(atPath: path) else {
-            customActions = []
-            return
-        }
-        do {
-            customActions = try JSONDecoder().decode([CustomAction].self, from: data)
-        } catch {
-            print("Failed to load custom actions: \(error)")
-            customActions = []
-        }
-    }
-
-    func save() {
-        let path = NSString(string: actionsFile).expandingTildeInPath
-        let dir = NSString(string: "~/.popdraft").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-
-        do {
-            let data = try JSONEncoder().encode(customActions)
-            try data.write(to: URL(fileURLWithPath: path))
-        } catch {
-            print("Failed to save custom actions: \(error)")
-        }
-    }
-
-    func add(_ action: CustomAction) {
-        customActions.append(action)
-        save()
-    }
-
-    func update(_ action: CustomAction) {
-        if let index = customActions.firstIndex(where: { $0.id == action.id }) {
-            customActions[index] = action
-            save()
-        }
-    }
-
-    func delete(_ action: CustomAction) {
-        customActions.removeAll { $0.id == action.id }
-        save()
-    }
-
-    func move(from source: IndexSet, to destination: Int) {
-        customActions.move(fromOffsets: source, toOffset: destination)
-        save()
-    }
 }
 
 // MARK: - LLM Configuration
@@ -268,9 +263,11 @@ struct LLMConfig {
     var claudeModel: String = "claude-sonnet-4-5-20250514"
     var ttsVoice: String = "af_heart"
     var ttsSpeed: Double = 1.0
-    var disabledBuiltInActions: [String] = []  // IDs of disabled built-in actions
-    var customShortcuts: [String: String] = [:]  // actionId -> shortcut key (e.g., "G", "A")
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
+
+    // Legacy fields — only used for migration, not saved
+    var disabledBuiltInActions: [String] = []
+    var customShortcuts: [String: String] = [:]
 
     // TTS voice list
     static let ttsVoices: [(id: String, name: String, grade: String)] = [
@@ -442,21 +439,12 @@ struct LLMConfig {
         lines.append("CLAUDE_MODEL=\(claudeModel)")
         lines.append("TTS_VOICE=\(ttsVoice)")
         lines.append("TTS_SPEED=\(ttsSpeed)")
-        lines.append("DISABLED_ACTIONS=\(disabledBuiltInActions.joined(separator: ","))")
         lines.append("POPUP_HOTKEY=\(popupHotkey)")
-        if let shortcutsData = try? JSONEncoder().encode(customShortcuts),
-           let shortcutsString = String(data: shortcutsData, encoding: .utf8) {
-            lines.append("CUSTOM_SHORTCUTS=\(shortcutsString)")
-        }
 
         let content = lines.joined(separator: "\n")
         try? content.write(to: configPath, atomically: true, encoding: .utf8)
     }
 
-    // Get effective shortcut for an action (custom or default)
-    func getShortcut(for actionId: String, defaultShortcut: String?) -> String? {
-        return customShortcuts[actionId] ?? defaultShortcut
-    }
 }
 
 // MARK: - LLM Client
@@ -840,21 +828,45 @@ class TTSClient {
             return
         }
 
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 300  // Long timeout for TTS
-
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if let error = error {
-                completion(.failure(error))
+        // Ensure TTS server is running, then speak (server may take ~30s to load model)
+        TTSServerManager.shared.ensureRunning()
+        waitForServer(maxAttempts: 15, interval: 2.0) { [weak self] ready in
+            guard self != nil else { return }
+            if !ready {
+                completion(.failure(NSError(domain: "TTS server not available. It may still be loading the model.", code: -1)))
                 return
             }
 
-            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-                completion(.success(()))
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 300  // Long timeout for TTS
+
+            URLSession.shared.dataTask(with: request) { _, response, error in
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    completion(.success(()))
+                } else {
+                    completion(.failure(NSError(domain: "TTS server error", code: -1)))
+                }
+            }.resume()
+        }
+    }
+
+    private func waitForServer(maxAttempts: Int, interval: TimeInterval, attempt: Int = 0, completion: @escaping (Bool) -> Void) {
+        checkHealth { [weak self] isHealthy in
+            if isHealthy {
+                completion(true)
+            } else if attempt < maxAttempts {
+                DispatchQueue.global().asyncAfter(deadline: .now() + interval) {
+                    self?.waitForServer(maxAttempts: maxAttempts, interval: interval, attempt: attempt + 1, completion: completion)
+                }
             } else {
-                completion(.failure(NSError(domain: "TTS server error", code: -1)))
+                completion(false)
             }
-        }.resume()
+        }
     }
 
     func stop(completion: ((Bool) -> Void)? = nil) {
@@ -935,89 +947,229 @@ class TTSClient {
 class ActionManager {
     static let shared = ActionManager()
 
-    let builtInActions: [LLMAction] = [
-        LLMAction(
-            name: "Fix grammar and spelling",
-            icon: "checkmark.circle.fill",
-            prompt: "Fix any grammar, spelling, and punctuation errors in this text. Keep the same tone and meaning. Only output the corrected text, nothing else. Preserve the original language.",
-            shortcut: "G"
-        ),
-        LLMAction(
-            name: "Articulate",
-            icon: "pencil.circle.fill",
-            prompt: "Improve this text to be clearer and more professional while keeping the same meaning and tone. Only output the improved text, nothing else. Preserve the original language.",
-            shortcut: "A"
-        ),
-        LLMAction(
-            name: "Explain simply",
-            icon: "lightbulb.fill",
-            prompt: "Explain this text in simple terms that anyone can understand. Only output the explanation, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Craft a reply",
-            icon: "arrowshape.turn.up.left.fill",
-            prompt: "Write a thoughtful and helpful reply to this message. Be professional and friendly. Only output the reply, nothing else. Preserve the original language.",
-            shortcut: "C"
-        ),
-        LLMAction(
-            name: "Continue writing",
-            icon: "arrow.right.circle.fill",
-            prompt: "Continue writing from where this text ends, matching the style and tone. Only output the continuation, nothing else. Preserve the original language.",
-            shortcut: nil
-        ),
-        LLMAction(
-            name: "Read aloud",
-            icon: "speaker.wave.2.fill",
-            prompt: "",
-            shortcut: "S",
-            isTTS: true
-        )
+    var actions: [Action] = []
+    var customPromptShortcut: String? = "P"
+    var customPromptEnabled: Bool = true
+
+    private let actionsFilePath: String
+
+    static let defaultActions: [Action] = [
+        Action(id: "fix_grammar_and_spelling", name: "Fix grammar and spelling", icon: "checkmark.circle.fill",
+               prompt: "Fix any grammar, spelling, and punctuation errors in this text. Keep the same tone and meaning. Only output the corrected text, nothing else. Preserve the original language.",
+               shortcut: "G", isEnabled: true, order: 0, isDefault: true),
+        Action(id: "articulate", name: "Articulate", icon: "pencil.circle.fill",
+               prompt: "Improve this text to be clearer and more professional while keeping the same meaning and tone. Only output the improved text, nothing else. Preserve the original language.",
+               shortcut: "A", isEnabled: true, order: 1, isDefault: true),
+        Action(id: "explain_simply", name: "Explain simply", icon: "lightbulb.fill",
+               prompt: "Explain this text in simple terms that anyone can understand. Only output the explanation, nothing else. Preserve the original language.",
+               isEnabled: true, order: 2, isDefault: true),
+        Action(id: "craft_a_reply", name: "Craft a reply", icon: "arrowshape.turn.up.left.fill",
+               prompt: "Write a thoughtful and helpful reply to this message. Be professional and friendly. Only output the reply, nothing else. Preserve the original language.",
+               shortcut: "C", isEnabled: true, order: 3, isDefault: true),
+        Action(id: "continue_writing", name: "Continue writing", icon: "arrow.right.circle.fill",
+               prompt: "Continue writing from where this text ends, matching the style and tone. Only output the continuation, nothing else. Preserve the original language.",
+               isEnabled: true, order: 4, isDefault: true),
+        Action(id: "read_aloud", name: "Read aloud", icon: "speaker.wave.2.fill",
+               prompt: "", shortcut: "S", actionType: .tts, isEnabled: true, order: 5, isDefault: true),
     ]
 
-    let customPromptAction = LLMAction(
-        name: "Custom prompt...",
-        icon: "ellipsis.circle.fill",
-        prompt: "",
-        shortcut: "P"
-    )
-
-    // All built-in actions (for settings UI)
-    var allBuiltInActions: [LLMAction] {
-        return builtInActions + [customPromptAction]
+    init() {
+        actionsFilePath = NSString(string: "~/.popdraft/actions.json").expandingTildeInPath
+        load()
     }
 
-    // Combined actions: enabled built-in + user custom + "Custom prompt..." at end
-    var actions: [LLMAction] {
-        let config = LLMConfig.load()
-        let disabledIds = Set(config.disabledBuiltInActions)
+    // For testing: init with a custom path
+    init(actionsFilePath: String) {
+        self.actionsFilePath = actionsFilePath
+        load()
+    }
 
-        var result = builtInActions.filter { !disabledIds.contains($0.id) }
-        let customActions = CustomActionManager.shared.customActions.map { $0.toLLMAction() }
-        result.append(contentsOf: customActions)
+    // Visible actions for popup: enabled actions sorted by order
+    var visibleActions: [Action] {
+        actions.filter { $0.isEnabled }.sorted { $0.order < $1.order }
+    }
 
-        // Only add custom prompt if not disabled
-        if !disabledIds.contains(customPromptAction.id) {
-            result.append(customPromptAction)
+    // Actions for popup including custom prompt sentinel at end
+    var popupActions: [Action] {
+        var result = visibleActions
+        if customPromptEnabled {
+            result.append(Action(id: "custom_prompt", name: "Custom prompt...", icon: "ellipsis.circle.fill",
+                                 prompt: "", shortcut: customPromptShortcut))
         }
         return result
     }
 
-    func filteredActions(searchText: String) -> [LLMAction] {
-        let allActions = actions
+    func filteredActions(searchText: String) -> [Action] {
+        let allActions = popupActions
         if searchText.isEmpty {
             return allActions
         }
         return allActions.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
-    func reloadCustomActions() {
-        CustomActionManager.shared.load()
+    // MARK: - CRUD
+
+    func add(_ action: Action) {
+        var newAction = action
+        newAction.order = (actions.map { $0.order }.max() ?? -1) + 1
+        actions.append(newAction)
+        save()
     }
 
-    func isBuiltInActionEnabled(_ actionId: String) -> Bool {
+    func update(_ action: Action) {
+        if let index = actions.firstIndex(where: { $0.id == action.id }) {
+            actions[index] = action
+            save()
+        }
+    }
+
+    func delete(_ actionId: String) {
+        actions.sort { $0.order < $1.order }
+        actions.removeAll { $0.id == actionId }
+        recalculateOrder()
+        save()
+    }
+
+    func move(from source: IndexSet, to destination: Int) {
+        actions.sort { $0.order < $1.order }
+        actions.move(fromOffsets: source, toOffset: destination)
+        recalculateOrder()
+        save()
+    }
+
+    func toggleEnabled(_ actionId: String) {
+        if let index = actions.firstIndex(where: { $0.id == actionId }) {
+            actions[index].isEnabled.toggle()
+            save()
+        }
+    }
+
+    func resetToDefault(_ actionId: String) {
+        guard let defaultAction = ActionManager.defaultActions.first(where: { $0.id == actionId }),
+              let index = actions.firstIndex(where: { $0.id == actionId }) else { return }
+        let currentOrder = actions[index].order
+        let currentEnabled = actions[index].isEnabled
+        actions[index] = defaultAction
+        actions[index].order = currentOrder
+        actions[index].isEnabled = currentEnabled
+        save()
+    }
+
+    func restoreDefaults() {
+        let existingIds = Set(actions.map { $0.id })
+        var nextOrder = (actions.map { $0.order }.max() ?? -1) + 1
+        for defaultAction in ActionManager.defaultActions {
+            if !existingIds.contains(defaultAction.id) {
+                var action = defaultAction
+                action.order = nextOrder
+                actions.append(action)
+                nextOrder += 1
+            }
+        }
+        save()
+    }
+
+    /// Check if a shortcut key is already in use by another action (or custom prompt)
+    func isShortcutInUse(_ key: String, excludingActionId: String?) -> Bool {
+        let upperKey = key.uppercased()
+        for action in actions where action.id != excludingActionId {
+            if let shortcut = action.shortcut, shortcut.uppercased() == upperKey {
+                return true
+            }
+        }
+        if excludingActionId != "custom_prompt",
+           let cpShortcut = customPromptShortcut, cpShortcut.uppercased() == upperKey {
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Persistence
+
+    func load() {
+        guard let data = FileManager.default.contents(atPath: actionsFilePath) else {
+            // No file exists — seed with defaults
+            actions = ActionManager.defaultActions
+            customPromptShortcut = "P"
+            save()
+            return
+        }
+
+        // Try v2/v3 format first
+        if let actionsFile = try? JSONDecoder().decode(ActionsFile.self, from: data) {
+            actions = actionsFile.actions
+            customPromptShortcut = actionsFile.customPromptShortcut
+            customPromptEnabled = actionsFile.customPromptEnabled ?? true
+            return
+        }
+
+        // Try old format (bare array of LegacyCustomAction)
+        if let legacyActions = try? JSONDecoder().decode([LegacyCustomAction].self, from: data) {
+            migrateFromLegacy(legacyActions)
+            return
+        }
+
+        // Unreadable — seed defaults
+        actions = ActionManager.defaultActions
+        customPromptShortcut = "P"
+        save()
+    }
+
+    func save() {
+        let dir = NSString(string: "~/.popdraft").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let file = ActionsFile(version: 3, actions: actions, customPromptShortcut: customPromptShortcut, customPromptEnabled: customPromptEnabled)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        if let data = try? encoder.encode(file) {
+            try? data.write(to: URL(fileURLWithPath: actionsFilePath))
+        }
+    }
+
+    private func migrateFromLegacy(_ legacyActions: [LegacyCustomAction]) {
+        // Start with defaults
+        actions = ActionManager.defaultActions
+
+        // Apply disabled actions and custom shortcuts from old config
         let config = LLMConfig.load()
-        return !config.disabledBuiltInActions.contains(actionId)
+        let disabledIds = Set(config.disabledBuiltInActions)
+        for i in 0..<actions.count {
+            if disabledIds.contains(actions[i].id) {
+                actions[i].isEnabled = false
+            }
+            if let customShortcut = config.customShortcuts[actions[i].id] {
+                actions[i].shortcut = customShortcut
+            }
+        }
+
+        // Custom prompt shortcut from old config
+        customPromptShortcut = config.customShortcuts["custom_prompt..."] ?? "P"
+
+        // Append legacy custom actions
+        var nextOrder = actions.count
+        for legacy in legacyActions {
+            let action = Action(
+                id: "custom_\(legacy.id.uuidString)",
+                name: legacy.name,
+                icon: legacy.icon,
+                prompt: legacy.prompt,
+                shortcut: config.customShortcuts["custom_\(legacy.id.uuidString)"],
+                isEnabled: true,
+                order: nextOrder,
+                isDefault: false
+            )
+            actions.append(action)
+            nextOrder += 1
+        }
+
+        save()
+    }
+
+    private func recalculateOrder() {
+        for i in 0..<actions.count {
+            actions[i].order = i
+        }
     }
 }
 
@@ -1041,17 +1193,18 @@ struct PopupView: View {
     @Binding var customPromptText: String
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isCustomPromptFocused: Bool
-    let allActions: [LLMAction]
-    let onSelect: (LLMAction) -> Void
+    let allActions: [Action]
+    let onSelect: (Action) -> Void
     let onCopy: () -> Void
     let onBack: () -> Void
     let onDismiss: () -> Void
     let onTTSStop: () -> Void
     let onTTSPause: () -> Void
     let onTTSResume: () -> Void
+    let onOpenAccessibilitySettings: () -> Void
 
     // Computed filtered actions - recomputes when searchText changes
-    private var actions: [LLMAction] {
+    private var actions: [Action] {
         if searchText.isEmpty {
             return allActions
         }
@@ -1369,24 +1522,53 @@ struct PopupView: View {
 
             Divider()
 
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 32))
-                    .foregroundColor(.orange)
+            if message == "ACCESSIBILITY_PERMISSION_REQUIRED" {
+                VStack(spacing: 12) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 32))
+                        .foregroundColor(.red)
 
-                Text(message)
-                    .font(.system(size: 13))
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
+                    Text("Accessibility Permission Required")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    Text("PopDraft needs Accessibility access to capture selected text. Please grant permission in System Settings.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    Button(action: onOpenAccessibilitySettings) {
+                        Text("Open Accessibility Settings")
+                            .font(.system(size: 12, weight: .medium))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color.accentColor)
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(20)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 32))
+                        .foregroundColor(.orange)
+
+                    Text(message)
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(20)
             }
-            .frame(maxWidth: .infinity)
-            .padding(20)
         }
     }
 }
 
 struct ActionRow: View {
-    let action: LLMAction
+    let action: Action
     let isSelected: Bool
 
     var body: some View {
@@ -1506,14 +1688,15 @@ class PopupWindowController: NSWindowController {
             selectedIndex: Binding(get: { self.selectedIndex }, set: { self.selectedIndex = $0 }),
             state: Binding(get: { self.state }, set: { self.state = $0; self.updateView() }),
             customPromptText: Binding(get: { self.customPromptText }, set: { self.customPromptText = $0 }),
-            allActions: ActionManager.shared.actions,
+            allActions: ActionManager.shared.popupActions,
             onSelect: { [weak self] action in self?.selectAction(action) },
             onCopy: { [weak self] in self?.copyResult() },
             onBack: { [weak self] in self?.goBack() },
             onDismiss: { [weak self] in self?.dismiss() },
             onTTSStop: { [weak self] in self?.stopTTS() },
             onTTSPause: { [weak self] in self?.pauseTTS() },
-            onTTSResume: { [weak self] in self?.resumeTTS() }
+            onTTSResume: { [weak self] in self?.resumeTTS() },
+            onOpenAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() }
         )
 
         if hostingView == nil {
@@ -1548,20 +1731,36 @@ class PopupWindowController: NSWindowController {
         previousApp = frontApp
         let frontName = frontApp?.localizedName ?? "unknown"
 
-        // Use AppleScript to click Edit > Copy menu (works with Electron apps like Slack)
-        let script = NSAppleScript(source: """
-            tell application "\(frontName)" to activate
-            delay 0.1
-            tell application "System Events"
-                tell process "\(frontName)"
-                    click menu item "Copy" of menu "Edit" of menu bar 1
-                end tell
-            end tell
-        """)
-        script?.executeAndReturnError(nil)
+        // Strategy: try CGEvent Cmd+C first (works for Chrome, native apps),
+        // then fall back to AppleScript Edit > Copy menu (works for Electron apps like Slack)
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
+        keyDown?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
+        keyUp?.flags = .maskCommand
+        keyUp?.post(tap: .cghidEventTap)
 
-        // Wait for clipboard to update (300ms for Electron apps)
-        usleep(300000)  // 300ms
+        // Wait for clipboard to update (poll up to 500ms for slower apps like Chrome)
+        for _ in 0..<10 {
+            usleep(50000)  // 50ms per check
+            if pasteboard.changeCount != savedChangeCount { break }
+        }
+
+        // If CGEvent Cmd+C didn't work, fall back to AppleScript Edit > Copy menu
+        if pasteboard.changeCount == savedChangeCount {
+            let script = NSAppleScript(source: """
+                tell application "\(frontName)" to activate
+                delay 0.1
+                tell application "System Events"
+                    tell process "\(frontName)"
+                        click menu item "Copy" of menu "Edit" of menu bar 1
+                    end tell
+                end tell
+            """)
+            script?.executeAndReturnError(nil)
+            usleep(300000)  // 300ms for Electron apps
+        }
 
         // Check if clipboard changed (meaning text was selected and copied)
         if pasteboard.changeCount != savedChangeCount {
@@ -1632,12 +1831,12 @@ class PopupWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func showWithAction(actionName: String) {
+    func showWithAction(actionID: String) {
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
 
-        // Find the action by name
-        guard let action = ActionManager.shared.actions.first(where: { $0.name == actionName }) else {
+        // Find the action by ID
+        guard let action = ActionManager.shared.popupActions.first(where: { $0.id == actionID }) else {
             showAtMouseLocation() // Fall back to showing popup
             return
         }
@@ -1772,11 +1971,11 @@ class PopupWindowController: NSWindowController {
                     }
                 case .customPrompt:
                     if !self.customPromptText.isEmpty {
-                        let customAction = LLMAction(
+                        let customAction = Action(
+                            id: "custom_prompt_inline",
                             name: "Custom",
                             icon: "ellipsis.circle.fill",
-                            prompt: self.customPromptText,
-                            shortcut: nil
+                            prompt: self.customPromptText
                         )
                         self.selectAction(customAction)
                     }
@@ -1800,11 +1999,19 @@ class PopupWindowController: NSWindowController {
         }
     }
 
-    private func selectAction(_ action: LLMAction) {
+    private func selectAction(_ action: Action) {
         // Handle custom prompt
-        if action.name == "Custom prompt..." {
+        if action.id == "custom_prompt" {
             Logger.shared.info("Action selected: Custom prompt")
             state = .customPrompt
+            updateView()
+            return
+        }
+
+        // Check accessibility permission
+        if !AXIsProcessTrusted() {
+            Logger.shared.error("Action '\(action.name)' failed: Accessibility permission not granted")
+            state = .error("ACCESSIBILITY_PERMISSION_REQUIRED")
             updateView()
             return
         }
@@ -1820,17 +2027,19 @@ class PopupWindowController: NSWindowController {
         let textPreview = clipboardText.prefix(50).replacingOccurrences(of: "\n", with: " ")
         Logger.shared.info("Action '\(action.name)' on \(clipboardText.count) chars: \"\(textPreview)...\"")
 
-        // Handle TTS action
-        if action.isTTS {
-            state = .ttsPlaying(isPaused: false)
-            updateView()
+        // Show processing state
+        state = .processing
+        updateView()
 
+        switch action.actionType {
+        case .tts:
             TTSClient.shared.speak(text: clipboardText) { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
                         Logger.shared.info("TTS playback started")
-                        // Playback started - start polling for completion
+                        self?.state = .ttsPlaying(isPaused: false)
+                        self?.updateView()
                         self?.startTTSStatusPolling()
                     case .failure(let error):
                         Logger.shared.error("TTS failed: \(error.localizedDescription)")
@@ -1839,31 +2048,91 @@ class PopupWindowController: NSWindowController {
                     }
                 }
             }
-            return
-        }
 
-        // Show processing state
-        state = .processing
-        updateView()
+        case .command:
+            let commandTemplate = action.prompt
+            Logger.shared.info("Running command action: \(commandTemplate)")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
 
-        // Build the full prompt
-        let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
-
-        // Call LLM backend
-        let startTime = Date()
-        LLMClient.shared.generate(prompt: fullPrompt) { [weak self] result in
-            let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
-            DispatchQueue.main.async {
-                switch result {
-                case .success(let response):
-                    Logger.shared.info("LLM response received (\(elapsed), \(response.count) chars)")
-                    self?.resultText = response
-                    self?.state = .result(response)
-                case .failure(let error):
-                    Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
-                    self?.state = .error(error.localizedDescription)
+                let hasPlaceholder = commandTemplate.contains("{text}")
+                let command: String
+                if hasPlaceholder {
+                    command = commandTemplate.replacingOccurrences(of: "{text}", with: self.clipboardText.replacingOccurrences(of: "'", with: "'\\''"))
+                } else {
+                    command = commandTemplate
                 }
-                self?.updateView()
+                process.arguments = ["-c", command]
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                if !hasPlaceholder {
+                    let stdinPipe = Pipe()
+                    stdinPipe.fileHandleForWriting.write(self.clipboardText.data(using: .utf8) ?? Data())
+                    stdinPipe.fileHandleForWriting.closeFile()
+                    process.standardInput = stdinPipe
+                }
+
+                // 30 second timeout
+                let timer = DispatchSource.makeTimerSource(queue: .global())
+                timer.schedule(deadline: .now() + 30)
+                timer.setEventHandler { process.terminate() }
+                timer.resume()
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    timer.cancel()
+
+                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stdout = String(data: stdoutData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let stderr = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                    DispatchQueue.main.async {
+                        if process.terminationStatus == 0 {
+                            Logger.shared.info("Command completed, output: \(stdout.count) chars")
+                            self.resultText = stdout
+                            self.state = .result(stdout)
+                        } else {
+                            let errorMsg = stderr.isEmpty ? "Command exited with code \(process.terminationStatus)" : stderr
+                            Logger.shared.error("Command failed: \(errorMsg)")
+                            self.state = .error(errorMsg)
+                        }
+                        self.updateView()
+                    }
+                } catch {
+                    timer.cancel()
+                    DispatchQueue.main.async {
+                        Logger.shared.error("Command failed to launch: \(error.localizedDescription)")
+                        self.state = .error("Failed to run command: \(error.localizedDescription)")
+                        self.updateView()
+                    }
+                }
+            }
+
+        case .llm:
+            let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
+            let startTime = Date()
+            LLMClient.shared.generate(prompt: fullPrompt) { [weak self] result in
+                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let response):
+                        Logger.shared.info("LLM response received (\(elapsed), \(response.count) chars)")
+                        self?.resultText = response
+                        self?.state = .result(response)
+                    case .failure(let error):
+                        Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
+                        self?.state = .error(error.localizedDescription)
+                    }
+                    self?.updateView()
+                }
             }
         }
     }
@@ -1924,6 +2193,13 @@ class PopupWindowController: NSWindowController {
         }
     }
 
+    private func openAccessibilitySettings() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
     private func showNotification(title: String, message: String) {
         let script = """
         display notification "\(message.replacingOccurrences(of: "\"", with: "\\\""))" with title "\(title.replacingOccurrences(of: "\"", with: "\\\""))"
@@ -1960,14 +2236,16 @@ struct SettingsView: View {
     @State private var ttsVoice: String = "af_heart"
     @State private var ttsSpeed: Double = 1.0
     @State private var voiceSearchText: String = ""
-    @State private var customActions: [CustomAction] = []
-    @State private var editingAction: CustomAction? = nil
-    @State private var isAddingAction: Bool = false
-    @State private var disabledBuiltInActions: Set<String> = []
+    @State private var settingsActions: [Action] = []
+
+    private var sortedActions: [Action] {
+        settingsActions.sorted(by: { $0.order < $1.order })
+    }
+    @State private var customPromptEnabled: Bool = true
     @State private var showingActionEditor: Bool = false
-    @State private var actionToEdit: CustomAction? = nil
-    @State private var customShortcuts: [String: String] = [:]
+    @State private var actionToEdit: Action? = nil
     @State private var editingShortcutFor: String? = nil  // actionId currently being edited
+    @State private var customPromptShortcut: String? = "P"
     @State private var popupHotkey: String = "Space"
     @State private var editingPopupHotkey: Bool = false
     @State private var selectedLlamaModel: String = "qwen2.5-3b"
@@ -2044,7 +2322,7 @@ struct SettingsView: View {
             }
             .padding(16)
         }
-        .frame(width: 420, height: 480)
+        .frame(width: 500, height: 580)
         .onAppear {
             loadCurrentConfig()
             if selectedProvider == .ollama {
@@ -2144,73 +2422,92 @@ struct SettingsView: View {
     private var actionsSettingsTab: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Built-in actions section
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Built-in Actions")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 16)
-
-                        VStack(spacing: 1) {
-                            ForEach(ActionManager.shared.allBuiltInActions, id: \.id) { action in
-                                builtInActionRow(action: action)
-                            }
-                        }
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(8)
+                VStack(alignment: .leading, spacing: 12) {
+                    // Header
+                    Text("Actions")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.secondary)
                         .padding(.horizontal, 16)
-                    }
-                    .padding(.top, 12)
 
-                    // Custom actions section
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Custom Actions")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.secondary)
+                    // Action list with up/down reorder buttons
+                    VStack(spacing: 0) {
+                        let sorted = sortedActions
+                        ForEach(Array(sorted.enumerated()), id: \.element.id) { index, action in
+                            if index > 0 {
+                                Divider().padding(.horizontal, 12)
+                            }
+                            actionRow(action: action, index: index, total: sorted.count)
+                        }
+
+                        Divider().padding(.horizontal, 12)
+
+                        // Custom prompt row (inline)
+                        HStack(spacing: 8) {
+                            Toggle("", isOn: Binding(
+                                get: { customPromptEnabled },
+                                set: { newVal in
+                                    customPromptEnabled = newVal
+                                    ActionManager.shared.customPromptEnabled = newVal
+                                    ActionManager.shared.save()
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .frame(width: 36)
+
+                            Image(systemName: "ellipsis.circle.fill")
+                                .foregroundColor(.accentColor)
+                                .frame(width: 18)
+
+                            Text("Custom prompt...")
+                                .font(.system(size: 12))
+                                .lineLimit(1)
+
                             Spacer()
-                            Button(action: {
-                                actionToEdit = nil
-                                showingActionEditor = true
-                            }) {
-                                Image(systemName: "plus.circle.fill")
-                                    .foregroundColor(.accentColor)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, 16)
 
-                        if customActions.isEmpty {
-                            HStack {
-                                Spacer()
-                                VStack(spacing: 4) {
-                                    Text("No custom actions")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.secondary)
-                                    Text("Click + to add one")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(.secondary.opacity(0.7))
-                                }
-                                Spacer()
-                            }
-                            .padding(.vertical, 20)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(8)
-                            .padding(.horizontal, 16)
-                        } else {
-                            VStack(spacing: 1) {
-                                ForEach(customActions) { action in
-                                    customActionRow(action: action)
-                                }
-                            }
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(8)
-                            .padding(.horizontal, 16)
+                            shortcutButton(actionId: "custom_prompt", currentShortcut: customPromptShortcut)
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                    }
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .padding(.horizontal, 16)
+
+                    // Add Action button
+                    Button(action: {
+                        actionToEdit = nil
+                        showingActionEditor = true
+                    }) {
+                        HStack {
+                            Image(systemName: "plus.circle.fill")
+                            Text("Add Action")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.accentColor.opacity(0.1))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+
+                    // Restore defaults button
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            ActionManager.shared.restoreDefaults()
+                            settingsActions = ActionManager.shared.actions
+                        }) {
+                            Text("Restore Default Actions")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
                     }
                 }
-                .padding(.bottom, 12)
+                .padding(.vertical, 12)
             }
         }
         .frame(maxHeight: .infinity)
@@ -2222,11 +2519,11 @@ struct SettingsView: View {
                 action: actionToEdit,
                 onSave: { newAction in
                     if actionToEdit != nil {
-                        CustomActionManager.shared.update(newAction)
+                        ActionManager.shared.update(newAction)
                     } else {
-                        CustomActionManager.shared.add(newAction)
+                        ActionManager.shared.add(newAction)
                     }
-                    customActions = CustomActionManager.shared.customActions
+                    settingsActions = ActionManager.shared.actions
                     showingActionEditor = false
                     actionToEdit = nil
                 },
@@ -2238,23 +2535,18 @@ struct SettingsView: View {
         }
     }
 
-    private func builtInActionRow(action: LLMAction) -> some View {
-        let effectiveShortcut = customShortcuts[action.id] ?? action.shortcut
-
-        return HStack(spacing: 10) {
+    private func actionRow(action: Action, index: Int, total: Int) -> some View {
+        HStack(spacing: 8) {
             Toggle("", isOn: Binding(
-                get: { !disabledBuiltInActions.contains(action.id) },
-                set: { enabled in
-                    if enabled {
-                        disabledBuiltInActions.remove(action.id)
-                    } else {
-                        disabledBuiltInActions.insert(action.id)
-                    }
+                get: { settingsActions.first(where: { $0.id == action.id })?.isEnabled ?? true },
+                set: { _ in
+                    ActionManager.shared.toggleEnabled(action.id)
+                    settingsActions = ActionManager.shared.actions
                 }
             ))
             .toggleStyle(.switch)
-            .scaleEffect(0.7)
-            .frame(width: 40)
+            .controlSize(.mini)
+            .frame(width: 36)
 
             Image(systemName: action.icon)
                 .foregroundColor(.accentColor)
@@ -2264,9 +2556,65 @@ struct SettingsView: View {
                 .font(.system(size: 12))
                 .lineLimit(1)
 
+            Text(action.actionType.label)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(3)
+
             Spacer()
 
-            shortcutButton(actionId: action.id, currentShortcut: effectiveShortcut)
+            // Reorder buttons
+            VStack(spacing: 0) {
+                Button(action: {
+                    guard index > 0 else { return }
+                    ActionManager.shared.move(from: IndexSet(integer: index), to: index - 1)
+                    settingsActions = ActionManager.shared.actions
+                }) {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(index > 0 ? .secondary : .secondary.opacity(0.3))
+                }
+                .buttonStyle(.plain)
+                .disabled(index == 0)
+
+                Button(action: {
+                    guard index < total - 1 else { return }
+                    ActionManager.shared.move(from: IndexSet(integer: index), to: index + 2)
+                    settingsActions = ActionManager.shared.actions
+                }) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(index < total - 1 ? .secondary : .secondary.opacity(0.3))
+                }
+                .buttonStyle(.plain)
+                .disabled(index == total - 1)
+            }
+            .frame(width: 16)
+
+            shortcutButton(actionId: action.id, currentShortcut: action.shortcut)
+
+            Button(action: {
+                actionToEdit = action
+                showingActionEditor = true
+            }) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+
+            Button(action: {
+                ActionManager.shared.delete(action.id)
+                settingsActions = ActionManager.shared.actions
+            }) {
+                Image(systemName: "trash")
+                    .font(.system(size: 11))
+                    .foregroundColor(.red.opacity(0.7))
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -2277,10 +2625,22 @@ struct SettingsView: View {
             if editingShortcutFor == actionId {
                 ShortcutRecorderView(
                     onCapture: { key in
-                        if let key = key {
-                            customShortcuts[actionId] = key
+                        if actionId == "custom_prompt" {
+                            customPromptShortcut = key
+                            ActionManager.shared.customPromptShortcut = key
+                            ActionManager.shared.save()
+                        } else if let key = key {
+                            if var action = settingsActions.first(where: { $0.id == actionId }) {
+                                action.shortcut = key
+                                ActionManager.shared.update(action)
+                                settingsActions = ActionManager.shared.actions
+                            }
                         } else {
-                            customShortcuts.removeValue(forKey: actionId)
+                            if var action = settingsActions.first(where: { $0.id == actionId }) {
+                                action.shortcut = nil
+                                ActionManager.shared.update(action)
+                                settingsActions = ActionManager.shared.actions
+                            }
                         }
                         editingShortcutFor = nil
                     },
@@ -2310,54 +2670,11 @@ struct SettingsView: View {
         }
     }
 
-    private func customActionRow(action: CustomAction) -> some View {
-        let actionId = "custom_\(action.id.uuidString)"
-        let effectiveShortcut = customShortcuts[actionId]
-
-        return HStack(spacing: 10) {
-            Image(systemName: action.icon)
-                .foregroundColor(.accentColor)
-                .frame(width: 18)
-
-            Text(action.name)
-                .font(.system(size: 12))
-                .lineLimit(1)
-
-            Spacer()
-
-            shortcutButton(actionId: actionId, currentShortcut: effectiveShortcut)
-
-            Button(action: {
-                actionToEdit = action
-                showingActionEditor = true
-            }) {
-                Image(systemName: "pencil")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(.plain)
-
-            Button(action: { deleteCustomAction(action) }) {
-                Image(systemName: "trash")
-                    .font(.system(size: 11))
-                    .foregroundColor(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-
     private func loadActionsState() {
-        customActions = CustomActionManager.shared.customActions
-        let config = LLMConfig.load()
-        disabledBuiltInActions = Set(config.disabledBuiltInActions)
-        customShortcuts = config.customShortcuts
-    }
-
-    private func deleteCustomAction(_ action: CustomAction) {
-        CustomActionManager.shared.delete(action)
-        customActions = CustomActionManager.shared.customActions
+        ActionManager.shared.load()
+        settingsActions = ActionManager.shared.actions
+        customPromptShortcut = ActionManager.shared.customPromptShortcut
+        customPromptEnabled = ActionManager.shared.customPromptEnabled
     }
 
     // MARK: - LLM Settings Tab
@@ -2748,10 +3065,10 @@ struct SettingsView: View {
         }
         ttsVoice = config.ttsVoice
         ttsSpeed = config.ttsSpeed
-        disabledBuiltInActions = Set(config.disabledBuiltInActions)
-        customShortcuts = config.customShortcuts
         popupHotkey = config.popupHotkey
-        customActions = CustomActionManager.shared.customActions
+        settingsActions = ActionManager.shared.actions
+        customPromptShortcut = ActionManager.shared.customPromptShortcut
+        customPromptEnabled = ActionManager.shared.customPromptEnabled
     }
 
     private func fetchOllamaModels() {
@@ -2790,8 +3107,6 @@ struct SettingsView: View {
         config.claudeModel = claudeModel == "Custom..." ? customClaudeModel : claudeModel
         config.ttsVoice = ttsVoice
         config.ttsSpeed = ttsSpeed
-        config.disabledBuiltInActions = Array(disabledBuiltInActions)
-        config.customShortcuts = customShortcuts
         config.popupHotkey = popupHotkey
         onSave(config)
     }
@@ -2861,20 +3176,23 @@ struct ShortcutRecorderView: View {
 // MARK: - Action Editor Sheet
 
 struct ActionEditorSheet: View {
-    let action: CustomAction?
-    let onSave: (CustomAction) -> Void
+    let action: Action?
+    let onSave: (Action) -> Void
     let onCancel: () -> Void
 
     @State private var name: String = ""
     @State private var prompt: String = ""
     @State private var selectedIcon: String = "star.fill"
+    @State private var selectedActionType: ActionType = .llm
 
     private let availableIcons = [
         "star.fill", "heart.fill", "bolt.fill", "globe", "flag.fill",
         "bookmark.fill", "tag.fill", "paperplane.fill", "doc.text.fill",
         "pencil", "highlighter", "text.bubble.fill", "quote.bubble.fill",
         "character.book.closed.fill", "text.magnifyingglass",
-        "wand.and.stars", "sparkles", "lightbulb.fill", "brain.head.profile"
+        "wand.and.stars", "sparkles", "lightbulb.fill", "brain.head.profile",
+        "checkmark.circle.fill", "pencil.circle.fill", "arrowshape.turn.up.left.fill",
+        "arrow.right.circle.fill", "speaker.wave.2.fill"
     ]
 
     var body: some View {
@@ -2884,6 +3202,20 @@ struct ActionEditorSheet: View {
                 Text(action == nil ? "New Action" : "Edit Action")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
+                if let action = action, action.isDefault {
+                    Button("Reset to Default") {
+                        ActionManager.shared.resetToDefault(action.id)
+                        if let defaultAction = ActionManager.shared.actions.first(where: { $0.id == action.id }) {
+                            name = defaultAction.name
+                            prompt = defaultAction.prompt
+                            selectedIcon = defaultAction.icon
+                            selectedActionType = defaultAction.actionType
+                        }
+                    }
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .buttonStyle(.plain)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.top, 16)
@@ -2922,24 +3254,69 @@ struct ActionEditorSheet: View {
                         }
                     }
 
-                    // Prompt field
+                    // Action type picker
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Prompt Instructions")
+                        Text("Action Type")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.secondary)
-                        TextEditor(text: $prompt)
-                            .font(.system(size: 12))
-                            .frame(minHeight: 80, maxHeight: 120)
-                            .padding(4)
-                            .background(Color(NSColor.textBackgroundColor))
-                            .cornerRadius(6)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.gray.opacity(0.3), lineWidth: 1)
-                            )
-                        Text("The selected text will be provided to the LLM with these instructions.")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
+                        Picker("", selection: $selectedActionType) {
+                            ForEach(ActionType.allCases, id: \.self) { type in
+                                Text(type.label).tag(type)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
+
+                    // Contextual fields based on action type
+                    VStack(alignment: .leading, spacing: 6) {
+                        switch selectedActionType {
+                        case .llm:
+                            Text("Prompt Instructions")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.secondary)
+                            TextEditor(text: $prompt)
+                                .font(.system(size: 12))
+                                .frame(minHeight: 80, maxHeight: 120)
+                                .padding(4)
+                                .background(Color(NSColor.textBackgroundColor))
+                                .cornerRadius(6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                                )
+                            Text("The selected text will be sent to the LLM with these instructions.")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        case .tts:
+                            Text("Text-to-Speech")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.secondary)
+                            Text("Selected text will be read aloud using the configured TTS voice.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(6)
+                        case .command:
+                            Text("Shell Command")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.secondary)
+                            TextEditor(text: $prompt)
+                                .font(.system(size: 12, design: .monospaced))
+                                .frame(minHeight: 80, maxHeight: 120)
+                                .padding(4)
+                                .background(Color(NSColor.textBackgroundColor))
+                                .cornerRadius(6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                                )
+                            Text("Use {text} as placeholder for selected text, or it will be piped via stdin.")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
                 .padding(.horizontal, 20)
@@ -2957,38 +3334,50 @@ struct ActionEditorSheet: View {
                 .keyboardShortcut(.cancelAction)
 
                 Button("Save") {
-                    let newAction = CustomAction(
-                        id: action?.id ?? UUID(),
-                        name: name,
-                        icon: selectedIcon,
-                        prompt: prompt
-                    )
+                    var newAction: Action
+                    if let existing = action {
+                        newAction = existing
+                        newAction.name = name
+                        newAction.icon = selectedIcon
+                        newAction.prompt = prompt
+                        newAction.actionType = selectedActionType
+                    } else {
+                        newAction = Action(
+                            id: "user_\(UUID().uuidString)",
+                            name: name,
+                            icon: selectedIcon,
+                            prompt: prompt,
+                            actionType: selectedActionType
+                        )
+                    }
                     onSave(newAction)
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty || prompt.isEmpty)
+                .disabled(name.isEmpty || (selectedActionType == .llm && prompt.isEmpty) || (selectedActionType == .command && prompt.isEmpty))
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
         }
-        .frame(width: 340, height: 380)
+        .frame(width: 380, height: 520)
         .onAppear {
             if let action = action {
                 name = action.name
                 prompt = action.prompt
                 selectedIcon = action.icon
+                selectedActionType = action.actionType
             }
         }
     }
 }
+
 
 class SettingsWindowController: NSWindowController {
     private var hostingView: NSHostingView<SettingsView>?
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -3941,15 +4330,6 @@ class HotkeyManager {
         let description: String
     }
 
-    // Default shortcuts mapping: actionId -> (shortcut key, trigger action)
-    private let defaultShortcuts: [(actionId: String, defaultKey: String, triggerAction: String)] = [
-        ("fix_grammar_and_spelling", "G", "grammar"),
-        ("articulate", "A", "articulate"),
-        ("craft_a_reply", "C", "answer"),
-        ("custom_prompt...", "P", "custom"),
-        ("read_aloud", "S", "speak"),
-    ]
-
     // Key code mapping
     private let keyCodeMap: [String: UInt32] = [
         "A": 0, "B": 11, "C": 8, "D": 2, "E": 14, "F": 3, "G": 5, "H": 4,
@@ -3975,41 +4355,33 @@ class HotkeyManager {
             id += 1
         }
 
-        // Register action shortcuts from config or defaults
-        for (actionId, defaultKey, triggerAction) in defaultShortcuts {
-            // Check if action is disabled
-            if config.disabledBuiltInActions.contains(actionId) {
-                continue
-            }
-
-            // Get custom shortcut or use default
-            let shortcutKey = config.customShortcuts[actionId] ?? defaultKey
-            guard let keyCode = keyCodeMap[shortcutKey.uppercased()] else { continue }
+        // Register shortcuts for all enabled actions
+        for action in ActionManager.shared.actions where action.isEnabled {
+            guard let shortcutKey = action.shortcut,
+                  let keyCode = keyCodeMap[shortcutKey.uppercased()] else { continue }
 
             hotkeys.append(HotkeyConfig(
                 id: id,
                 keyCode: keyCode,
                 modifiers: UInt32(controlKey | optionKey),
-                actionID: triggerAction,
+                actionID: action.id,
                 description: "Ctrl+Option+\(shortcutKey)"
             ))
             id += 1
         }
 
-        // Register shortcuts for custom actions
-        for customAction in CustomActionManager.shared.customActions {
-            let actionId = "custom_\(customAction.id.uuidString)"
-            if let shortcutKey = config.customShortcuts[actionId],
-               let keyCode = keyCodeMap[shortcutKey.uppercased()] {
-                hotkeys.append(HotkeyConfig(
-                    id: id,
-                    keyCode: keyCode,
-                    modifiers: UInt32(controlKey | optionKey),
-                    actionID: actionId,
-                    description: "Ctrl+Option+\(shortcutKey)"
-                ))
-                id += 1
-            }
+        // Register custom prompt shortcut
+        if ActionManager.shared.customPromptEnabled,
+           let cpShortcut = ActionManager.shared.customPromptShortcut,
+           let keyCode = keyCodeMap[cpShortcut.uppercased()] {
+            hotkeys.append(HotkeyConfig(
+                id: id,
+                keyCode: keyCode,
+                modifiers: UInt32(controlKey | optionKey),
+                actionID: "custom_prompt",
+                description: "Ctrl+Option+\(cpShortcut)"
+            ))
+            id += 1
         }
 
         return hotkeys
@@ -4140,6 +4512,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         HotkeyManager.shared.registerAll()
 
         Logger.shared.info("PopDraft \(AppVersion.current) started. Press Option+Space to show popup.")
+
+        // Monitor accessibility permission periodically
+        var wasAccessible = AXIsProcessTrusted()
+        Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
+            let isAccessible = AXIsProcessTrusted()
+            if wasAccessible && !isAccessible {
+                Logger.shared.error("Accessibility permission was revoked")
+                let script = """
+                display notification "PopDraft needs Accessibility permission to capture text. Please re-enable it in System Settings > Privacy & Security > Accessibility." with title "PopDraft: Accessibility Permission Lost"
+                """
+                let task = Process()
+                task.launchPath = "/usr/bin/osascript"
+                task.arguments = ["-e", script]
+                try? task.run()
+            }
+            wasAccessible = isAccessible
+        }
     }
 
     private func setupEditMenu() {
@@ -4175,39 +4564,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func triggerAction(actionID: String) {
-        switch actionID {
-        case "popup":
+        if actionID == "popup" {
             showPopup()
-        case "grammar":
-            popupController?.showWithAction(actionName: "Fix grammar and spelling")
-        case "articulate":
-            popupController?.showWithAction(actionName: "Articulate")
-        case "answer":
-            popupController?.showWithAction(actionName: "Craft a reply")
-        case "custom":
-            popupController?.showWithAction(actionName: "Custom prompt...")
-        case "speak":
-            popupController?.showWithAction(actionName: "Read aloud")
-        default:
-            // Check if it's a custom action (custom_UUID format) or a built-in action ID
-            if actionID.hasPrefix("custom_") {
-                // Find the custom action by ID
-                let uuidString = String(actionID.dropFirst(7)) // Remove "custom_" prefix
-                if let uuid = UUID(uuidString: uuidString),
-                   let customAction = CustomActionManager.shared.customActions.first(where: { $0.id == uuid }) {
-                    popupController?.showWithAction(actionName: customAction.name)
-                } else {
-                    showPopup()
-                }
-            } else {
-                // Try to find built-in action by ID
-                let actions = ActionManager.shared.actions
-                if let action = actions.first(where: { $0.id == actionID }) {
-                    popupController?.showWithAction(actionName: action.name)
-                } else {
-                    showPopup()
-                }
-            }
+        } else {
+            popupController?.showWithAction(actionID: actionID)
         }
     }
 

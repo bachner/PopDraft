@@ -84,7 +84,58 @@ cp "${SCRIPT_DIR}/README.md" "${APP_BUNDLE}/Contents/Resources/"
 
 echo "  [OK] Resources copied"
 
-# Create Applications symlink
+# Generate DMG background image
+echo "Generating DMG background..."
+mkdir -p "${DMG_DIR}/.background"
+python3 "${SCRIPT_DIR}/scripts/create-dmg-background.py" "${DMG_DIR}/.background/bg.png"
+echo "  [OK] Background generated"
+
+# Create installer script (hidden, avoids Gatekeeper quarantine for unsigned apps)
+cat > "${DMG_DIR}/.install.command" << 'INSTALLER'
+#!/bin/bash
+# PopDraft Installer — double-click to install
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_SRC="${SCRIPT_DIR}/PopDraft.app"
+APP_DEST="/Applications/PopDraft.app"
+
+echo ""
+echo "PopDraft Installer"
+echo "======================"
+echo ""
+
+# Kill existing instance
+pkill -f "PopDraft.app/Contents/MacOS/PopDraft" 2>/dev/null || true
+sleep 0.5
+
+# Remove old installation
+if [ -d "$APP_DEST" ]; then
+    echo "Removing previous installation..."
+    rm -rf "$APP_DEST"
+fi
+
+# Copy app
+echo "Installing PopDraft to /Applications..."
+cp -R "$APP_SRC" "$APP_DEST"
+
+# Strip quarantine (critical for unsigned apps from DMGs)
+xattr -cr "$APP_DEST" 2>/dev/null || true
+
+echo "[OK] PopDraft installed"
+echo ""
+echo "Launching PopDraft..."
+open "$APP_DEST"
+
+echo ""
+echo "Done! You can close this window."
+echo "Look for the sparkles icon (✦) in your menu bar."
+echo ""
+INSTALLER
+chmod +x "${DMG_DIR}/.install.command"
+echo "  [OK] Installer script created"
+
+# Create Applications symlink (for drag-and-drop as alternative)
 ln -s /Applications "${DMG_DIR}/Applications"
 
 # Create the DMG
@@ -108,12 +159,13 @@ tell application "Finder"
         set current view of container window to icon view
         set toolbar visible of container window to false
         set statusbar visible of container window to false
-        set bounds of container window to {400, 100, 850, 400}
+        set bounds of container window to {100, 100, 760, 500}
         set viewOptions to the icon view options of container window
         set arrangement of viewOptions to not arranged
-        set icon size of viewOptions to 80
-        set position of item "${APP_NAME}.app" of container window to {120, 140}
-        set position of item "Applications" of container window to {330, 140}
+        set icon size of viewOptions to 128
+        set background picture of viewOptions to file ".background:bg.png"
+        set position of item "${APP_NAME}.app" of container window to {165, 200}
+        set position of item "Applications" of container window to {495, 200}
         close
         update without registering applications
         delay 1
