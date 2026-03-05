@@ -263,6 +263,8 @@ struct LLMConfig {
     var claudeModel: String = "claude-sonnet-4-5-20250514"
     var claudeExtendedThinking: Bool = false
     var claudeThinkingBudget: Int = 10000
+    var ollamaEnableThinking: Bool = false
+    var llamacppEnableThinking: Bool = false
     var ttsVoice: String = "af_heart"
     var ttsSpeed: Double = 1.0
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
@@ -404,6 +406,10 @@ struct LLMConfig {
                 config.claudeExtendedThinking = (value == "true")
             case "CLAUDE_THINKING_BUDGET":
                 config.claudeThinkingBudget = Int(value) ?? 10000
+            case "OLLAMA_ENABLE_THINKING":
+                config.ollamaEnableThinking = (value == "true")
+            case "LLAMACPP_ENABLE_THINKING":
+                config.llamacppEnableThinking = (value == "true")
             case "TTS_VOICE":
                 config.ttsVoice = value
             case "TTS_SPEED":
@@ -445,6 +451,8 @@ struct LLMConfig {
         lines.append("CLAUDE_MODEL=\(claudeModel)")
         lines.append("CLAUDE_EXTENDED_THINKING=\(claudeExtendedThinking)")
         lines.append("CLAUDE_THINKING_BUDGET=\(claudeThinkingBudget)")
+        lines.append("OLLAMA_ENABLE_THINKING=\(ollamaEnableThinking)")
+        lines.append("LLAMACPP_ENABLE_THINKING=\(llamacppEnableThinking)")
         lines.append("TTS_VOICE=\(ttsVoice)")
         lines.append("TTS_SPEED=\(ttsSpeed)")
         lines.append("POPUP_HOTKEY=\(popupHotkey)")
@@ -617,10 +625,14 @@ class LLMClient {
                    let message = first["message"] as? [String: Any],
                    let content = message["content"] as? String {
                     var cleaned = content
+                    var thinkingText: String? = nil
                     if let range = cleaned.range(of: "</think>") {
+                        if self.config.llamacppEnableThinking, let startRange = cleaned.range(of: "<think>") {
+                            thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
-                    completion(.success(LLMResponse(text: cleaned, thinking: nil)))
+                    completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorObj = json["error"] as? [String: Any],
                           let message = errorObj["message"] as? String {
@@ -679,10 +691,14 @@ class LLMClient {
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let responseText = json["response"] as? String {
                     var cleaned = responseText
+                    var thinkingText: String? = nil
                     if let range = cleaned.range(of: "</think>") {
+                        if self.config.ollamaEnableThinking, let startRange = cleaned.range(of: "<think>") {
+                            thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
                         cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
-                    completion(.success(LLMResponse(text: cleaned, thinking: nil)))
+                    completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let errorMsg = json["error"] as? String {
                     completion(.failure(NSError(domain: errorMsg, code: -1)))
@@ -2294,6 +2310,8 @@ struct SettingsView: View {
     @State private var claudeModel: String = ""
     @State private var claudeExtendedThinking: Bool = false
     @State private var claudeThinkingBudget: Double = 10000
+    @State private var ollamaEnableThinking: Bool = false
+    @State private var llamacppEnableThinking: Bool = false
     @State private var availableOllamaModels: [String] = []
     @State private var isLoading = false
     @State private var customOpenAIModel: String = ""
@@ -2421,6 +2439,7 @@ struct SettingsView: View {
                     LaunchAtLoginManager.shared.setEnabled(newValue)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
             .background(Color(NSColor.controlBackgroundColor))
             .cornerRadius(8)
@@ -2945,6 +2964,14 @@ struct SettingsView: View {
             Text("Server: http://localhost:8080")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Show Thinking", isOn: $llamacppEnableThinking)
+                    .font(.system(size: 12, weight: .medium))
+                Text("Show reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
         }
     }
 
@@ -3047,6 +3074,14 @@ struct SettingsView: View {
                 Text("If Ollama fails, PopDraft will fall back to llama.cpp")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Show Thinking", isOn: $ollamaEnableThinking)
+                        .font(.system(size: 12, weight: .medium))
+                    Text("Show reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }
@@ -3148,6 +3183,8 @@ struct SettingsView: View {
         }
         claudeExtendedThinking = config.claudeExtendedThinking
         claudeThinkingBudget = Double(config.claudeThinkingBudget)
+        ollamaEnableThinking = config.ollamaEnableThinking
+        llamacppEnableThinking = config.llamacppEnableThinking
         ttsVoice = config.ttsVoice
         ttsSpeed = config.ttsSpeed
         popupHotkey = config.popupHotkey
@@ -3192,6 +3229,8 @@ struct SettingsView: View {
         config.claudeModel = claudeModel == "Custom..." ? customClaudeModel : claudeModel
         config.claudeExtendedThinking = claudeExtendedThinking
         config.claudeThinkingBudget = Int(claudeThinkingBudget)
+        config.ollamaEnableThinking = ollamaEnableThinking
+        config.llamacppEnableThinking = llamacppEnableThinking
         config.ttsVoice = ttsVoice
         config.ttsSpeed = ttsSpeed
         config.popupHotkey = popupHotkey
