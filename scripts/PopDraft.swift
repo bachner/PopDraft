@@ -4482,7 +4482,7 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
         let appPath = "/Applications/PopDraft.app"
         let task = Process()
         task.launchPath = "/bin/sh"
-        task.arguments = ["-c", "sleep 1; open \"\(appPath)\""]
+        task.arguments = ["-c", "sleep 1; killall PopDraft 2>/dev/null; sleep 0.5; open \"\(appPath)\""]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         try? task.run()
