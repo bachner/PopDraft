@@ -470,12 +470,18 @@ struct LLMResponse {
     let thinking: String?
 }
 
+enum LLMStreamProgress {
+    case thinking
+    case generating(String)  // accumulated response text so far
+}
+
 // MARK: - LLM Client
 
 class LLMClient {
     static let shared = LLMClient()
     private var config: LLMConfig
     private var activeProvider: LLMConfig.Provider?
+    private var activeStreamDelegate: OllamaStreamDelegate?
 
     init() {
         config = LLMConfig.load()
@@ -530,14 +536,14 @@ class LLMClient {
         Logger.shared.log(message)
     }
 
-    func generate(prompt: String, systemPrompt: String? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+    func generate(prompt: String, systemPrompt: String? = nil, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         let provider = config.provider
         activeProvider = provider
 
         Logger.shared.info("Sending to \(provider.displayName) [\(currentModel)]")
 
         // Generate with the configured provider, fallback to llama.cpp on failure
-        generateWithProvider(provider, prompt: prompt, systemPrompt: systemPrompt) { [weak self] result in
+        generateWithProvider(provider, prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress) { [weak self] result in
             switch result {
             case .success:
                 completion(result)
@@ -554,12 +560,12 @@ class LLMClient {
         }
     }
 
-    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         switch provider {
         case .llamacpp:
             generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
         case .ollama:
-            generateOllama(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+            generateOllama(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress, completion: completion)
         case .openai:
             if config.openaiAPIKey.isEmpty {
                 completion(.failure(NSError(domain: "OpenAI API key not configured", code: -1)))
@@ -648,11 +654,13 @@ class LLMClient {
 
     // MARK: - Ollama Backend
 
-    private func generateOllama(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+    private func generateOllama(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
         }
+
+        let useStreaming = config.ollamaEnableThinking && onProgress != nil
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -662,8 +670,10 @@ class LLMClient {
         var body: [String: Any] = [
             "model": config.ollamaModel,
             "prompt": prompt,
-            "stream": false
+            "stream": useStreaming
         ]
+
+        body["think"] = config.ollamaEnableThinking
 
         if let system = systemPrompt {
             body["system"] = system
@@ -676,39 +686,62 @@ class LLMClient {
             return
         }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-
-            guard let data = data else {
-                completion(.failure(NSError(domain: "No data", code: -1)))
-                return
-            }
-
-            do {
-                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let responseText = json["response"] as? String {
-                    var cleaned = responseText
-                    var thinkingText: String? = nil
-                    if let range = cleaned.range(of: "</think>") {
-                        if self.config.ollamaEnableThinking, let startRange = cleaned.range(of: "<think>") {
-                            thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        }
-                        cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if useStreaming {
+            let delegate = OllamaStreamDelegate(
+                enableThinking: config.ollamaEnableThinking,
+                onProgress: { progress in
+                    DispatchQueue.main.async { onProgress?(progress) }
+                },
+                onCompletion: { [weak self] result in
+                    DispatchQueue.main.async {
+                        self?.activeStreamDelegate = nil
+                        completion(result)
                     }
-                    completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
-                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let errorMsg = json["error"] as? String {
-                    completion(.failure(NSError(domain: errorMsg, code: -1)))
-                } else {
-                    completion(.failure(NSError(domain: "Invalid response", code: -1)))
                 }
-            } catch {
-                completion(.failure(error))
-            }
-        }.resume()
+            )
+            activeStreamDelegate = delegate
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.dataTask(with: request).resume()
+        } else {
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let data = data else {
+                    completion(.failure(NSError(domain: "No data", code: -1)))
+                    return
+                }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let responseText = json["response"] as? String {
+                        var cleaned = responseText
+                        var thinkingText: String? = nil
+                        // Ollama returns thinking in a separate "thinking" field
+                        if self.config.ollamaEnableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                            thinkingText = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        // Also handle <think> tags in response text as fallback
+                        if let range = cleaned.range(of: "</think>") {
+                            if self.config.ollamaEnableThinking && thinkingText == nil, let startRange = cleaned.range(of: "<think>") {
+                                thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                            cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
+                    } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let errorMsg = json["error"] as? String {
+                        completion(.failure(NSError(domain: errorMsg, code: -1)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                    }
+                } catch {
+                    completion(.failure(error))
+                }
+            }.resume()
+        }
     }
 
     // MARK: - OpenAI Backend
@@ -855,6 +888,94 @@ class LLMClient {
                 completion(.failure(error))
             }
         }.resume()
+    }
+}
+
+// MARK: - Ollama Stream Delegate
+
+class OllamaStreamDelegate: NSObject, URLSessionDataDelegate {
+    private var buffer = Data()
+    private var accumulatedText = ""
+    private var accumulatedThinking = ""
+    private let onProgress: (LLMStreamProgress) -> Void
+    private let onCompletion: (Result<LLMResponse, Error>) -> Void
+    private let enableThinking: Bool
+
+    init(enableThinking: Bool, onProgress: @escaping (LLMStreamProgress) -> Void, onCompletion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        self.enableThinking = enableThinking
+        self.onProgress = onProgress
+        self.onCompletion = onCompletion
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+
+        // Parse newline-delimited JSON
+        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+            guard !lineData.isEmpty,
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+
+            let done = json["done"] as? Bool ?? false
+
+            if enableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                accumulatedThinking += thinking
+                onProgress(.thinking)
+            }
+
+            if let response = json["response"] as? String, !response.isEmpty {
+                accumulatedText += response
+                onProgress(.generating(accumulatedText))
+            }
+
+            if done {
+                var finalText = accumulatedText
+                var thinkingText: String? = accumulatedThinking.isEmpty ? nil : accumulatedThinking.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Handle <think> tags in response text as fallback
+                if let range = finalText.range(of: "</think>") {
+                    if enableThinking && thinkingText == nil, let startRange = finalText.range(of: "<think>") {
+                        thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+
+                onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+                return
+            }
+        }
+
+        // Also try to parse remaining buffer if it's a complete JSON object (no trailing newline)
+        if !buffer.isEmpty, let json = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any], json["done"] as? Bool == true {
+            buffer.removeAll()
+
+            if enableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                accumulatedThinking += thinking
+            }
+            if let response = json["response"] as? String, !response.isEmpty {
+                accumulatedText += response
+            }
+
+            var finalText = accumulatedText
+            var thinkingText: String? = accumulatedThinking.isEmpty ? nil : accumulatedThinking.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let range = finalText.range(of: "</think>") {
+                if enableThinking && thinkingText == nil, let startRange = finalText.range(of: "<think>") {
+                    thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            onCompletion(.failure(error))
+        }
     }
 }
 
@@ -1230,6 +1351,7 @@ enum PopupState {
     case actionList
     case customPrompt
     case processing
+    case streaming(text: String, isThinking: Bool)
     case ttsPlaying(isPaused: Bool)
     case result(String, thinking: String?)
     case error(String)
@@ -1271,6 +1393,8 @@ struct PopupView: View {
                 customPromptView
             case .processing:
                 processingView
+            case .streaming(let text, let isThinking):
+                streamingView(text: text, isThinking: isThinking)
             case .ttsPlaying(let isPaused):
                 ttsPlayingView(isPaused: isPaused)
             case .result(let text, let thinking):
@@ -1298,6 +1422,7 @@ struct PopupView: View {
         case .actionList: return "actionList"
         case .customPrompt: return "customPrompt"
         case .processing: return "processing"
+        case .streaming: return "streaming"
         case .ttsPlaying: return "ttsPlaying"
         case .result: return "result"
         case .error: return "error"
@@ -1415,6 +1540,64 @@ struct PopupView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding()
+    }
+
+    // MARK: - Streaming View
+
+    private func streamingView(text: String, isThinking: Bool) -> some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 8) {
+                if isThinking {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 14))
+                        .foregroundColor(.purple)
+                    Text("Thinking...")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                } else {
+                    Image(systemName: "text.cursor")
+                        .font(.system(size: 14))
+                        .foregroundColor(.accentColor)
+                    Text("Generating...")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                ProgressView()
+                    .scaleEffect(0.6)
+                    .frame(width: 16, height: 16)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            if isThinking || text.isEmpty {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                    if isThinking {
+                        Text("Model is reasoning...")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 80)
+                .padding()
+            } else {
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 13))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                .frame(maxHeight: 200)
+            }
+        }
     }
 
     // MARK: - TTS Playing View
@@ -2198,7 +2381,19 @@ class PopupWindowController: NSWindowController {
         case .llm:
             let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
             let startTime = Date()
-            LLMClient.shared.generate(prompt: fullPrompt) { [weak self] result in
+            LLMClient.shared.generate(
+                prompt: fullPrompt,
+                onProgress: { [weak self] progress in
+                    guard let self = self else { return }
+                    switch progress {
+                    case .thinking:
+                        self.state = .streaming(text: "", isThinking: true)
+                    case .generating(let text):
+                        self.state = .streaming(text: text, isThinking: false)
+                    }
+                    self.updateView()
+                }
+            ) { [weak self] result in
                 let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
                 DispatchQueue.main.async {
                     switch result {
