@@ -4190,6 +4190,321 @@ class TTSServerManager {
     }
 }
 
+// MARK: - Update Manager
+
+class UpdateManager: NSObject, URLSessionDownloadDelegate {
+    static let shared = UpdateManager()
+
+    private(set) var updateAvailable = false
+    private(set) var latestVersion: String?
+    private(set) var downloadURL: String?
+    private(set) var isDownloading = false
+    private(set) var downloadProgress: Double = 0
+    var onUpdateStatusChanged: (() -> Void)?
+
+    private let githubAPI = "https://api.github.com/repos/bachner/PopDraft/releases/latest"
+    private let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
+    private var downloadTask: URLSessionDownloadTask?
+
+    // MARK: - Check for updates
+
+    func checkOnLaunchIfNeeded() {
+        let checkFile = "\(configDir)/update_check"
+        if let data = FileManager.default.contents(atPath: checkFile),
+           let timestamp = String(data: data, encoding: .utf8).flatMap(Double.init) {
+            let lastCheck = Date(timeIntervalSince1970: timestamp)
+            if Date().timeIntervalSince(lastCheck) < 86400 { return }
+        }
+        checkForUpdates(silent: true)
+    }
+
+    func checkForUpdates(silent: Bool) {
+        guard let url = URL(string: githubAPI) else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue("PopDraft/\(AppVersion.current)", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            // Save check timestamp
+            let checkFile = "\(self.configDir)/update_check"
+            try? "\(Date().timeIntervalSince1970)".write(toFile: checkFile, atomically: true, encoding: .utf8)
+
+            if let error = error {
+                Logger.shared.error("Update check failed: \(error.localizedDescription)")
+                if !silent {
+                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not connect to GitHub. Please check your internet connection.") }
+                }
+                return
+            }
+
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tagName = json["tag_name"] as? String else {
+                if !silent {
+                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not parse update information.") }
+                }
+                return
+            }
+
+            // Find DMG asset URL
+            var dmgURL: String?
+            if let assets = json["assets"] as? [[String: Any]] {
+                for asset in assets {
+                    if let name = asset["name"] as? String, name.hasSuffix(".dmg"),
+                       let url = asset["browser_download_url"] as? String {
+                        dmgURL = url
+                        break
+                    }
+                }
+            }
+
+            let remoteVersion = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
+
+            if self.isNewerVersion(remoteVersion, than: AppVersion.current) {
+                self.updateAvailable = true
+                self.latestVersion = remoteVersion
+                self.downloadURL = dmgURL
+                Logger.shared.info("Update available: v\(remoteVersion)")
+                DispatchQueue.main.async { self.onUpdateStatusChanged?() }
+            } else {
+                self.updateAvailable = false
+                self.latestVersion = nil
+                self.downloadURL = nil
+                if !silent {
+                    DispatchQueue.main.async { self.showAlert(title: "You're Up to Date", message: "PopDraft \(AppVersion.current) is the latest version.") }
+                }
+            }
+        }.resume()
+    }
+
+    // MARK: - Version comparison
+
+    private func isNewerVersion(_ remote: String, than local: String) -> Bool {
+        // Dev builds always count as older
+        if local.hasPrefix("dev-") { return true }
+
+        let remoteParts = remote.split(separator: ".").compactMap { Int($0) }
+        let localParts = local.split(separator: ".").compactMap { Int($0) }
+
+        for i in 0..<max(remoteParts.count, localParts.count) {
+            let r = i < remoteParts.count ? remoteParts[i] : 0
+            let l = i < localParts.count ? localParts[i] : 0
+            if r > l { return true }
+            if r < l { return false }
+        }
+        return false
+    }
+
+    // MARK: - Download and install
+
+    func downloadAndInstall() {
+        guard let urlString = downloadURL, let url = URL(string: urlString) else {
+            showAlert(title: "Update Error", message: "No download URL available.")
+            return
+        }
+        guard !isDownloading else { return }
+
+        isDownloading = true
+        downloadProgress = 0
+        onUpdateStatusChanged?()
+
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
+        downloadTask = session.downloadTask(with: url)
+        downloadTask?.resume()
+        Logger.shared.info("Downloading update from \(urlString)")
+    }
+
+    // URLSessionDownloadDelegate
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        if totalBytesExpectedToWrite > 0 {
+            downloadProgress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+            onUpdateStatusChanged?()
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        let dmgPath = "/tmp/PopDraft-update.dmg"
+        let dmgURL = URL(fileURLWithPath: dmgPath)
+
+        do {
+            // Remove any existing file
+            try? FileManager.default.removeItem(at: dmgURL)
+            try FileManager.default.moveItem(at: location, to: dmgURL)
+            Logger.shared.info("Download complete: \(dmgPath)")
+            installFromDMG(at: dmgPath)
+        } catch {
+            Logger.shared.error("Failed to save DMG: \(error)")
+            isDownloading = false
+            onUpdateStatusChanged?()
+            showAlert(title: "Update Error", message: "Failed to save download: \(error.localizedDescription)")
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            Logger.shared.error("Download failed: \(error.localizedDescription)")
+            isDownloading = false
+            downloadProgress = 0
+            onUpdateStatusChanged?()
+            showAlert(title: "Download Failed", message: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Install from DMG
+
+    private func installFromDMG(at dmgPath: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            let mountPoint = "/tmp/PopDraft-mount"
+
+            // Detach any stale mount
+            let detachStale = Process()
+            detachStale.launchPath = "/usr/bin/hdiutil"
+            detachStale.arguments = ["detach", mountPoint, "-quiet", "-force"]
+            detachStale.standardOutput = FileHandle.nullDevice
+            detachStale.standardError = FileHandle.nullDevice
+            try? detachStale.run()
+            detachStale.waitUntilExit()
+
+            // Mount DMG
+            let mount = Process()
+            mount.launchPath = "/usr/bin/hdiutil"
+            mount.arguments = ["attach", dmgPath, "-mountpoint", mountPoint, "-nobrowse", "-quiet"]
+            mount.standardOutput = FileHandle.nullDevice
+            mount.standardError = FileHandle.nullDevice
+
+            do {
+                try mount.run()
+                mount.waitUntilExit()
+            } catch {
+                DispatchQueue.main.async {
+                    self.isDownloading = false
+                    self.onUpdateStatusChanged?()
+                    self.showAlert(title: "Update Error", message: "Failed to mount DMG: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            guard mount.terminationStatus == 0 else {
+                DispatchQueue.main.async {
+                    self.isDownloading = false
+                    self.onUpdateStatusChanged?()
+                    self.showAlert(title: "Update Error", message: "Failed to mount DMG (exit code \(mount.terminationStatus)).")
+                }
+                return
+            }
+
+            // Find .app in mount
+            let appSource = "\(mountPoint)/PopDraft.app"
+            guard FileManager.default.fileExists(atPath: appSource) else {
+                // Unmount and fail
+                let unmount = Process()
+                unmount.launchPath = "/usr/bin/hdiutil"
+                unmount.arguments = ["detach", mountPoint, "-quiet"]
+                unmount.standardOutput = FileHandle.nullDevice
+                unmount.standardError = FileHandle.nullDevice
+                try? unmount.run()
+                unmount.waitUntilExit()
+
+                DispatchQueue.main.async {
+                    self.isDownloading = false
+                    self.onUpdateStatusChanged?()
+                    self.showAlert(title: "Update Error", message: "PopDraft.app not found in DMG.")
+                }
+                return
+            }
+
+            let appDest = "/Applications/PopDraft.app"
+
+            do {
+                // Remove old app
+                if FileManager.default.fileExists(atPath: appDest) {
+                    try FileManager.default.removeItem(atPath: appDest)
+                }
+                // Copy new app
+                try FileManager.default.copyItem(atPath: appSource, toPath: appDest)
+
+                // Clear quarantine
+                let xattr = Process()
+                xattr.launchPath = "/usr/bin/xattr"
+                xattr.arguments = ["-cr", appDest]
+                xattr.standardOutput = FileHandle.nullDevice
+                xattr.standardError = FileHandle.nullDevice
+                try? xattr.run()
+                xattr.waitUntilExit()
+
+                Logger.shared.info("Updated app installed to \(appDest)")
+            } catch {
+                Logger.shared.error("Failed to install update: \(error)")
+                DispatchQueue.main.async {
+                    self.isDownloading = false
+                    self.onUpdateStatusChanged?()
+                    self.showAlert(title: "Update Error", message: "Failed to install: \(error.localizedDescription)")
+                }
+                // Still unmount
+                let unmount = Process()
+                unmount.launchPath = "/usr/bin/hdiutil"
+                unmount.arguments = ["detach", mountPoint, "-quiet"]
+                unmount.standardOutput = FileHandle.nullDevice
+                unmount.standardError = FileHandle.nullDevice
+                try? unmount.run()
+                unmount.waitUntilExit()
+                return
+            }
+
+            // Unmount DMG
+            let unmount = Process()
+            unmount.launchPath = "/usr/bin/hdiutil"
+            unmount.arguments = ["detach", mountPoint, "-quiet"]
+            unmount.standardOutput = FileHandle.nullDevice
+            unmount.standardError = FileHandle.nullDevice
+            try? unmount.run()
+            unmount.waitUntilExit()
+
+            // Cleanup
+            try? FileManager.default.removeItem(atPath: dmgPath)
+
+            // Relaunch
+            DispatchQueue.main.async {
+                self.relaunchApp()
+            }
+        }
+    }
+
+    // MARK: - Relaunch
+
+    private func relaunchApp() {
+        let appPath = "/Applications/PopDraft.app"
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", "sleep 1; open \"\(appPath)\""]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+
+        Logger.shared.info("Relaunching PopDraft...")
+        NSApp.terminate(nil)
+    }
+
+    // MARK: - Helpers
+
+    private func showAlert(title: String, message: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = message
+            alert.alertStyle = title.contains("Error") || title.contains("Failed") ? .warning : .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+}
+
 // MARK: - Launch at Login Manager
 
 class LaunchAtLoginManager {
@@ -4794,6 +5109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popupController: PopupWindowController?
     var settingsController: SettingsWindowController?
     var onboardingController: OnboardingWindowController?
+    var updateMenuItem: NSMenuItem?
 
     private var isOnboardingComplete: Bool {
         let path = NSString(string: "~/.popdraft/onboarding_complete").expandingTildeInPath
@@ -4837,6 +5153,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "About PopDraft", action: #selector(showAbout), keyEquivalent: ""))
+        let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
+        menu.addItem(updateItem)
+        updateMenuItem = updateItem
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
         statusItem?.menu = menu
@@ -4852,6 +5171,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         HotkeyManager.shared.registerAll()
 
         Logger.shared.info("PopDraft \(AppVersion.current) started. Press Option+Space to show popup.")
+
+        // Enable launch at login on first run
+        let loginFlag = NSString(string: "~/.popdraft/login_configured").expandingTildeInPath
+        if !FileManager.default.fileExists(atPath: loginFlag) {
+            LaunchAtLoginManager.shared.setEnabled(true)
+            FileManager.default.createFile(atPath: loginFlag, contents: nil)
+        }
+
+        // Set up update manager
+        UpdateManager.shared.onUpdateStatusChanged = { [weak self] in
+            self?.refreshUpdateMenuItem()
+        }
+        UpdateManager.shared.checkOnLaunchIfNeeded()
 
         // Monitor accessibility permission periodically
         var wasAccessible = AXIsProcessTrusted()
@@ -4924,6 +5256,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
+    @objc func checkForUpdatesMenu() {
+        let mgr = UpdateManager.shared
+        if mgr.updateAvailable && !mgr.isDownloading {
+            let alert = NSAlert()
+            alert.messageText = "Update Available"
+            alert.informativeText = "PopDraft v\(mgr.latestVersion ?? "?") is available. You have v\(AppVersion.current).\n\nDownload and install now?"
+            alert.addButton(withTitle: "Update")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                mgr.downloadAndInstall()
+            }
+        } else if !mgr.isDownloading {
+            mgr.checkForUpdates(silent: false)
+        }
+    }
+
+    private func refreshUpdateMenuItem() {
+        let mgr = UpdateManager.shared
+        if mgr.isDownloading {
+            let pct = Int(mgr.downloadProgress * 100)
+            updateMenuItem?.title = "Downloading Update... \(pct)%"
+            updateMenuItem?.action = nil
+        } else if mgr.updateAvailable {
+            updateMenuItem?.title = "Update Available: v\(mgr.latestVersion ?? "")"
+            updateMenuItem?.action = #selector(checkForUpdatesMenu)
+        } else {
+            updateMenuItem?.title = "Check for Updates..."
+            updateMenuItem?.action = #selector(checkForUpdatesMenu)
+        }
+
+        // Status bar dot indicator
+        if let button = statusItem?.button {
+            button.title = mgr.updateAvailable ? "·" : ""
+        }
+    }
 }
 
 // MARK: - Main
