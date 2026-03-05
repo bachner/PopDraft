@@ -480,6 +480,7 @@ class LLMClient {
     private var config: LLMConfig
     private var activeProvider: LLMConfig.Provider?
     private var activeStreamDelegate: OllamaStreamDelegate?
+    private var activeLlamaCppStreamDelegate: LlamaCppStreamDelegate?
 
     init() {
         config = LLMConfig.load()
@@ -561,7 +562,7 @@ class LLMClient {
     private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         switch provider {
         case .llamacpp:
-            generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+            generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress, completion: completion)
         case .ollama:
             generateOllama(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress, completion: completion)
         case .openai:
@@ -581,11 +582,13 @@ class LLMClient {
 
     // MARK: - llama.cpp Backend (OpenAI-compatible API)
 
-    private func generateLlamaCpp(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+    private func generateLlamaCpp(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         guard let url = URL(string: "\(config.llamacppURL)/v1/chat/completions") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
         }
+
+        let useStreaming = onProgress != nil
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -600,7 +603,7 @@ class LLMClient {
 
         let body: [String: Any] = [
             "messages": messages,
-            "stream": false,
+            "stream": useStreaming,
             "max_tokens": 4096
         ]
 
@@ -611,43 +614,61 @@ class LLMClient {
             return
         }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-
-            guard let data = data else {
-                completion(.failure(NSError(domain: "No data", code: -1)))
-                return
-            }
-
-            do {
-                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let choices = json["choices"] as? [[String: Any]],
-                   let first = choices.first,
-                   let message = first["message"] as? [String: Any],
-                   let content = message["content"] as? String {
-                    var cleaned = content
-                    var thinkingText: String? = nil
-                    if let range = cleaned.range(of: "</think>") {
-                        if self.config.llamacppEnableThinking, let startRange = cleaned.range(of: "<think>") {
-                            thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        }
-                        cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if useStreaming {
+            let delegate = LlamaCppStreamDelegate(
+                enableThinking: config.llamacppEnableThinking,
+                onProgress: { progress in
+                    DispatchQueue.main.async { onProgress?(progress) }
+                },
+                onCompletion: { [weak self] result in
+                    DispatchQueue.main.async {
+                        self?.activeLlamaCppStreamDelegate = nil
+                        completion(result)
                     }
-                    completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
-                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let errorObj = json["error"] as? [String: Any],
-                          let message = errorObj["message"] as? String {
-                    completion(.failure(NSError(domain: message, code: -1)))
-                } else {
-                    completion(.failure(NSError(domain: "Invalid response", code: -1)))
                 }
-            } catch {
-                completion(.failure(error))
-            }
-        }.resume()
+            )
+            activeLlamaCppStreamDelegate = delegate
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.dataTask(with: request).resume()
+        } else {
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let data = data else {
+                    completion(.failure(NSError(domain: "No data", code: -1)))
+                    return
+                }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let choices = json["choices"] as? [[String: Any]],
+                       let first = choices.first,
+                       let message = first["message"] as? [String: Any],
+                       let content = message["content"] as? String {
+                        var cleaned = content
+                        var thinkingText: String? = nil
+                        if let range = cleaned.range(of: "</think>") {
+                            if self.config.llamacppEnableThinking, let startRange = cleaned.range(of: "<think>") {
+                                thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                            cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
+                    } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let errorObj = json["error"] as? [String: Any],
+                              let message = errorObj["message"] as? String {
+                        completion(.failure(NSError(domain: message, code: -1)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                    }
+                } catch {
+                    completion(.failure(error))
+                }
+            }.resume()
+        }
     }
 
     // MARK: - Ollama Backend
@@ -973,6 +994,111 @@ class OllamaStreamDelegate: NSObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error = error {
             onCompletion(.failure(error))
+        }
+    }
+}
+
+// MARK: - llama.cpp Stream Delegate (OpenAI SSE format)
+
+class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
+    private var buffer = Data()
+    private var accumulatedText = ""
+    private var insideThinkTag = false
+    private var accumulatedThinking = ""
+    private let onProgress: (LLMStreamProgress) -> Void
+    private let onCompletion: (Result<LLMResponse, Error>) -> Void
+    private let enableThinking: Bool
+
+    init(enableThinking: Bool, onProgress: @escaping (LLMStreamProgress) -> Void, onCompletion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        self.enableThinking = enableThinking
+        self.onProgress = onProgress
+        self.onCompletion = onCompletion
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+
+        // Parse SSE lines
+        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+            guard let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: CharacterSet(charactersIn: "\r")) else { continue }
+
+            // Skip empty lines and comments
+            if line.isEmpty || line.hasPrefix(":") { continue }
+
+            // Check for stream end
+            if line == "data: [DONE]" {
+                finishStream()
+                return
+            }
+
+            // Parse SSE data line
+            guard line.hasPrefix("data: ") else { continue }
+            let jsonStr = String(line.dropFirst(6))
+
+            guard let jsonData = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let first = choices.first,
+                  let delta = first["delta"] as? [String: Any],
+                  let content = delta["content"] as? String else { continue }
+
+            // Track <think> tags in streamed content
+            accumulatedText += content
+
+            // Check for think tag transitions
+            if accumulatedText.contains("<think>") && !insideThinkTag {
+                insideThinkTag = true
+            }
+
+            if insideThinkTag {
+                if accumulatedText.contains("</think>") {
+                    insideThinkTag = false
+                    // Extract text after </think> for display
+                    if let range = accumulatedText.range(of: "</think>") {
+                        let afterThink = String(accumulatedText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !afterThink.isEmpty {
+                            onProgress(.generating(afterThink))
+                        }
+                    }
+                } else if enableThinking {
+                    onProgress(.thinking)
+                }
+            } else {
+                // Outside think tags - show accumulated text without think block
+                var displayText = accumulatedText
+                if let range = displayText.range(of: "</think>") {
+                    displayText = String(displayText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if !displayText.isEmpty {
+                    onProgress(.generating(displayText))
+                }
+            }
+        }
+    }
+
+    private func finishStream() {
+        var finalText = accumulatedText
+        var thinkingText: String? = nil
+
+        if let range = finalText.range(of: "</think>") {
+            if enableThinking, let startRange = finalText.range(of: "<think>") {
+                thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            onCompletion(.failure(error))
+        } else if !accumulatedText.isEmpty {
+            // Stream ended without [DONE] - finish with what we have
+            finishStream()
         }
     }
 }
@@ -3184,9 +3310,9 @@ struct SettingsView: View {
                 .foregroundColor(.secondary)
 
             VStack(alignment: .leading, spacing: 4) {
-                Toggle("Show Thinking", isOn: $llamacppEnableThinking)
+                Toggle("Enable Thinking", isOn: $llamacppEnableThinking)
                     .font(.system(size: 12, weight: .medium))
-                Text("Show reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
+                Text("Enable reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
@@ -3294,9 +3420,9 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Show Thinking", isOn: $ollamaEnableThinking)
+                    Toggle("Enable Thinking", isOn: $ollamaEnableThinking)
                         .font(.system(size: 12, weight: .medium))
-                    Text("Show reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
+                    Text("Enable reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 }
