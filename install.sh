@@ -42,6 +42,15 @@ else
         echo "  [ERROR] Failed to compile PopDraft"
         exit 1
     fi
+
+    # Write version file from latest git tag (e.g., v2.6.0 -> 2.6.0)
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null; then
+        APP_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+        if [ -n "$APP_VERSION" ]; then
+            echo "$APP_VERSION" > "$CONFIG_DIR/version"
+            echo "  [OK] Version set to $APP_VERSION"
+        fi
+    fi
 fi
 
 # Copy TTS server script

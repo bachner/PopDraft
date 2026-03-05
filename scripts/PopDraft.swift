@@ -10,20 +10,26 @@ import Carbon.HIToolbox
 
 struct AppVersion {
     static var current: String {
-        // Try to get version from bundle Info.plist (official release)
+        // 1. Bundle Info.plist (DMG/app bundle install)
         if let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
            !bundleVersion.isEmpty,
-           bundleVersion != "1.0" {  // Default Xcode value
+           bundleVersion != "1.0" {
             return bundleVersion
         }
 
-        // Dev build - use compilation timestamp
+        // 2. Version file written by install.sh (source install)
+        let versionFile = NSHomeDirectory() + "/.popdraft/version"
+        if let fileVersion = try? String(contentsOfFile: versionFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !fileVersion.isEmpty {
+            return fileVersion
+        }
+
+        // 3. Dev build fallback
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmm"
         return "dev-\(formatter.string(from: AppVersion.buildDate))"
     }
 
-    // Compilation timestamp (evaluated at compile time via static initialization)
     private static let buildDate: Date = Date()
 }
 
