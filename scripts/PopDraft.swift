@@ -2491,6 +2491,10 @@ class PopupWindowController: NSWindowController {
         _ = AXIsProcessTrustedWithOptions(options)
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
+        // Bring System Settings to foreground
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first?.activate()
+        }
     }
 
     private func showNotification(title: String, message: String) {
@@ -4827,6 +4831,10 @@ struct OnboardingView: View {
         // Also open settings so user can see and toggle
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
+        // Bring System Settings to foreground
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first?.activate()
+        }
     }
 
     private func fetchOllamaModels() {
