@@ -3383,7 +3383,7 @@ struct SettingsView: View {
     private func loadCurrentConfig() {
         let config = LLMConfig.load()
         selectedProvider = config.provider
-        selectedLlamaModel = config.llamaModel
+        selectedLlamaModel = LLMConfig.llamaModels.contains(where: { $0.id == config.llamaModel }) ? config.llamaModel : LLMConfig.llamaModels.first?.id ?? "qwen3.5-2b"
         ollamaModel = config.ollamaModel
         openaiAPIKey = config.openaiAPIKey
         openaiModel = LLMConfig.openaiModels.contains(config.openaiModel) ? config.openaiModel : "Custom..."
