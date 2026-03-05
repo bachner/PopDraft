@@ -90,10 +90,20 @@ else
     echo "         $CONFIG_DIR/tts-venv/bin/pip install kokoro soundfile numpy"
 fi
 
-# Create default config if it doesn't exist
-if [ ! -f "$CONFIG_DIR/config.json" ]; then
+# Restore config from backup if it doesn't exist (e.g., after uninstall + reinstall)
+if [ ! -f "$CONFIG_DIR/config.json" ] && [ -f /tmp/popdraft-config-backup.json ]; then
+    cp /tmp/popdraft-config-backup.json "$CONFIG_DIR/config.json"
+    rm -f /tmp/popdraft-config-backup.json
+    echo "  [OK] Config restored from backup"
+elif [ ! -f "$CONFIG_DIR/config.json" ]; then
     echo '{"provider":"llamacpp"}' > "$CONFIG_DIR/config.json"
     echo "  [OK] Default config created"
+fi
+
+if [ ! -f "$CONFIG_DIR/actions.json" ] && [ -f /tmp/popdraft-actions-backup.json ]; then
+    cp /tmp/popdraft-actions-backup.json "$CONFIG_DIR/actions.json"
+    rm -f /tmp/popdraft-actions-backup.json
+    echo "  [OK] Actions restored from backup"
 fi
 
 # Launch PopDraft

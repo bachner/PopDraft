@@ -1735,7 +1735,7 @@ struct PopupView: View {
                 }
                 .padding(12)
             }
-            .frame(maxHeight: 250)
+            .frame(maxHeight: isThinkingExpanded ? 400 : 250)
 
             Divider()
 
@@ -1970,10 +1970,31 @@ class PopupWindowController: NSWindowController {
 
         // Defer resize to next run loop so SwiftUI can finish layout
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let hostingView = self.hostingView else { return }
+            guard let self = self, let hostingView = self.hostingView, let window = self.window else { return }
             var size = hostingView.fittingSize
             size.height = min(size.height, 400)  // Maximum height
-            self.window?.setContentSize(size)
+            window.setContentSize(size)
+
+            // Ensure window stays within screen bounds after resize
+            var frame = window.frame
+            if let screen = window.screen ?? NSScreen.main {
+                let screenFrame = screen.visibleFrame
+                if frame.minY < screenFrame.minY {
+                    frame.origin.y = screenFrame.minY + 5
+                }
+                if frame.maxY > screenFrame.maxY {
+                    frame.origin.y = screenFrame.maxY - frame.height - 5
+                }
+                if frame.minX < screenFrame.minX {
+                    frame.origin.x = screenFrame.minX + 5
+                }
+                if frame.maxX > screenFrame.maxX {
+                    frame.origin.x = screenFrame.maxX - frame.width - 5
+                }
+                if frame != window.frame {
+                    window.setFrame(frame, display: true)
+                }
+            }
         }
     }
 

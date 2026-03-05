@@ -53,6 +53,15 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     read -p "Remove configuration and models (~/.popdraft)? (y/n) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
+        # Back up config.json and actions.json so reinstall can restore them
+        if [ -f ~/.popdraft/config.json ]; then
+            cp ~/.popdraft/config.json /tmp/popdraft-config-backup.json
+            echo "  [OK] Config backed up to /tmp/popdraft-config-backup.json"
+        fi
+        if [ -f ~/.popdraft/actions.json ]; then
+            cp ~/.popdraft/actions.json /tmp/popdraft-actions-backup.json
+            echo "  [OK] Actions backed up to /tmp/popdraft-actions-backup.json"
+        fi
         rm -rf ~/.popdraft
         echo "[OK] Configuration removed"
     else
