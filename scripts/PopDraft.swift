@@ -4269,6 +4269,9 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
                 self.downloadURL = dmgURL
                 Logger.shared.info("Update available: v\(remoteVersion)")
                 DispatchQueue.main.async { self.onUpdateStatusChanged?() }
+                if silent {
+                    DispatchQueue.main.async { self.downloadAndInstall() }
+                }
             } else {
                 self.updateAvailable = false
                 self.latestVersion = nil
@@ -5166,6 +5169,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Start TTS server if needed
         TTSServerManager.shared.ensureRunning()
+
+        // Ensure llama.cpp server is running if configured
+        let config = LLMConfig.load()
+        if config.provider == .llamacpp {
+            let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+            if FileManager.default.fileExists(atPath: plistPath) {
+                DispatchQueue.global(qos: .utility).async {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                    process.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
+                    process.standardOutput = FileHandle.nullDevice
+                    process.standardError = FileHandle.nullDevice
+                    try? process.run()
+                    process.waitUntilExit()
+                }
+            }
+        }
 
         // Register all global hotkeys
         HotkeyManager.shared.registerAll()
