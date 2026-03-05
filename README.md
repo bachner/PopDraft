@@ -100,7 +100,7 @@ Local model management with easy switching between models.
 
 **Setup:**
 1. Choose Ollama during installation (offers to install via Homebrew if needed)
-2. Run `ollama pull qwen2.5:7b` (or your preferred model)
+2. Run `ollama pull qwen3.5:4b` (or your preferred model)
 
 ### OpenAI API
 
@@ -192,7 +192,7 @@ LLAMACPP_URL=http://localhost:8080
 
 # Ollama settings
 OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_MODEL=qwen3.5:4b
 OLLAMA_FALLBACK_MODEL=
 
 # OpenAI settings

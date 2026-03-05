@@ -9,8 +9,8 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DEFAULT_BACKEND="ollama"
 DEFAULT_OLLAMA_URL="http://localhost:11434"
 DEFAULT_LLAMACPP_URL="http://localhost:8080"
-DEFAULT_MODEL="qwen2.5:7b"
-DEFAULT_LLAMACPP_MODEL="$HOME/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf"
+DEFAULT_MODEL="qwen3.5:4b"
+DEFAULT_LLAMACPP_MODEL="$HOME/.popdraft/models/Qwen3.5-4B-Q4_K_M.gguf"
 
 # Initialize config if it doesn't exist
 init_config() {
@@ -23,11 +23,11 @@ BACKEND=ollama
 
 # Ollama settings
 OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_MODEL=qwen3.5:4b
 
 # llama.cpp settings
 LLAMACPP_URL=http://localhost:8080
-LLAMACPP_MODEL_PATH=$HOME/.popdraft/models/qwen2.5-7b-instruct-q4_k_m.gguf
+LLAMACPP_MODEL_PATH=$HOME/.popdraft/models/Qwen3.5-4B-Q4_K_M.gguf
 EOF
     fi
 }

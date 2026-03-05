@@ -217,52 +217,44 @@ struct LLMConfig {
 
     static let llamaModels: [LlamaModel] = [
         LlamaModel(
-            id: "qwen2.5-3b",
-            name: "Qwen 2.5 3B",
+            id: "qwen3.5-2b",
+            name: "Qwen 3.5 2B",
+            size: "~1.3GB",
+            languages: "201 languages",
+            url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+            filename: "Qwen3.5-2B-Q4_K_M.gguf"
+        ),
+        LlamaModel(
+            id: "qwen3.5-4b",
+            name: "Qwen 3.5 4B",
+            size: "~2.7GB",
+            languages: "201 languages",
+            url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+            filename: "Qwen3.5-4B-Q4_K_M.gguf"
+        ),
+        LlamaModel(
+            id: "phi-4-mini",
+            name: "Phi-4 Mini 3.8B",
             size: "~2.5GB",
-            languages: "29+ languages",
-            url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
-            filename: "qwen2.5-3b-instruct-q4_k_m.gguf"
+            languages: "22 languages",
+            url: "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+            filename: "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
         ),
         LlamaModel(
-            id: "qwen2.5-7b",
-            name: "Qwen 2.5 7B",
-            size: "~5GB",
-            languages: "29+ languages",
-            url: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
-            filename: "qwen2.5-7b-instruct-q4_k_m.gguf"
-        ),
-        LlamaModel(
-            id: "llama-3.2-3b",
-            name: "Llama 3.2 3B",
-            size: "~2.5GB",
-            languages: "8 languages",
-            url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-        ),
-        LlamaModel(
-            id: "gemma-2-2b",
-            name: "Gemma 2 2B",
-            size: "~1.5GB",
-            languages: "Multilingual",
-            url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
-            filename: "gemma-2-2b-it-Q4_K_M.gguf"
-        ),
-        LlamaModel(
-            id: "phi-3-mini",
-            name: "Phi-3 Mini",
-            size: "~2.5GB",
-            languages: "Multilingual",
-            url: "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf",
-            filename: "Phi-3-mini-4k-instruct-q4.gguf"
+            id: "gemma-3n-e4b",
+            name: "Gemma 3n E4B",
+            size: "~4.2GB",
+            languages: "140+ languages",
+            url: "https://huggingface.co/bartowski/google_gemma-3n-E4B-it-GGUF/resolve/main/google_gemma-3n-E4B-it-Q4_K_M.gguf",
+            filename: "google_gemma-3n-E4B-it-Q4_K_M.gguf"
         )
     ]
 
     var provider: Provider = .llamacpp
-    var llamaModel: String = "qwen2.5-3b"
+    var llamaModel: String = "qwen3.5-2b"
     var llamacppURL: String = "http://localhost:8080"
     var ollamaURL: String = "http://localhost:11434"
-    var ollamaModel: String = "qwen2.5:7b"
+    var ollamaModel: String = "qwen3.5:4b"
     var openaiAPIKey: String = ""
     var openaiModel: String = "gpt-4o"
     var claudeAPIKey: String = ""
@@ -2553,7 +2545,7 @@ struct SettingsView: View {
     @State private var customPromptShortcut: String? = "P"
     @State private var popupHotkey: String = "Space"
     @State private var editingPopupHotkey: Bool = false
-    @State private var selectedLlamaModel: String = "qwen2.5-3b"
+    @State private var selectedLlamaModel: String = "qwen3.5-2b"
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
     @State private var downloadStatus: String = ""
@@ -3281,7 +3273,7 @@ struct SettingsView: View {
                     Text("Model")
                         .font(.system(size: 12, weight: .medium))
                     if availableOllamaModels.isEmpty {
-                        TextField("e.g., qwen2.5:7b", text: $ollamaModel)
+                        TextField("e.g., qwen3.5:4b", text: $ollamaModel)
                             .textFieldStyle(.roundedBorder)
                     } else {
                         Picker("", selection: $ollamaModel) {
@@ -4259,7 +4251,7 @@ struct OnboardingView: View {
     @State private var selectedProvider: LLMConfig.Provider = .llamacpp
     @State private var apiKey = ""
     @State private var selectedModel = ""
-    @State private var selectedLlamaModel: String = "qwen2.5-3b"
+    @State private var selectedLlamaModel: String = "qwen3.5-2b"
     @State private var ollamaModels: [String] = []
     @State private var checkingPermission = false
     @State private var isSettingUp = false
@@ -4366,7 +4358,7 @@ struct OnboardingView: View {
                         Text("Model:")
                             .font(.callout)
                         if ollamaModels.isEmpty {
-                            TextField("e.g., qwen2.5:7b", text: $selectedModel)
+                            TextField("e.g., qwen3.5:4b", text: $selectedModel)
                                 .textFieldStyle(.roundedBorder)
                         } else {
                             Picker("", selection: $selectedModel) {
@@ -4426,7 +4418,7 @@ struct OnboardingView: View {
                 case .llamacpp:
                     selectedModel = ""
                 case .ollama:
-                    selectedModel = ollamaModels.first ?? "qwen2.5:7b"
+                    selectedModel = ollamaModels.first ?? "qwen3.5:4b"
                     fetchOllamaModels()
                 case .openai:
                     selectedModel = LLMConfig.openaiModels.first ?? "gpt-4o"
@@ -4551,7 +4543,7 @@ struct OnboardingView: View {
             case .llamacpp:
                 config.llamaModel = selectedLlamaModel
             case .ollama:
-                config.ollamaModel = selectedModel.isEmpty ? "qwen2.5:7b" : selectedModel
+                config.ollamaModel = selectedModel.isEmpty ? "qwen3.5:4b" : selectedModel
             case .openai:
                 config.openaiAPIKey = apiKey
                 config.openaiModel = selectedModel.isEmpty ? "gpt-4o" : selectedModel

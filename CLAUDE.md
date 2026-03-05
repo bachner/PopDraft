@@ -82,7 +82,7 @@ Selected Text -> Ctrl+Option+Shortcut -> Direct Action -> LLM API -> Result Prev
 ```json
 {
   "provider": "llamacpp",
-  "ollamaModel": "qwen2.5:7b",
+  "ollamaModel": "qwen3.5:4b",
   "openaiAPIKey": "",
   "openaiModel": "gpt-4o",
   "claudeAPIKey": "",
