@@ -87,16 +87,16 @@ rm -rf "$CONFIG_DIR/tts-venv"
 if python3 -m venv "$CONFIG_DIR/tts-venv" 2>/dev/null; then
     echo "  [OK] Virtual environment created"
     echo "  Installing Python packages (this may take a few minutes)..."
-    if "$CONFIG_DIR/tts-venv/bin/pip" install kokoro soundfile numpy 2>/dev/null; then
+    if "$CONFIG_DIR/tts-venv/bin/pip" install "kokoro>=0.9.4" "misaki[ja]" "misaki[zh]" soundfile numpy 2>/dev/null; then
         echo "  [OK] TTS packages installed"
     else
         echo "  [WARN] Could not install TTS packages. Install manually:"
-        echo "         $CONFIG_DIR/tts-venv/bin/pip install kokoro soundfile numpy"
+        echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
     fi
 else
     echo "  [WARN] Could not create Python venv. Install manually:"
     echo "         python3 -m venv $CONFIG_DIR/tts-venv"
-    echo "         $CONFIG_DIR/tts-venv/bin/pip install kokoro soundfile numpy"
+    echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
 fi
 
 # Restore config from backup if it doesn't exist (e.g., after uninstall + reinstall)

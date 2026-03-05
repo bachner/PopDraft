@@ -21,9 +21,24 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in separate threads."""
     daemon_threads = True
 
-# Global pipeline (loaded once)
-pipeline = None
+# Pipeline cache keyed by lang_code (loaded on demand)
+pipelines = {}
+pipelines_lock = threading.Lock()
 SAMPLE_RATE = 24000
+
+# Language code mapping for Kokoro v1.0 multilingual voices
+# Voice names follow the pattern: {lang_code}{gender}_{name}
+LANG_CODES = {
+    'a': 'American English',
+    'b': 'British English',
+    'j': 'Japanese',
+    'z': 'Mandarin Chinese',
+    'e': 'Spanish',
+    'f': 'French',
+    'h': 'Hindi',
+    'i': 'Italian',
+    'p': 'Brazilian Portuguese',
+}
 PID_FILE = os.path.expanduser("~/.llm-tts-server.pid")
 DEFAULT_PORT = 7865
 
@@ -32,24 +47,47 @@ playback_lock = threading.Lock()
 current_playback = None
 current_audio_file = None
 
-def load_model():
-    """Load Kokoro model once at startup."""
-    global pipeline
-    if pipeline is not None:
-        return
+def get_pipeline(voice='af_heart'):
+    """Get or create a KPipeline for the given voice's language.
 
-    print("Loading Kokoro-82M model...", file=sys.stderr)
+    Extracts the first character of the voice name as the lang_code,
+    looks it up in the cache, and creates a new KPipeline if needed.
+    """
+    lang_code = voice[0] if voice else 'a'
+    if lang_code not in LANG_CODES:
+        lang_code = 'a'  # Fall back to American English
+
+    with pipelines_lock:
+        if lang_code in pipelines:
+            return pipelines[lang_code]
+
+    # Create outside the lock to avoid blocking other languages
+    print(f"Loading Kokoro pipeline for '{lang_code}' ({LANG_CODES[lang_code]})...", file=sys.stderr)
     from kokoro import KPipeline
-    pipeline = KPipeline(lang_code='a')
-    print("Model loaded!", file=sys.stderr)
+    new_pipeline = KPipeline(lang_code=lang_code)
+    print(f"Pipeline '{lang_code}' loaded!", file=sys.stderr)
+
+    with pipelines_lock:
+        # Another thread may have created it while we were loading
+        if lang_code not in pipelines:
+            pipelines[lang_code] = new_pipeline
+        return pipelines[lang_code]
+
+
+def load_model():
+    """Pre-load the default American English pipeline at startup."""
+    print("Loading default Kokoro pipeline...", file=sys.stderr)
+    get_pipeline('af_heart')
+    print("Default pipeline ready!", file=sys.stderr)
 
 def text_to_speech(text, voice='af_heart', speed=1.0):
     """Generate speech from text."""
     import soundfile as sf
     import numpy as np
 
+    pipe = get_pipeline(voice)
     audio_chunks = []
-    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+    for _, _, audio in pipe(text, voice=voice, speed=speed):
         audio_chunks.append(audio)
 
     if not audio_chunks:
@@ -132,6 +170,84 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'ok')
+            return
+
+        if parsed.path == '/voices':
+            voices = {
+                'a': {
+                    'language': 'American English',
+                    'voices': [
+                        'af_heart', 'af_alloy', 'af_aoede', 'af_bella',
+                        'af_jessica', 'af_kore', 'af_nicole', 'af_nova',
+                        'af_river', 'af_sarah', 'af_sky',
+                        'am_adam', 'am_echo', 'am_eric', 'am_fenrir',
+                        'am_liam', 'am_michael', 'am_onyx', 'am_puck',
+                        'am_santa',
+                    ],
+                },
+                'b': {
+                    'language': 'British English',
+                    'voices': [
+                        'bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily',
+                        'bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis',
+                    ],
+                },
+                'j': {
+                    'language': 'Japanese',
+                    'voices': [
+                        'jf_alpha', 'jf_gongitsune', 'jf_nezumi',
+                        'jf_tebukuro',
+                        'jm_kumo',
+                    ],
+                },
+                'z': {
+                    'language': 'Mandarin Chinese',
+                    'voices': [
+                        'zf_xiaobei', 'zf_xiaoni', 'zf_xiaoxiao',
+                        'zf_xiaoyi',
+                        'zm_yunjian', 'zm_yunxi', 'zm_yunxia', 'zm_yunyang',
+                    ],
+                },
+                'e': {
+                    'language': 'Spanish',
+                    'voices': [
+                        'ef_dora',
+                        'em_alex', 'em_santa',
+                    ],
+                },
+                'f': {
+                    'language': 'French',
+                    'voices': [
+                        'ff_siwis',
+                        'fm_gilles',
+                    ],
+                },
+                'h': {
+                    'language': 'Hindi',
+                    'voices': [
+                        'hf_alpha', 'hf_beta',
+                        'hm_omega', 'hm_psi',
+                    ],
+                },
+                'i': {
+                    'language': 'Italian',
+                    'voices': [
+                        'if_sara',
+                        'im_nicola',
+                    ],
+                },
+                'p': {
+                    'language': 'Brazilian Portuguese',
+                    'voices': [
+                        'pf_dora',
+                        'pm_alex', 'pm_santa',
+                    ],
+                },
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(voices, indent=2).encode())
             return
 
         if parsed.path == '/status':

@@ -271,71 +271,91 @@ struct LLMConfig {
     var disabledBuiltInActions: [String] = []
     var customShortcuts: [String: String] = [:]
 
-    // TTS voice list
-    static let ttsVoices: [(id: String, name: String, grade: String)] = [
+    // TTS voice list — all 54 Kokoro v1.0 voices grouped by language
+    static let ttsVoiceLanguages: [String] = [
+        "American English",
+        "British English",
+        "Japanese",
+        "Mandarin Chinese",
+        "Spanish",
+        "French",
+        "Hindi",
+        "Italian",
+        "Brazilian Portuguese",
+    ]
+
+    static let ttsVoices: [(id: String, name: String, language: String)] = [
         // American English - Female
-        ("af_heart", "Heart (American Female)", "A"),
-        ("af_bella", "Bella (American Female)", "A-"),
-        ("af_nicole", "Nicole (American Female)", "B-"),
-        ("af_aoede", "Aoede (American Female)", "C+"),
-        ("af_kore", "Kore (American Female)", "C+"),
-        ("af_sarah", "Sarah (American Female)", "C+"),
-        ("af_alloy", "Alloy (American Female)", "C"),
-        ("af_nova", "Nova (American Female)", "C"),
-        ("af_sky", "Sky (American Female)", "C-"),
-        ("af_jessica", "Jessica (American Female)", "D"),
-        ("af_river", "River (American Female)", "D"),
+        ("af_heart", "Heart (Female)", "American English"),
+        ("af_alloy", "Alloy (Female)", "American English"),
+        ("af_aoede", "Aoede (Female)", "American English"),
+        ("af_bella", "Bella (Female)", "American English"),
+        ("af_jessica", "Jessica (Female)", "American English"),
+        ("af_kore", "Kore (Female)", "American English"),
+        ("af_nicole", "Nicole (Female)", "American English"),
+        ("af_nova", "Nova (Female)", "American English"),
+        ("af_river", "River (Female)", "American English"),
+        ("af_sarah", "Sarah (Female)", "American English"),
+        ("af_sky", "Sky (Female)", "American English"),
         // American English - Male
-        ("am_fenrir", "Fenrir (American Male)", "C+"),
-        ("am_michael", "Michael (American Male)", "C+"),
-        ("am_puck", "Puck (American Male)", "C+"),
-        ("am_echo", "Echo (American Male)", "D"),
-        ("am_eric", "Eric (American Male)", "D"),
-        ("am_liam", "Liam (American Male)", "D"),
-        ("am_onyx", "Onyx (American Male)", "D"),
-        ("am_adam", "Adam (American Male)", "F+"),
-        ("am_santa", "Santa (American Male)", "D-"),
+        ("am_adam", "Adam (Male)", "American English"),
+        ("am_echo", "Echo (Male)", "American English"),
+        ("am_eric", "Eric (Male)", "American English"),
+        ("am_fenrir", "Fenrir (Male)", "American English"),
+        ("am_liam", "Liam (Male)", "American English"),
+        ("am_michael", "Michael (Male)", "American English"),
+        ("am_onyx", "Onyx (Male)", "American English"),
+        ("am_puck", "Puck (Male)", "American English"),
+        ("am_santa", "Santa (Male)", "American English"),
         // British English - Female
-        ("bf_emma", "Emma (British Female)", "B-"),
-        ("bf_isabella", "Isabella (British Female)", "C"),
-        ("bf_alice", "Alice (British Female)", "D"),
-        ("bf_lily", "Lily (British Female)", "D"),
+        ("bf_alice", "Alice (Female)", "British English"),
+        ("bf_emma", "Emma (Female)", "British English"),
+        ("bf_isabella", "Isabella (Female)", "British English"),
+        ("bf_lily", "Lily (Female)", "British English"),
         // British English - Male
-        ("bm_fable", "Fable (British Male)", "C"),
-        ("bm_george", "George (British Male)", "C"),
-        ("bm_lewis", "Lewis (British Male)", "D+"),
-        ("bm_daniel", "Daniel (British Male)", "D"),
-        // French
-        ("ff_siwis", "Siwis (French Female)", "B-"),
-        // Italian
-        ("if_sara", "Sara (Italian Female)", "C"),
-        ("im_nicola", "Nicola (Italian Male)", "C"),
-        // Japanese
-        ("jf_alpha", "Alpha (Japanese Female)", "C+"),
-        ("jf_gongitsune", "Gongitsune (Japanese Female)", "C"),
-        ("jf_tebukuro", "Tebukuro (Japanese Female)", "C"),
-        ("jf_nezumi", "Nezumi (Japanese Female)", "C-"),
-        ("jm_kumo", "Kumo (Japanese Male)", "C-"),
-        // Hindi
-        ("hf_alpha", "Alpha (Hindi Female)", "C"),
-        ("hf_beta", "Beta (Hindi Female)", "C"),
-        ("hm_omega", "Omega (Hindi Male)", "C"),
-        ("hm_psi", "Psi (Hindi Male)", "C"),
-        // Spanish
-        ("ef_dora", "Dora (Spanish Female)", "-"),
-        ("em_alex", "Alex (Spanish Male)", "-"),
-        // Mandarin Chinese
-        ("zf_xiaobei", "Xiaobei (Chinese Female)", "D"),
-        ("zf_xiaoni", "Xiaoni (Chinese Female)", "D"),
-        ("zf_xiaoxiao", "Xiaoxiao (Chinese Female)", "D"),
-        ("zf_xiaoyi", "Xiaoyi (Chinese Female)", "D"),
-        ("zm_yunjian", "Yunjian (Chinese Male)", "D"),
-        ("zm_yunxi", "Yunxi (Chinese Male)", "D"),
-        ("zm_yunxia", "Yunxia (Chinese Male)", "D"),
-        ("zm_yunyang", "Yunyang (Chinese Male)", "D"),
-        // Brazilian Portuguese
-        ("pf_dora", "Dora (Portuguese Female)", "-"),
-        ("pm_alex", "Alex (Portuguese Male)", "-"),
+        ("bm_daniel", "Daniel (Male)", "British English"),
+        ("bm_fable", "Fable (Male)", "British English"),
+        ("bm_george", "George (Male)", "British English"),
+        ("bm_lewis", "Lewis (Male)", "British English"),
+        // Japanese - Female
+        ("jf_alpha", "Alpha (Female)", "Japanese"),
+        ("jf_gongitsune", "Gongitsune (Female)", "Japanese"),
+        ("jf_nezumi", "Nezumi (Female)", "Japanese"),
+        ("jf_tebukuro", "Tebukuro (Female)", "Japanese"),
+        // Japanese - Male
+        ("jm_kumo", "Kumo (Male)", "Japanese"),
+        // Mandarin Chinese - Female
+        ("zf_xiaobei", "Xiaobei (Female)", "Mandarin Chinese"),
+        ("zf_xiaoni", "Xiaoni (Female)", "Mandarin Chinese"),
+        ("zf_xiaoxiao", "Xiaoxiao (Female)", "Mandarin Chinese"),
+        ("zf_xiaoyi", "Xiaoyi (Female)", "Mandarin Chinese"),
+        // Mandarin Chinese - Male
+        ("zm_yunjian", "Yunjian (Male)", "Mandarin Chinese"),
+        ("zm_yunxi", "Yunxi (Male)", "Mandarin Chinese"),
+        ("zm_yunxia", "Yunxia (Male)", "Mandarin Chinese"),
+        ("zm_yunyang", "Yunyang (Male)", "Mandarin Chinese"),
+        // Spanish - Female
+        ("ef_dora", "Dora (Female)", "Spanish"),
+        // Spanish - Male
+        ("em_alex", "Alex (Male)", "Spanish"),
+        ("em_santa", "Santa (Male)", "Spanish"),
+        // French - Female
+        ("ff_siwis", "Siwis (Female)", "French"),
+        // Hindi - Female
+        ("hf_alpha", "Alpha (Female)", "Hindi"),
+        ("hf_beta", "Beta (Female)", "Hindi"),
+        // Hindi - Male
+        ("hm_omega", "Omega (Male)", "Hindi"),
+        ("hm_psi", "Psi (Male)", "Hindi"),
+        // Italian - Female
+        ("if_sara", "Sara (Female)", "Italian"),
+        // Italian - Male
+        ("im_nicola", "Nicola (Male)", "Italian"),
+        // Brazilian Portuguese - Female
+        ("pf_dora", "Dora (Female)", "Brazilian Portuguese"),
+        // Brazilian Portuguese - Male
+        ("pm_alex", "Alex (Male)", "Brazilian Portuguese"),
+        ("pm_santa", "Santa (Male)", "Brazilian Portuguese"),
     ]
 
     // Model lists
@@ -2682,13 +2702,79 @@ struct SettingsView: View {
     let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
-    private var filteredVoices: [(id: String, name: String, grade: String)] {
+    private var filteredVoices: [(id: String, name: String, language: String)] {
         if voiceSearchText.isEmpty {
             return LLMConfig.ttsVoices
         }
         return LLMConfig.ttsVoices.filter {
             $0.name.localizedCaseInsensitiveContains(voiceSearchText) ||
-            $0.id.localizedCaseInsensitiveContains(voiceSearchText)
+            $0.id.localizedCaseInsensitiveContains(voiceSearchText) ||
+            $0.language.localizedCaseInsensitiveContains(voiceSearchText)
+        }
+    }
+
+    enum VoiceListItem: Identifiable {
+        case header(language: String, count: Int)
+        case voice(id: String, name: String, language: String)
+
+        var id: String {
+            switch self {
+            case .header(let language, _): return "header_\(language)"
+            case .voice(let id, _, _): return id
+            }
+        }
+    }
+
+    private var voiceListItems: [VoiceListItem] {
+        let voices = filteredVoices
+        var items: [VoiceListItem] = []
+        for lang in LLMConfig.ttsVoiceLanguages {
+            let langVoices = voices.filter { $0.language == lang }
+            if !langVoices.isEmpty {
+                items.append(.header(language: lang, count: langVoices.count))
+                for v in langVoices {
+                    items.append(.voice(id: v.id, name: v.name, language: v.language))
+                }
+            }
+        }
+        return items
+    }
+
+    @ViewBuilder
+    private func voiceListRow(_ item: VoiceListItem) -> some View {
+        switch item {
+        case .header(let language, let count):
+            HStack {
+                Text(language)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(count)")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        case .voice(let voiceId, let name, _):
+            HStack {
+                Image(systemName: ttsVoice == voiceId ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(ttsVoice == voiceId ? .accentColor : .secondary)
+                    .font(.system(size: 14))
+                Text(name)
+                    .font(.system(size: 12))
+                Spacer()
+                Text(voiceId)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
+            }
+            .padding(.vertical, 5)
+            .padding(.horizontal, 8)
+            .background(ttsVoice == voiceId ? Color.accentColor.opacity(0.1) : Color.clear)
+            .cornerRadius(4)
+            .onTapGesture {
+                ttsVoice = voiceId
+            }
         }
     }
 
@@ -3165,31 +3251,11 @@ struct SettingsView: View {
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(6)
 
-                // Voice list
+                // Voice list grouped by language
                 ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(filteredVoices, id: \.id) { voice in
-                            HStack {
-                                Image(systemName: ttsVoice == voice.id ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(ttsVoice == voice.id ? .accentColor : .secondary)
-                                    .font(.system(size: 14))
-
-                                Text(voice.name)
-                                    .font(.system(size: 12))
-
-                                Spacer()
-
-                                Text("Grade: \(voice.grade)")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.vertical, 6)
-                            .padding(.horizontal, 8)
-                            .background(ttsVoice == voice.id ? Color.accentColor.opacity(0.1) : Color.clear)
-                            .cornerRadius(4)
-                            .onTapGesture {
-                                ttsVoice = voice.id
-                            }
+                    LazyVStack(spacing: 0) {
+                        ForEach(voiceListItems, id: \.id) { item in
+                            voiceListRow(item)
                         }
                     }
                 }
