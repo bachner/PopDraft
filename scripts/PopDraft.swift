@@ -5193,6 +5193,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     process.waitUntilExit()
                 }
             }
+
+            // Ensure llama.cpp is up to date for newer models
+            DispatchQueue.global(qos: .background).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/brew")
+                process.arguments = ["upgrade", "llama.cpp"]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try? process.run()
+                process.waitUntilExit()
+            }
         }
 
         // Register all global hotkeys
