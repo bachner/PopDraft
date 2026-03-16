@@ -1212,9 +1212,16 @@ class LlamaServerManager {
     func restart(completion: @escaping (Bool) -> Void) {
         let config = LLMConfig.load()
         let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
-        guard FileManager.default.fileExists(atPath: plistPath) else {
-            completion(false)
-            return
+
+        // Create plist if missing
+        if !FileManager.default.fileExists(atPath: plistPath) {
+            DependencyManager.shared.createLlamaLaunchAgentForModel(
+                LLMConfig.llamaModels.first { $0.id == config.llamaModel } ?? LLMConfig.llamaModels[0]
+            )
+            guard FileManager.default.fileExists(atPath: plistPath) else {
+                completion(false)
+                return
+            }
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
