@@ -188,7 +188,7 @@ Configuration file: `~/.popdraft/config`
 PROVIDER=llamacpp
 
 # llama.cpp settings
-LLAMACPP_URL=http://localhost:8080
+LLAMACPP_URL=http://localhost:10819
 
 # Ollama settings
 OLLAMA_URL=http://localhost:11434
@@ -288,7 +288,7 @@ popdraft/
 **For llama.cpp:**
 ```bash
 # Check if server is running
-curl http://localhost:8080/health
+curl http://localhost:10819/health
 
 # Check logs
 tail -f /tmp/llm-llama-server.log

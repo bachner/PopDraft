@@ -252,7 +252,7 @@ struct LLMConfig {
 
     var provider: Provider = .llamacpp
     var llamaModel: String = "qwen3.5-2b"
-    var llamacppURL: String = "http://localhost:8080"
+    var llamacppURL: String = "http://localhost:10819"
     var ollamaURL: String = "http://localhost:11434"
     var ollamaModel: String = "qwen3.5:4b"
     var openaiAPIKey: String = ""
@@ -1145,6 +1145,117 @@ class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
         } else if !accumulatedText.isEmpty {
             // Stream ended without [DONE] - finish with what we have
             finishStream()
+        }
+    }
+}
+
+// MARK: - Llama Server Manager
+
+class LlamaServerManager {
+    static let shared = LlamaServerManager()
+
+    enum Status {
+        case unknown, online, loading, offline
+    }
+
+    private(set) var status: Status = .unknown
+    var onStatusChanged: ((Status) -> Void)?
+    private var pollTimer: Timer?
+
+    private var healthURL: URL {
+        let config = LLMConfig.load()
+        return URL(string: "\(config.llamacppURL)/health")!
+    }
+
+    func startPolling(interval: TimeInterval = 10.0) {
+        stopPolling()
+        checkNow()
+        DispatchQueue.main.async {
+            self.pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                self?.checkNow()
+            }
+        }
+    }
+
+    func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    func checkNow(completion: ((Status) -> Void)? = nil) {
+        var request = URLRequest(url: healthURL)
+        request.timeoutInterval = 2.0
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let newStatus: Status
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 200 {
+                    newStatus = .online
+                } else if http.statusCode == 503 {
+                    newStatus = .loading
+                } else {
+                    newStatus = .offline
+                }
+            } else {
+                newStatus = .offline
+            }
+            DispatchQueue.main.async {
+                let changed = self?.status != newStatus
+                self?.status = newStatus
+                if changed {
+                    self?.onStatusChanged?(newStatus)
+                }
+                completion?(newStatus)
+            }
+        }.resume()
+    }
+
+    func restart(completion: @escaping (Bool) -> Void) {
+        let config = LLMConfig.load()
+        let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: plistPath) else {
+            completion(false)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let stopProcess = Process()
+            stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
+            try? stopProcess.run()
+            stopProcess.waitUntilExit()
+
+            let startProcess = Process()
+            startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            startProcess.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
+            try? startProcess.run()
+            startProcess.waitUntilExit()
+
+            let healthURL = URL(string: "\(config.llamacppURL)/health")!
+            var serverReady = false
+            for _ in 0..<20 {
+                Thread.sleep(forTimeInterval: 0.5)
+                let sem = DispatchSemaphore(value: 0)
+                var ok = false
+                URLSession.shared.dataTask(with: healthURL) { _, response, _ in
+                    if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                        ok = true
+                    }
+                    sem.signal()
+                }.resume()
+                _ = sem.wait(timeout: .now() + 2)
+                if ok {
+                    serverReady = true
+                    break
+                }
+            }
+
+            DispatchQueue.main.async {
+                if serverReady {
+                    self?.status = .online
+                    self?.onStatusChanged?(.online)
+                }
+                completion(serverReady)
+            }
         }
     }
 }
@@ -2717,49 +2828,13 @@ class PopupWindowController: NSWindowController {
         self.state = .processing
         self.updateView()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Stop existing server
-            let stopProcess = Process()
-            stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
-            try? stopProcess.run()
-            stopProcess.waitUntilExit()
-
-            // Start server
-            let startProcess = Process()
-            startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            startProcess.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
-            try? startProcess.run()
-            startProcess.waitUntilExit()
-
-            // Poll health endpoint for up to 10 seconds
-            let healthURL = URL(string: "http://localhost:8080/health")!
-            var serverReady = false
-            for _ in 0..<20 {
-                Thread.sleep(forTimeInterval: 0.5)
-                let sem = DispatchSemaphore(value: 0)
-                var ok = false
-                URLSession.shared.dataTask(with: healthURL) { _, response, _ in
-                    if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                        ok = true
-                    }
-                    sem.signal()
-                }.resume()
-                _ = sem.wait(timeout: .now() + 2)
-                if ok {
-                    serverReady = true
-                    break
-                }
+        LlamaServerManager.shared.restart { [weak self] success in
+            if success {
+                self?.state = .actionList
+            } else {
+                self?.state = .error("Failed to start llama-server. Check /tmp/llm-llama-server.log for details.")
             }
-
-            DispatchQueue.main.async {
-                if serverReady {
-                    self?.state = .actionList
-                } else {
-                    self?.state = .error("Failed to start llama-server. Check /tmp/llm-llama-server.log for details.")
-                }
-                self?.updateView()
-            }
+            self?.updateView()
         }
     }
 
@@ -2819,6 +2894,9 @@ struct SettingsView: View {
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
     @State private var downloadStatus: String = ""
+    @State private var serverStatus: LlamaServerManager.Status = .unknown
+    @State private var isRestartingServer: Bool = false
+    @State private var serverStatusTimer: Timer? = nil
     let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
@@ -3491,9 +3569,53 @@ struct SettingsView: View {
                 }
             }
 
-            Text("Server: http://localhost:8080")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(.secondary)
+            // Server status
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(serverStatusColor)
+                    .frame(width: 8, height: 8)
+                Text(serverStatusText)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                if isRestartingServer {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                    Text("Restarting...")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                } else {
+                    Button(action: restartServer) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9))
+                            Text("Restart")
+                                .font(.system(size: 10))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.secondary.opacity(0.12))
+                    .cornerRadius(4)
+                }
+            }
+            .onAppear {
+                serverStatus = LlamaServerManager.shared.status
+                LlamaServerManager.shared.checkNow { status in
+                    serverStatus = status
+                }
+                serverStatusTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+                    LlamaServerManager.shared.checkNow { status in
+                        serverStatus = status
+                    }
+                }
+            }
+            .onDisappear {
+                serverStatusTimer?.invalidate()
+                serverStatusTimer = nil
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 Toggle("Enable Thinking", isOn: $llamacppEnableThinking)
@@ -3502,6 +3624,32 @@ struct SettingsView: View {
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
+        }
+    }
+
+    private var serverStatusColor: Color {
+        switch serverStatus {
+        case .online: return .green
+        case .loading: return .orange
+        case .offline: return .red
+        case .unknown: return .gray
+        }
+    }
+
+    private var serverStatusText: String {
+        switch serverStatus {
+        case .online: return "Server online"
+        case .loading: return "Server loading model..."
+        case .offline: return "Server offline"
+        case .unknown: return "Checking server..."
+        }
+    }
+
+    private func restartServer() {
+        isRestartingServer = true
+        LlamaServerManager.shared.restart { success in
+            isRestartingServer = false
+            serverStatus = success ? .online : .offline
         }
     }
 
@@ -4170,7 +4318,8 @@ class DependencyManager {
         status.hasLlamaModel = FileManager.default.fileExists(atPath: modelPath)
 
         // Check if server is running
-        let healthCheck = runShellCommand("curl -s http://localhost:8080/health 2>/dev/null")
+        let config = LLMConfig.load()
+        let healthCheck = runShellCommand("curl -s \(config.llamacppURL)/health 2>/dev/null")
         status.isLlamaServerRunning = healthCheck.contains("ok") || healthCheck.contains("OK")
 
         return status
@@ -4340,6 +4489,9 @@ class DependencyManager {
             ? "/opt/homebrew/bin/llama-server"
             : "/usr/local/bin/llama-server"
 
+        let config = LLMConfig.load()
+        let port = URLComponents(string: config.llamacppURL)?.port ?? 10819
+
         let plistContent = """
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -4353,7 +4505,7 @@ class DependencyManager {
         <string>-m</string>
         <string>\(modelPath)</string>
         <string>--port</string>
-        <string>8080</string>
+        <string>\(port)</string>
         <string>-ngl</string>
         <string>99</string>
     </array>
@@ -5433,6 +5585,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var settingsController: SettingsWindowController?
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
+    var serverStatusMenuItem: NSMenuItem?
 
     private var isOnboardingComplete: Bool {
         let path = NSString(string: "~/.popdraft/onboarding_complete").expandingTildeInPath
@@ -5473,6 +5626,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create menu
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Show Popup", action: #selector(showPopup), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+
+        let statusMenuItem = NSMenuItem(title: "llama.cpp: Checking...", action: nil, keyEquivalent: "")
+        statusMenuItem.isEnabled = false
+        menu.addItem(statusMenuItem)
+        serverStatusMenuItem = statusMenuItem
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "About PopDraft", action: #selector(showAbout), keyEquivalent: ""))
@@ -5516,6 +5676,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 try? process.run()
                 process.waitUntilExit()
             }
+        }
+
+        // Start llama.cpp server monitoring
+        if config.provider == .llamacpp {
+            LlamaServerManager.shared.onStatusChanged = { [weak self] status in
+                self?.updateServerStatusMenuItem(status)
+            }
+            LlamaServerManager.shared.startPolling()
+        } else {
+            serverStatusMenuItem?.isHidden = true
         }
 
         // Register all global hotkeys
@@ -5596,6 +5766,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showSettings() {
         settingsController?.showWindow()
+    }
+
+    private func updateServerStatusMenuItem(_ status: LlamaServerManager.Status) {
+        switch status {
+        case .online:
+            serverStatusMenuItem?.title = "llama.cpp: Online"
+            serverStatusMenuItem?.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Online")
+            serverStatusMenuItem?.image?.isTemplate = false
+        case .loading:
+            serverStatusMenuItem?.title = "llama.cpp: Loading Model..."
+            serverStatusMenuItem?.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Loading")
+            serverStatusMenuItem?.image?.isTemplate = false
+        case .offline:
+            serverStatusMenuItem?.title = "llama.cpp: Offline"
+            serverStatusMenuItem?.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Offline")
+            serverStatusMenuItem?.image?.isTemplate = false
+        case .unknown:
+            serverStatusMenuItem?.title = "llama.cpp: Checking..."
+            serverStatusMenuItem?.image = nil
+        }
     }
 
     @objc func showAbout() {

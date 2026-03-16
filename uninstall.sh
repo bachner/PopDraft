@@ -15,7 +15,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     # Kill running processes
     pkill -f PopDraft 2>/dev/null || true
     pkill -f llm-tts-server.py 2>/dev/null || true
-    pkill -f "llama-server.*8080" 2>/dev/null || true
+    pkill -f "llama-server.*(8080|10819)" 2>/dev/null || true
 
     # Remove LaunchAgents
     launchctl unload ~/Library/LaunchAgents/com.popdraft.app.plist 2>/dev/null || true

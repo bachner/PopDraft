@@ -93,7 +93,7 @@ Selected Text -> Ctrl+Option+Shortcut -> Direct Action -> LLM API -> Result Prev
 ```
 
 **API endpoints:**
-- llama.cpp: `http://localhost:8080` (OpenAI-compatible)
+- llama.cpp: `http://localhost:10819` (OpenAI-compatible)
 - Ollama: `http://localhost:11434`
 - OpenAI: `https://api.openai.com/v1/chat/completions`
 - Claude: `https://api.anthropic.com/v1/messages`
