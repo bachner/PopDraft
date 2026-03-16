@@ -1225,15 +1225,25 @@ class LlamaServerManager {
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let uid = getuid()
+
+            // Stop existing server if running
             let stopProcess = Process()
             stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
+            stopProcess.arguments = ["bootout", "gui/\(uid)/com.popdraft.llama-server"]
             try? stopProcess.run()
             stopProcess.waitUntilExit()
 
+            // Ensure service is enabled (uninstall can disable it permanently)
+            let enableProcess = Process()
+            enableProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            enableProcess.arguments = ["enable", "gui/\(uid)/com.popdraft.llama-server"]
+            try? enableProcess.run()
+            enableProcess.waitUntilExit()
+
             let startProcess = Process()
             startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            startProcess.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
+            startProcess.arguments = ["bootstrap", "gui/\(uid)", plistPath]
             try? startProcess.run()
             startProcess.waitUntilExit()
 
@@ -5656,9 +5666,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
             if FileManager.default.fileExists(atPath: plistPath) {
                 DispatchQueue.global(qos: .utility).async {
+                    let uid = getuid()
+                    // Ensure service is enabled
+                    let enableProcess = Process()
+                    enableProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                    enableProcess.arguments = ["enable", "gui/\(uid)/com.popdraft.llama-server"]
+                    enableProcess.standardOutput = FileHandle.nullDevice
+                    enableProcess.standardError = FileHandle.nullDevice
+                    try? enableProcess.run()
+                    enableProcess.waitUntilExit()
+
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                    process.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
+                    process.arguments = ["bootstrap", "gui/\(uid)", plistPath]
                     process.standardOutput = FileHandle.nullDevice
                     process.standardError = FileHandle.nullDevice
                     try? process.run()
