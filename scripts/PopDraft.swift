@@ -496,6 +496,7 @@ enum LLMStreamProgress {
 // MARK: - LLM Client
 
 class LLMClient {
+    static let llamaServerDownError = "LLAMA_SERVER_DOWN"
     static let shared = LLMClient()
     private var config: LLMConfig
     private var activeProvider: LLMConfig.Provider?
@@ -653,7 +654,11 @@ class LLMClient {
         } else {
             URLSession.shared.dataTask(with: request) { data, response, error in
                 if let error = error {
-                    completion(.failure(error))
+                    if (error as? URLError)?.code == .cannotConnectToHost {
+                        completion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+                    } else {
+                        completion(.failure(error))
+                    }
                     return
                 }
 
@@ -1115,7 +1120,11 @@ class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error = error {
-            onCompletion(.failure(error))
+            if (error as? URLError)?.code == .cannotConnectToHost {
+                onCompletion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+            } else {
+                onCompletion(.failure(error))
+            }
         } else if !accumulatedText.isEmpty {
             // Stream ended without [DONE] - finish with what we have
             finishStream()
@@ -1519,6 +1528,7 @@ struct PopupView: View {
     let onTTSPause: () -> Void
     let onTTSResume: () -> Void
     let onOpenAccessibilitySettings: () -> Void
+    let onRestartLlamaServer: () -> Void
 
     // Computed filtered actions - recomputes when searchText changes
     private var actions: [Action] {
@@ -1955,6 +1965,33 @@ struct PopupView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(20)
+            } else if message == LLMClient.llamaServerDownError {
+                VStack(spacing: 12) {
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 32))
+                        .foregroundColor(.orange)
+
+                    Text("llama-server is not running")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    Text("The local llama.cpp server could not be reached. Click below to restart it.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    Button(action: onRestartLlamaServer) {
+                        Text("Restart Server")
+                            .font(.system(size: 12, weight: .medium))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color.accentColor)
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(20)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -2102,7 +2139,8 @@ class PopupWindowController: NSWindowController {
             onTTSStop: { [weak self] in self?.stopTTS() },
             onTTSPause: { [weak self] in self?.pauseTTS() },
             onTTSResume: { [weak self] in self?.resumeTTS() },
-            onOpenAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() }
+            onOpenAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() },
+            onRestartLlamaServer: { [weak self] in self?.restartLlamaServer() }
         )
 
         if hostingView == nil {
@@ -2640,6 +2678,71 @@ class PopupWindowController: NSWindowController {
         // Bring System Settings to foreground
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first?.activate()
+        }
+    }
+
+    private func restartLlamaServer() {
+        let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: plistPath) else {
+            self.state = .error("llama-server LaunchAgent not found. Please configure llama.cpp in Settings first.")
+            self.updateView()
+            return
+        }
+
+        let llamaServerExists = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server") ||
+                                FileManager.default.fileExists(atPath: "/usr/local/bin/llama-server")
+        guard llamaServerExists else {
+            self.state = .error("llama-server binary not found. Please install llama.cpp first.")
+            self.updateView()
+            return
+        }
+
+        self.state = .processing
+        self.updateView()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Stop existing server
+            let stopProcess = Process()
+            stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
+            try? stopProcess.run()
+            stopProcess.waitUntilExit()
+
+            // Start server
+            let startProcess = Process()
+            startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            startProcess.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
+            try? startProcess.run()
+            startProcess.waitUntilExit()
+
+            // Poll health endpoint for up to 10 seconds
+            let healthURL = URL(string: "http://localhost:8080/health")!
+            var serverReady = false
+            for _ in 0..<20 {
+                Thread.sleep(forTimeInterval: 0.5)
+                let sem = DispatchSemaphore(value: 0)
+                var ok = false
+                URLSession.shared.dataTask(with: healthURL) { _, response, _ in
+                    if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                        ok = true
+                    }
+                    sem.signal()
+                }.resume()
+                _ = sem.wait(timeout: .now() + 2)
+                if ok {
+                    serverReady = true
+                    break
+                }
+            }
+
+            DispatchQueue.main.async {
+                if serverReady {
+                    self?.state = .actionList
+                } else {
+                    self?.state = .error("Failed to start llama-server. Check /tmp/llm-llama-server.log for details.")
+                }
+                self?.updateView()
+            }
         }
     }
 
