@@ -2817,13 +2817,6 @@ class PopupWindowController: NSWindowController {
     }
 
     private func restartLlamaServer() {
-        let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
-        guard FileManager.default.fileExists(atPath: plistPath) else {
-            self.state = .error("llama-server LaunchAgent not found. Please configure llama.cpp in Settings first.")
-            self.updateView()
-            return
-        }
-
         let llamaServerExists = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server") ||
                                 FileManager.default.fileExists(atPath: "/usr/local/bin/llama-server")
         guard llamaServerExists else {
