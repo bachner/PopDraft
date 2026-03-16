@@ -662,6 +662,11 @@ class LLMClient {
                     return
                 }
 
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 503 {
+                    completion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+                    return
+                }
+
                 guard let data = data else {
                     completion(.failure(NSError(domain: "No data", code: -1)))
                     return
@@ -1033,11 +1038,22 @@ class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
     private let onProgress: (LLMStreamProgress) -> Void
     private let onCompletion: (Result<LLMResponse, Error>) -> Void
     private let enableThinking: Bool
+    private var receivedHTTPError = false
 
     init(enableThinking: Bool, onProgress: @escaping (LLMStreamProgress) -> Void, onCompletion: @escaping (Result<LLMResponse, Error>) -> Void) {
         self.enableThinking = enableThinking
         self.onProgress = onProgress
         self.onCompletion = onCompletion
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse, http.statusCode == 503 {
+            receivedHTTPError = true
+            onCompletion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -1119,6 +1135,7 @@ class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if receivedHTTPError { return }
         if let error = error {
             if (error as? URLError)?.code == .cannotConnectToHost {
                 onCompletion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
