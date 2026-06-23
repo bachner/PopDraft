@@ -19,6 +19,7 @@ TESTS=(
   "tests/test-toolrunner.swift scripts/Core.swift"
   "tests/test-agentloop.swift scripts/Core.swift"
   "tests/test-maccontrol.swift scripts/Core.swift"
+  "tests/test-ippinning.swift scripts/Core.swift"
 )
 
 OVERALL_EXIT=0
@@ -113,7 +114,7 @@ if [ "${RUN_GUI_TESTS:-0}" = "1" ]; then
     GBIN="/tmp/popdraft-test-webengine-gui"
 
     if swiftc -o "$GBIN" "$GSTAGE/main.swift" "$GSTAGE/PopDraft.swift" scripts/Core.swift \
-         -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation; then
+         -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation -framework Network; then
       echo "  Compiled. Running..."
       if ! "$GBIN"; then OVERALL_EXIT=1; fi
     else

@@ -120,6 +120,35 @@ hard denylist (sudo, `rm -rf /`, `curl|sh`, fork bomb, `dd if=`, `> /dev/…`,
 shutdown/reboot) is enforced even on Approve. MacControlGuard / MacControlPolicy
 live in `scripts/Core.swift` (pure, unit-tested by `tests/test-maccontrol.swift`).
 
+## WebEngine IP pinning (PR11) — DNS-rebinding defense
+
+The WebEngine's `SafetyGuard` resolves a host and verifies every IP is public,
+but WKWebView resolves the host AGAIN when it opens its socket — a hostile DNS
+server could return a public IP to the guard and a private IP (e.g.
+`169.254.169.254`, `10.x`, `127.x`) to WebKit (DNS-rebinding / TOCTOU).
+
+**Primary control (macOS 14+):** an in-process forward proxy (`PinningProxy`,
+Network framework) bound to `127.0.0.1:<ephemeral>`. WKWebView is pointed at it
+via `WKWebsiteDataStore.proxyConfigurations` (and the search `URLSession` via
+`URLSessionConfiguration.proxyConfigurations`). For every connection the proxy
+resolves the target ONCE, runs all addresses through `SafetyGuard.pinnedAddress`
+(fail-closed: reject if ANY is private/loopback/metadata, else pick one public
+IP), and **dials that exact validated IP** — CONNECT is blind-tunnelled (no TLS
+interception; certs validate in WebKit as normal), plain HTTP is forwarded with
+a corrected Host header and byte cap. Because we dial the validated IP, WebKit
+never resolves the host → rebinding is **closed on macOS 14+**.
+
+**Fallback (macOS 13):** `proxyConfigurations` is 14+ only. On 13 the engine
+keeps the PR6 mitigation (require all resolved IPs public, redirect cap, redirect
++ response-URL re-validation) — a residual rebinding risk remains on 13 only.
+
+**Defense in depth:** the `decidePolicyFor` / response-host SSRF checks in
+`NavigationBridge` stay as a backstop on every OS. Pure decision logic
+(`SafetyGuard.pinnedAddress`, `ProxyParser` request parsing) is in `Core.swift`
+and unit-tested by `tests/test-ippinning.swift`; the proxy round-trip is covered
+by `tests/test-webengine-gui.swift` (RUN_GUI_TESTS=1). The build links
+`-framework Network`.
+
 ## Installation Targets
 
 - App: `/Applications/PopDraft.app`

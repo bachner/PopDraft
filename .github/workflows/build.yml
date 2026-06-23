@@ -25,7 +25,7 @@ jobs:
         timeout-minutes: 5
         run: |
           swiftc --version
-          swiftc -O -o PopDraft scripts/PopDraft.swift scripts/Core.swift -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation
+          swiftc -O -o PopDraft scripts/PopDraft.swift scripts/Core.swift -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation -framework Network
           ls -la PopDraft
           echo "Binary built successfully"
 
