@@ -13,6 +13,7 @@ cd "$SCRIPT_DIR/.."
 TESTS=(
   "tests/test-actions.swift"
   "tests/test-config.swift scripts/Core.swift"
+  "tests/test-model-validation.swift scripts/Core.swift"
 )
 
 OVERALL_EXIT=0

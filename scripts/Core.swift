@@ -355,3 +355,385 @@ extension AppConfig {
         return config
     }
 }
+
+// MARK: - Model Validation (pure parsers + thin async network)
+//
+// All logic here is Foundation-only and split into two layers:
+//   1. PURE PARSERS — take raw `Data`/`Int` and return value types. These are
+//      exercised directly by `tests/test-model-validation.swift` over hand-crafted
+//      JSON fixtures, with NO network access.
+//   2. Thin async methods — fetch over the network, then delegate to the pure
+//      parsers. Not unit-tested (network), but trivial wrappers.
+
+/// Gating state of a Hugging Face repo. HF returns `gated` as `false`, `"auto"`,
+/// or `"manual"` — we collapse to a small enum.
+enum HFGated: Equatable {
+    case none          // public, no terms to accept
+    case auto          // auto-approved gate (still needs a token)
+    case manual        // manual-approval gate (needs token + accepted terms)
+
+    /// Parse HF's polymorphic `gated` JSON value (`false` | `"auto"` | `"manual"`).
+    static func parse(_ value: Any?) -> HFGated {
+        if let b = value as? Bool { return b ? .manual : .none }
+        if let s = value as? String {
+            switch s.lowercased() {
+            case "auto": return .auto
+            case "manual": return .manual
+            case "false", "": return .none
+            default: return .manual   // unknown truthy string ⇒ treat as gated
+            }
+        }
+        return .none
+    }
+
+    var isGated: Bool { self != .none }
+}
+
+/// Parsed metadata about a Hugging Face model repo.
+struct HFModelInfo: Equatable {
+    var exists: Bool
+    var hasGGUF: Bool        // top-level `gguf` object present ⇒ strong "is a GGUF repo" signal
+    var isPrivate: Bool
+    var gated: HFGated
+}
+
+/// A single `.gguf` file in a repo tree, with its parsed quant + size.
+struct GGUFFile: Equatable {
+    var filename: String
+    var quant: String        // e.g. "Q4_K_M", "IQ4_XS", "Q8_0" (empty if unparseable)
+    var sizeBytes: Int64
+}
+
+/// The result of validating a local (Hugging Face GGUF) model reference.
+struct ModelValidation: Equatable {
+    enum State: Equatable {
+        case valid                 // public GGUF repo, ready to download
+        case validNeedsToken       // GGUF repo but private/gated — needs HF token / accepted terms
+        case notGGUF               // repo exists but has no GGUF files
+        case notFound              // repo doesn't exist (or anon 401/404)
+        case error(String)         // network / parse error
+    }
+
+    var state: State
+    var info: HFModelInfo?
+
+    var isUsable: Bool { state == .valid }
+    var message: String {
+        switch state {
+        case .valid: return "Found on Hugging Face"
+        case .validNeedsToken: return "Found, but gated — needs a Hugging Face token / accepted terms"
+        case .notGGUF: return "Not a GGUF repo (no .gguf files)"
+        case .notFound: return "Not found on Hugging Face"
+        case .error(let m): return m
+        }
+    }
+}
+
+/// The result of validating a cloud provider API key.
+struct KeyValidation: Equatable {
+    var isValid: Bool
+    var models: [String]       // available model ids (empty if key invalid)
+    var error: String?
+
+    static let invalid = KeyValidation(isValid: false, models: [], error: nil)
+}
+
+/// Cloud providers we can validate keys against.
+enum CloudProvider: String, CaseIterable, Equatable {
+    case openai
+    case anthropic
+    case gemini
+    case openrouter
+
+    var displayName: String {
+        switch self {
+        case .openai: return "OpenAI"
+        case .anthropic: return "Anthropic"
+        case .gemini: return "Gemini"
+        case .openrouter: return "OpenRouter"
+        }
+    }
+
+    /// Base URL for the OpenAI-compatible `/v1/models` probe.
+    /// (Anthropic uses its own adapter, but we still give it a base.)
+    var defaultBaseURL: String {
+        switch self {
+        case .openai: return "https://api.openai.com"
+        case .anthropic: return "https://api.anthropic.com"
+        case .gemini: return "https://generativelanguage.googleapis.com/v1beta/openai"
+        case .openrouter: return "https://openrouter.ai/api"
+        }
+    }
+
+    /// Maps a cloud provider to the legacy `LLMConfig.Provider` rawValue used in config.
+    var llmProviderRawValue: String {
+        switch self {
+        case .openai, .gemini, .openrouter: return "openai"
+        case .anthropic: return "claude"
+        }
+    }
+}
+
+/// Pure parsers + thin async network methods for validating models.
+enum ModelValidator {
+
+    // MARK: - PURE PARSERS (no network — unit-tested over fixtures)
+
+    /// Parse the JSON body of `GET https://huggingface.co/api/models/{repo}`.
+    /// Returns nil only if the body isn't a JSON object at all.
+    static func parseHFModel(_ data: Data) -> HFModelInfo? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        // The top-level `gguf` object is the strong "this is a GGUF repo" signal.
+        let hasGGUF = obj["gguf"] != nil && !(obj["gguf"] is NSNull)
+        let isPrivate = (obj["private"] as? Bool) ?? false
+        let gated = HFGated.parse(obj["gated"])
+        return HFModelInfo(exists: true, hasGGUF: hasGGUF, isPrivate: isPrivate, gated: gated)
+    }
+
+    /// Apply HF validation rules given an HTTP status + (optional) parsed info.
+    /// HF returns 401 for nonexistent repos when anonymous — treat 401/404 as not found.
+    static func validateHFModel(status: Int, info: HFModelInfo?) -> ModelValidation {
+        if status == 401 || status == 404 {
+            return ModelValidation(state: .notFound, info: nil)
+        }
+        guard status == 200, let info = info else {
+            return ModelValidation(state: .error("HTTP \(status)"), info: info)
+        }
+        guard info.hasGGUF else {
+            return ModelValidation(state: .notGGUF, info: info)
+        }
+        if info.isPrivate || info.gated.isGated {
+            return ModelValidation(state: .validNeedsToken, info: info)
+        }
+        return ModelValidation(state: .valid, info: info)
+    }
+
+    /// Extract the quantization token (e.g. `Q4_K_M`, `IQ4_XS`, `Q8_0`, `Q5_K_S`)
+    /// from a GGUF filename. Returns "" if none is recognizable.
+    static func parseQuant(fromFilename filename: String) -> String {
+        // Strip directory + extension. Split on FILENAME separators only ('-' and '.')
+        // — NOT '_', because a quant token like Q4_K_M contains underscores.
+        let base = (filename as NSString).lastPathComponent
+        let stem = base.hasSuffix(".gguf") ? String(base.dropLast(5)) : base
+        let tokens = stem.components(separatedBy: CharacterSet(charactersIn: "-."))
+        // Match the canonical shapes: Q<digit>(_<...>) or IQ<digit>(_<...>) or F16/F32/BF16.
+        // Scan from the end (quant usually trails the model name).
+        for token in tokens.reversed() {
+            let upper = token.uppercased()
+            if isQuantToken(upper) { return upper }
+        }
+        return ""
+    }
+
+    private static func isQuantToken(_ t: String) -> Bool {
+        if t == "F16" || t == "F32" || t == "BF16" || t == "F64" { return true }
+        // IQ<n>... or Q<n>...
+        var s = Substring(t)
+        if s.hasPrefix("IQ") { s = s.dropFirst(2) }
+        else if s.hasPrefix("Q") { s = s.dropFirst(1) }
+        else { return false }
+        guard let first = s.first, first.isNumber else { return false }
+        return true
+    }
+
+    /// Parse the JSON body of `GET /api/models/{repo}/tree/main` into GGUF files.
+    /// Filters to `*.gguf`, parses quant + size. Sorted by filename for determinism.
+    static func parseHFTree(_ data: Data) -> [GGUFFile] {
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        var files: [GGUFFile] = []
+        for entry in arr {
+            // Tree entries: {"type":"file","path":"...","size":N, "lfs":{"size":N}}
+            guard let path = entry["path"] as? String, path.lowercased().hasSuffix(".gguf") else { continue }
+            if let type = entry["type"] as? String, type != "file" { continue }
+            // Prefer the LFS size (real file size for GGUFs stored in LFS); fall back to `size`.
+            var size: Int64 = 0
+            if let lfs = entry["lfs"] as? [String: Any], let s = (lfs["size"] as? NSNumber)?.int64Value {
+                size = s
+            } else if let s = (entry["size"] as? NSNumber)?.int64Value {
+                size = s
+            }
+            files.append(GGUFFile(filename: path, quant: parseQuant(fromFilename: path), sizeBytes: size))
+        }
+        return files.sorted { $0.filename < $1.filename }
+    }
+
+    /// Parse an OpenAI-compatible `GET /v1/models` body: `{"data":[{"id":"..."}]}`.
+    static func parseOpenAIModels(_ data: Data) -> [String] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["data"] as? [[String: Any]] else {
+            return []
+        }
+        return arr.compactMap { $0["id"] as? String }
+    }
+
+    /// Parse an Anthropic `GET /v1/models` body: `{"data":[{"id":"...","display_name":"..."}]}`.
+    static func parseAnthropicModels(_ data: Data) -> [String] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["data"] as? [[String: Any]] else {
+            return []
+        }
+        return arr.compactMap { $0["id"] as? String }
+    }
+
+    // MARK: - Network helpers
+
+    /// Normalize a user-pasted HF repo string: strip a full URL down to `owner/name`,
+    /// drop a trailing `:quant`, trim whitespace and slashes.
+    static func normalizeHFRepo(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Note whether the original was a URL BEFORE we strip the scheme — a URL must
+        // never have its scheme colon (`https:`) mistaken for a `:quant` suffix.
+        let wasURL = s.contains("://")
+        // Strip a leading huggingface.co URL (any scheme).
+        for prefix in ["https://huggingface.co/", "http://huggingface.co/", "huggingface.co/"] {
+            if s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)); break }
+        }
+        // Drop a trailing `:Q4_K_M` quant suffix — but ONLY from the final path component,
+        // and ONLY when the input wasn't a URL (whose `://` colon must be left alone).
+        if !wasURL {
+            let parts = s.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            if var last = parts.last, let colon = last.firstIndex(of: ":") {
+                last = String(last[..<colon])
+                s = (parts.dropLast() + [last]).joined(separator: "/")
+            }
+        }
+        // Keep just `owner/name`, dropping any `/tree/...` or `/resolve/...` tail.
+        let comps = s.split(separator: "/").map(String.init)
+        if comps.count >= 2 {
+            s = "\(comps[0])/\(comps[1])"
+        }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    }
+
+    /// Build the HF resolve URL for downloading a specific GGUF file.
+    static func hfResolveURL(repo: String, file: String) -> String {
+        return "https://huggingface.co/\(repo)/resolve/main/\(file)"
+    }
+
+    /// Validate a downloaded GGUF filename before it is written into a path or
+    /// embedded into the launch-agent plist XML. Guards against path traversal and
+    /// XML/shell injection: must match `^[A-Za-z0-9._-]+\.gguf$` (no slashes, no spaces,
+    /// no `<>&'"`). Returns the bare filename if safe, else nil.
+    static func safeGGUFFilename(_ filename: String) -> String? {
+        // Strictly enforce `^[A-Za-z0-9._-]+\.gguf$` on the WHOLE string — any slash,
+        // space, or XML metacharacter (so `../`, `</string>`, `&`) fails outright.
+        guard filename.lowercased().hasSuffix(".gguf"), filename.count <= 255 else { return nil }
+        let stem = String(filename.dropLast(5))           // strip ".gguf"
+        guard !stem.isEmpty else { return nil }            // ".gguf" alone has no name
+        if stem.hasPrefix(".") { return nil }              // reject hidden / dotfile names
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        guard filename.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        return filename
+    }
+
+    // MARK: - Thin async network methods (fetch → pure parse)
+
+#if canImport(FoundationNetworking)
+    // (Linux) — URLSession lives in FoundationNetworking.
+#endif
+
+    /// Validate that an HF repo exists and is a usable GGUF repo.
+    static func validateHFRepo(_ repo: String, token: String? = nil) async -> ModelValidation {
+        let clean = normalizeHFRepo(repo)
+        guard !clean.isEmpty, clean.contains("/"),
+              let url = URL(string: "https://huggingface.co/api/models/\(clean)") else {
+            return ModelValidation(state: .notFound, info: nil)
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        if let token = token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let info = (status == 200) ? parseHFModel(data) : nil
+            return validateHFModel(status: status, info: info)
+        } catch {
+            return ModelValidation(state: .error(error.localizedDescription), info: nil)
+        }
+    }
+
+    /// List the `.gguf` files in an HF repo (with quant + size).
+    static func listGGUFFiles(_ repo: String, token: String? = nil) async -> [GGUFFile] {
+        let clean = normalizeHFRepo(repo)
+        guard !clean.isEmpty, clean.contains("/"),
+              let url = URL(string: "https://huggingface.co/api/models/\(clean)/tree/main") else {
+            return []
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        if let token = token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            return parseHFTree(data)
+        } catch {
+            return []
+        }
+    }
+
+    /// Validate a cloud provider API key by probing its model-list endpoint.
+    /// 200 ⇒ key valid (returns available model ids). 401/403 ⇒ invalid.
+    static func validateCloudKey(provider: CloudProvider, key: String, baseURL: String? = nil) async -> KeyValidation {
+        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return .invalid }
+
+        let base = (baseURL?.isEmpty == false ? baseURL! : provider.defaultBaseURL)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+
+        let urlString: String
+        var headers: [String: String] = [:]
+        let isAnthropic = (provider == .anthropic)
+
+        if isAnthropic {
+            urlString = "\(base)/v1/models"
+            headers["x-api-key"] = trimmedKey
+            headers["anthropic-version"] = "2023-06-01"
+        } else {
+            urlString = "\(base)/v1/models"
+            headers["Authorization"] = "Bearer \(trimmedKey)"
+        }
+
+        guard let url = URL(string: urlString) else {
+            return KeyValidation(isValid: false, models: [], error: "Invalid base URL")
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                return KeyValidation(isValid: false, models: [], error: "HTTP \(status)")
+            }
+            let models = isAnthropic ? parseAnthropicModels(data) : parseOpenAIModels(data)
+            return KeyValidation(isValid: true, models: models, error: nil)
+        } catch {
+            return KeyValidation(isValid: false, models: [], error: error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - Human-readable byte size
+
+extension Int64 {
+    /// Format a byte count like "4.7 GB" / "512 MB" (1000-based, like HF shows).
+    var humanReadableSize: String {
+        let units = ["B", "KB", "MB", "GB", "TB"]
+        var value = Double(self)
+        var idx = 0
+        while value >= 1000 && idx < units.count - 1 {
+            value /= 1000
+            idx += 1
+        }
+        if idx == 0 { return "\(self) B" }
+        return String(format: "%.1f %@", value, units[idx])
+    }
+}
