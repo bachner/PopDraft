@@ -188,6 +188,17 @@ func runTests() async {
         R.check(true, "slow page failed (acceptable): \(error)")
     }
 
+    // --- size cap: the /big fixture (~12MB) must be rejected, not read ---
+    do {
+        _ = try await engine.read(URL(string: "\(b)/big")!, maxChars: 1000)
+        R.check(false, "oversized /big page should have been rejected by the size cap")
+    } catch let e as WebEngineError {
+        if case .tooLarge = e { R.check(true, "size cap rejected /big (tooLarge)") }
+        else { R.check(true, "/big rejected (acceptable error): \(e)") }
+    } catch {
+        R.check(true, "/big rejected (acceptable error): \(error)")
+    }
+
     // --- concurrent reads (parallel renderers) ---
     do {
         async let a = engine.read(URL(string: "\(b)/article")!, maxChars: 4000)

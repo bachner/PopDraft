@@ -1393,8 +1393,8 @@ enum DDGParser {
         let ns = html as NSString
         let matches = re.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length))
 
-        // Build a list of (url, title, anchorEndOffset) for redirect anchors.
-        var anchors: [(url: String, title: String, end: Int)] = []
+        // Build a list of (url, title, anchorStart, anchorEnd) for redirect anchors.
+        var anchors: [(url: String, title: String, start: Int, end: Int)] = []
         for m in matches {
             guard m.numberOfRanges >= 3 else { continue }
             let href = ns.substring(with: m.range(at: 1))
@@ -1403,10 +1403,13 @@ enum DDGParser {
             let rawTitle = ns.substring(with: m.range(at: 2))
             let title = stripTags(rawTitle)
             guard !title.isEmpty else { continue }
-            anchors.append((url: URLCleaner.strip(real), title: title, end: m.range.location + m.range.length))
+            anchors.append((url: URLCleaner.strip(real), title: title,
+                            start: m.range.location, end: m.range.location + m.range.length))
         }
 
-        // For each result anchor, grab the nearest following result-snippet block.
+        // For each result anchor, grab a result-snippet block — but ONLY one that
+        // falls strictly BEFORE the next result anchor, so a result with no
+        // snippet of its own can't borrow the following result's snippet.
         let snippetPattern = "class=\"result-snippet\"[^>]*>(.*?)</td>"
         let snippetRe = try? NSRegularExpression(pattern: snippetPattern, options: [.dotMatchesLineSeparators, .caseInsensitive])
 
@@ -1418,9 +1421,10 @@ enum DDGParser {
             }
         }
 
-        for a in anchors {
-            // Nearest snippet that starts after this anchor.
-            let snippet = snippetRanges.first(where: { $0.start >= a.end })?.text ?? ""
+        for (i, a) in anchors.enumerated() {
+            // Upper bound = start of the next anchor (or end-of-document).
+            let nextStart = (i + 1 < anchors.count) ? anchors[i + 1].start : ns.length
+            let snippet = snippetRanges.first(where: { $0.start >= a.end && $0.start < nextStart })?.text ?? ""
             // Dedupe by exact URL within this page.
             if results.contains(where: { $0.url == a.url }) { continue }
             results.append(SearchResult(title: a.title, url: a.url, snippet: snippet))

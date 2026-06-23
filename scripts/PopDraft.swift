@@ -7433,19 +7433,52 @@ final class OffscreenRenderHost {
 /// Bridges a single navigation to an async continuation: resolves on
 /// didFinish, throws on didFail / didFailProvisional / process crash, and
 /// enforces the SSRF/scheme policy on the initial request and EVERY redirect.
+///
+/// SSRF NOTE: the host/IP checks here (and in `WebEngine.guardURL`) classify the
+/// address(es) we resolve via `getaddrinfo`. WebKit resolves independently, so a
+/// hostile DNS server could in principle return a public IP to us and a private
+/// IP to WebKit (DNS-rebinding / TOCTOU). We mitigate by (a) requiring ALL of
+/// our resolved addresses to be public, (b) capping redirects, and (c) re-checking
+/// every redirect AND the final response URL. Full per-socket IP pinning is a
+/// tracked follow-up; until then a residual rebinding risk remains.
 @MainActor
 final class NavigationBridge: NSObject, WKNavigationDelegate {
     private var continuation: CheckedContinuation<Void, Error>?
     private var finished = false
 
+    /// Max redirects we follow before refusing (defense against redirect loops /
+    /// rebinding chains). Exceeding this cancels with an error.
+    static let maxRedirects = 8
+    private var redirectCount = 0
+
     /// Called for every navigation action — enforce SSRF + scheme here so a
     /// redirect to an internal IP is blocked mid-flight.
     var policyCheck: ((URL) -> Bool)?
+    /// Max bytes allowed for the response body; checked against the response's
+    /// `expectedContentLength` in `decidePolicyForNavigationResponse`.
+    var maxBytes: Int = .max
+    /// Re-validates the response URL's host (resolve + all-public) on the
+    /// committed response, catching a host that differs from the request.
+    var responseHostCheck: ((URL) -> Bool)?
+    /// The REAL HTTP status code of the main-frame response (0 if unknown, e.g.
+    /// non-HTTP). Captured in `decidePolicyForNavigationResponse`.
+    private(set) var httpStatus: Int = 0
 
-    func wait(_ body: () -> Void) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            self.continuation = cont
-            body()
+    func wait(_ body: @escaping () -> Void) async throws {
+        // Cancellation-aware: if the surrounding task is cancelled (e.g. the
+        // renderer-pool timeout wins), resume the continuation with an error so
+        // the caller always returns and the pool's `defer` releases its permit.
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = cont
+                body()
+            }
+        } onCancel: {
+            Task { @MainActor in self.resolve(.failure(CancellationError())) }
         }
     }
 
@@ -7466,11 +7499,48 @@ final class NavigationBridge: NSObject, WKNavigationDelegate {
         if let url = navigationAction.request.url {
             // about:blank is allowed (reset); everything else passes the guard.
             if url.absoluteString.lowercased() != "about:blank" {
+                // A redirect re-uses the same navigation; count it and cap.
+                if navigationAction.navigationType == .other && webView.isLoading {
+                    redirectCount += 1
+                    if redirectCount > Self.maxRedirects {
+                        decisionHandler(.cancel)
+                        resolve(.failure(WebEngineError.navigationFailed("too many redirects")))
+                        return
+                    }
+                }
                 if let check = policyCheck, check(url) == false {
                     decisionHandler(.cancel)
                     resolve(.failure(WebEngineError.blockedHost(url.host ?? url.absoluteString)))
                     return
                 }
+            }
+        }
+        decisionHandler(.allow)
+    }
+
+    /// Enforce the byte cap (via `expectedContentLength`) and re-validate the
+    /// response host before the body is fetched.
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
+        let response = navigationResponse.response
+        // Capture the real HTTP status for the main-frame response.
+        if navigationResponse.isForMainFrame, let http = response as? HTTPURLResponse {
+            httpStatus = http.statusCode
+        }
+        // Size cap: reject up-front when the server declares an oversized body.
+        let expected = response.expectedContentLength
+        if expected > 0, SizeGuard.rejectByContentLength(Int(expected), max: maxBytes) {
+            decisionHandler(.cancel)
+            resolve(.failure(WebEngineError.tooLarge(Int(expected))))
+            return
+        }
+        // Re-validate the committed response URL's host (catches a late rebind).
+        if let url = response.url, url.absoluteString.lowercased() != "about:blank" {
+            if let check = responseHostCheck, check(url) == false {
+                decisionHandler(.cancel)
+                resolve(.failure(WebEngineError.blockedHost(url.host ?? url.absoluteString)))
+                return
             }
         }
         decisionHandler(.allow)
@@ -7605,6 +7675,8 @@ protocol SearchProvider: Sendable {
 /// URLSession GET — no webview, no JS. Parsing lives in `DDGParser` (Core).
 struct DuckDuckGoProvider: SearchProvider {
     let name = "ddg"
+    /// Search HTML is tiny; cap the body well under the engine's page cap.
+    static let maxSearchBytes = 4 * 1024 * 1024
     func isConfigured(keys: [String: String]) -> Bool { true }  // always available
 
     func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
@@ -7628,6 +7700,14 @@ struct DuckDuckGoProvider: SearchProvider {
             do {
                 let (data, response) = try await URLSession.shared.data(for: req)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                // Reject an oversized response up-front (Content-Length) or after read.
+                let declared = (response as? HTTPURLResponse)?.expectedContentLength
+                if let len = declared, len > 0, SizeGuard.rejectByContentLength(Int(len), max: Self.maxSearchBytes) {
+                    lastError = WebEngineError.tooLarge(Int(len)); continue
+                }
+                if SizeGuard.exceeds(received: data.count, max: Self.maxSearchBytes) {
+                    lastError = WebEngineError.tooLarge(data.count); continue
+                }
                 guard status == 200, let html = String(data: data, encoding: .utf8) else {
                     lastError = WebEngineError.searchFailed("HTTP \(status)")
                     continue
@@ -7792,8 +7872,15 @@ actor WebCache {
     }
 
     /// Fetch-or-compute with coalescing. `compute` runs at most once per key
-    /// while in flight; the result is cached for `ttl`.
-    func value(forKey key: String, ttl: TimeInterval, compute: @escaping @Sendable () async throws -> Data) async throws -> Data {
+    /// while in flight; the result is cached for `ttl` ONLY when `shouldStore`
+    /// returns true (default: always). A transient bad render (e.g. empty
+    /// Markdown) can thus be returned to THIS caller without poisoning the cache.
+    func value(
+        forKey key: String,
+        ttl: TimeInterval,
+        shouldStore: @escaping @Sendable (Data) -> Bool = { _ in true },
+        compute: @escaping @Sendable () async throws -> Data
+    ) async throws -> Data {
         // Fresh memory hit?
         if let e = memory[key], e.isFresh {
             touch(key)
@@ -7806,15 +7893,13 @@ actor WebCache {
         let task = Task { try await compute() }
         inFlight[key] = task
         defer { inFlight[key] = nil }
-        do {
-            let data = try await task.value
+        let data = try await task.value
+        if shouldStore(data) {
             memory[key] = Entry(data: data, storedAt: Date(), ttl: ttl)
             touch(key)
             evictIfNeeded()
-            return data
-        } catch {
-            throw error
         }
+        return data
     }
 
     /// Path for an on-disk artifact (e.g. a screenshot PNG) under the cache dir.
@@ -7865,8 +7950,38 @@ final class WebEngine {
 
     // MARK: SSRF gate
 
+    /// Core SSRF host check, FAIL-CLOSED. Returns nil when the host is safe to
+    /// fetch, or a reason string when it must be blocked.
+    ///
+    /// Rules (in order):
+    ///   - TEST-ONLY loopback escape hatch (env-gated; never set in the app).
+    ///   - obvious-local literal host (localhost / *.local / *.internal / IP literal) → block.
+    ///   - resolve via getaddrinfo: ZERO resolved addresses → block (FAIL CLOSED —
+    ///     a non-resolving name is not provably public).
+    ///   - ANY resolved address private/loopback/metadata → block (require ALL public).
+    ///
+    /// Residual DNS-rebinding risk: WebKit resolves independently of us, so this
+    /// is TOCTOU. Mitigated by re-checking redirects + the response URL and
+    /// capping redirects; full per-socket IP pinning is a tracked follow-up.
+    private func ssrfBlockReason(for url: URL) -> String? {
+        guard SafetyGuard.isSchemeAllowed(url) else { return "scheme \(url.scheme ?? "(none)")" }
+        guard let host = url.host, !host.isEmpty else { return "no host" }
+        if SafetyGuard.isTestLoopback(host: host, port: url.port) { return nil }
+        if SafetyGuard.isLiteralHostBlocked(host) { return host }
+        let addrs = DNSResolver.resolve(host)
+        if addrs.isEmpty {
+            // FAIL CLOSED: an unresolvable, non-literal host is not provably public.
+            return "\(host) (unresolvable)"
+        }
+        // Require EVERY resolved address to be public.
+        for ip in addrs where SafetyGuard.isBlockedIP(ip) {
+            return "\(host) -> \(ip)"
+        }
+        return nil
+    }
+
     /// Validate a URL's scheme + resolved IP BEFORE navigation. Throws on any
-    /// blocked scheme/host. Returns the validated URL.
+    /// blocked scheme/host.
     private func guardURL(_ url: URL) throws {
         guard SafetyGuard.isSchemeAllowed(url) else {
             throw WebEngineError.blockedScheme(url.scheme ?? "(none)")
@@ -7874,59 +7989,48 @@ final class WebEngine {
         guard let host = url.host, !host.isEmpty else {
             throw WebEngineError.invalidURL(url.absoluteString)
         }
-        // TEST-ONLY: allow the allowlisted loopback fixture port (never set in the app).
-        if SafetyGuard.isTestLoopback(host: host, port: url.port) { return }
-        // Literal-host / obvious-local check (no DNS).
-        if SafetyGuard.isLiteralHostBlocked(host) {
-            throw WebEngineError.blockedHost(host)
-        }
-        // Resolve the host and reject if ANY resolved address is blocked.
-        let addrs = DNSResolver.resolve(host)
-        if addrs.isEmpty {
-            // Could not resolve — if it's not a literal IP, let WebKit try, but a
-            // literal that failed parsing above is fine. Conservative: allow named
-            // hosts that don't resolve here (WebKit will fail the load safely).
-            return
-        }
-        for ip in addrs where SafetyGuard.isBlockedIP(ip) {
-            throw WebEngineError.blockedHost("\(host) -> \(ip)")
+        if let reason = ssrfBlockReason(for: url) {
+            throw WebEngineError.blockedHost(reason)
         }
     }
 
-    /// A synchronous policy closure used inside `decidePolicyFor` so redirects
-    /// to internal IPs are blocked mid-navigation. Returns true if allowed.
+    /// A synchronous policy closure used inside `decidePolicyFor` (and the
+    /// response check) so redirects / responses to internal IPs are blocked
+    /// mid-navigation. Returns true if allowed (fail-closed via `ssrfBlockReason`).
     private func redirectAllowed(_ url: URL) -> Bool {
-        guard SafetyGuard.isSchemeAllowed(url) else { return false }
-        guard let host = url.host, !host.isEmpty else { return false }
-        // TEST-ONLY: allow the allowlisted loopback fixture port (never set in the app).
-        if SafetyGuard.isTestLoopback(host: host, port: url.port) { return true }
-        if SafetyGuard.isLiteralHostBlocked(host) { return false }
-        let addrs = DNSResolver.resolve(host)
-        for ip in addrs where SafetyGuard.isBlockedIP(ip) { return false }
-        return true
+        return ssrfBlockReason(for: url) == nil
     }
 
     // MARK: Load + settle
 
     /// Navigate `webView` to `url`, wait for didFinish, then poll readyState and
     /// apply a bounded settle. Enforces SSRF on the initial request + redirects.
-    private func loadAndSettle(_ webView: WKWebView, url: URL) async throws {
+    /// Navigate + settle; returns the real main-frame HTTP status (0 if unknown).
+    @discardableResult
+    private func loadAndSettle(_ webView: WKWebView, url: URL) async throws -> Int {
         let bridge = NavigationBridge()
         bridge.policyCheck = { [weak self] u in self?.redirectAllowed(u) ?? false }
+        bridge.responseHostCheck = { [weak self] u in self?.redirectAllowed(u) ?? false }
+        bridge.maxBytes = config.webMaxBytes
         webView.navigationDelegate = bridge
         try await bridge.wait {
             webView.load(URLRequest(url: url))
         }
-        // Poll readyState == complete (bounded).
+        // Poll readyState == complete (bounded). Check cancellation explicitly so
+        // a renderer-pool timeout propagates out (the pool's `defer` then releases
+        // the permit instead of hanging); a transient JS-eval error is tolerated,
+        // but the `Task.sleep` uses plain `try` so cancellation isn't swallowed.
         let deadline = Date().addingTimeInterval(3.0)
         while Date() < deadline {
-            let state = try? await webView.evaluateJavaScript(WebJS.readyStateScript) as? String
+            try Task.checkCancellation()
+            let state = (try? await webView.evaluateJavaScript(WebJS.readyStateScript)) as? String
             if state == "complete" { break }
-            try? await Task.sleep(nanoseconds: 80_000_000)
+            try await Task.sleep(nanoseconds: 80_000_000)
         }
-        // Bounded settle.
+        // Bounded settle. Plain `try` so cancellation surfaces.
         let settleNs = UInt64(max(0, config.webSettleMs)) * 1_000_000
-        if settleNs > 0 { try? await Task.sleep(nanoseconds: settleNs) }
+        if settleNs > 0 { try await Task.sleep(nanoseconds: settleNs) }
+        return bridge.httpStatus
     }
 
     // MARK: search
@@ -7948,7 +8052,7 @@ final class WebEngine {
     func open(_ url: URL) async throws -> OpenResult {
         try guardURL(url)
         return try await pool.withRenderer(readMode: false) { webView in
-            try await self.loadAndSettle(webView, url: url)
+            let status = try await self.loadAndSettle(webView, url: url)
             let finalURL = webView.url?.absoluteString ?? url.absoluteString
             let title = (try? await webView.evaluateJavaScript("document.title") as? String) ?? ""
             let probeRaw = (try? await webView.evaluateJavaScript(WebJS.openProbeScript) as? String) ?? "{}"
@@ -7957,27 +8061,44 @@ final class WebEngine {
                let obj = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] {
                 preview = String((obj["text"] as? String ?? "").prefix(500))
             }
-            return OpenResult(finalURL: finalURL, status: 200, title: title, preview: preview)
+            // Real HTTP status (0 → unknown, e.g. non-HTTP); fall back to 200 only
+            // when WebKit gave us nothing.
+            return OpenResult(finalURL: finalURL, status: status > 0 ? status : 200, title: title, preview: preview)
         }
     }
 
     // MARK: read
 
+    /// Minimum char count for a read to be cached. A render that yields fewer
+    /// chars is returned to the caller but NOT cached, so a transient bad render
+    /// doesn't poison the 15-min cache. Plain `nonisolated` so the @Sendable
+    /// cache predicate can read it.
+    nonisolated static let minCacheableReadChars = 20
+
     func read(_ url: URL, maxChars: Int) async throws -> ReadResult {
         try guardURL(url)
         let cap = maxChars > 0 ? maxChars : config.webReadMaxChars
         let key = WebCache.key(method: "GET", url: url.absoluteString, variant: "read:\(cap)")
-        let data = try await cache.value(forKey: key, ttl: 900) { [self] in
-            let result = try await self.performRead(url: url, maxChars: cap)
-            return (try? JSONEncoder().encode(result)) ?? Data("{}".utf8)
-        }
+        let minChars = WebEngine.minCacheableReadChars   // capture for the @Sendable closure
+        let data = try await cache.value(
+            forKey: key,
+            ttl: 900,
+            shouldStore: { d in
+                // Only cache a substantial result (decode + check charCount).
+                guard let r = try? JSONDecoder().decode(ReadResult.self, from: d) else { return false }
+                return r.charCount >= minChars
+            },
+            compute: { [self] in
+                let result = try await self.performRead(url: url, maxChars: cap)
+                return (try? JSONEncoder().encode(result)) ?? Data("{}".utf8)
+            })
         if let decoded = try? JSONDecoder().decode(ReadResult.self, from: data) { return decoded }
         throw WebEngineError.noContent
     }
 
     private func performRead(url: URL, maxChars: Int) async throws -> ReadResult {
         return try await pool.withRenderer(readMode: true) { webView in
-            try await self.loadAndSettle(webView, url: url)
+            let status = try await self.loadAndSettle(webView, url: url)
             let finalURL = webView.url?.absoluteString ?? url.absoluteString
             let script = WebJS.extractScript(dropImages: true)
             let raw = (try? await webView.evaluateJavaScript(script) as? String) ?? "{}"
@@ -7995,7 +8116,7 @@ final class WebEngine {
             markdown = MarkdownSanitizer.collapseWhitespace(markdown)
             let (capped, truncated) = MarkdownSanitizer.truncate(markdown, maxChars: maxChars)
             return ReadResult(
-                finalURL: finalURL, status: 200, title: title,
+                finalURL: finalURL, status: status > 0 ? status : 200, title: title,
                 byline: byline, siteName: siteName,
                 markdown: capped, charCount: capped.count, truncated: truncated)
         }
@@ -8019,16 +8140,27 @@ final class WebEngine {
             try await self.loadAndSettle(webView, url: url)
             let finalURL = webView.url?.absoluteString ?? url.absoluteString
 
+            // Full-page height cap. Lowered from 20000 → 12000 to bound the
+            // bitmap memory spike (1280 × 12000 × 4 bytes ≈ 61 MB).
+            let maxFullPageHeight = 12000
             var targetHeight = 2000
             if fullPage {
-                if let h = try? await webView.evaluateJavaScript(WebJS.scrollHeightScript) as? Int {
-                    targetHeight = min(max(h, 400), 20000)
-                } else if let hd = try? await webView.evaluateJavaScript(WebJS.scrollHeightScript) as? Double {
-                    targetHeight = min(max(Int(hd), 400), 20000)
+                // Evaluate scrollHeight ONCE; it can come back as Int or Double.
+                let raw = try? await webView.evaluateJavaScript(WebJS.scrollHeightScript)
+                if let h = raw as? Int {
+                    targetHeight = min(max(h, 400), maxFullPageHeight)
+                } else if let hd = raw as? Double {
+                    targetHeight = min(max(Int(hd), 400), maxFullPageHeight)
+                } else if let hn = raw as? NSNumber {
+                    targetHeight = min(max(hn.intValue, 400), maxFullPageHeight)
+                } else {
+                    // Could not read the scroll height — log and fall back to the
+                    // default viewport height instead of silently guessing.
+                    Logger.shared.log("screenshot: scrollHeight unreadable (got \(String(describing: raw))); falling back to \(targetHeight)px")
                 }
                 webView.frame = NSRect(x: 0, y: 0, width: 1280, height: targetHeight)
                 // Let layout settle after resize.
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                try await Task.sleep(nanoseconds: 250_000_000)
             }
 
             let png = try await self.snapshotPNG(webView, height: targetHeight, fullPage: fullPage)

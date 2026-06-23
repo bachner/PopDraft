@@ -151,6 +151,25 @@ test("DDG lite parsing from fixture + uddg decode + dedupe") {
     assert(!results.contains(where: { $0.url.contains("settings") }), "non-result anchor ignored")
 }
 
+test("DDG snippet pairing bounded to before next anchor") {
+    // Result #1 has a snippet; result #2 has NO snippet of its own — it must NOT
+    // borrow result #3's snippet (it should be empty).
+    let html = """
+    <table>
+      <tr><td><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2F1" class="result-link">First</a></td></tr>
+      <tr><td class="result-snippet">snippet for first result</td></tr>
+      <tr><td><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com%2F2" class="result-link">Second</a></td></tr>
+      <tr><td><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com%2F3" class="result-link">Third</a></td></tr>
+      <tr><td class="result-snippet">snippet for third result</td></tr>
+    </table>
+    """
+    let r = DDGParser.parseLite(html, maxResults: 10)
+    assert(r.count == 3, "three results, got \(r.count)")
+    assert(r[0].snippet == "snippet for first result", "first gets its own snippet")
+    assert(r[1].snippet == "", "second (no snippet) does NOT borrow third's, got '\(r[1].snippet)'")
+    assert(r[2].snippet == "snippet for third result", "third gets its own snippet")
+}
+
 test("DDG uddg redirect decoding directly") {
     let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Ffoo.bar%2Fbaz%3Fx%3D1&rut=z"
     assert(DDGParser.decodeRedirect(href) == "https://foo.bar/baz?x=1", "decodeRedirect")
