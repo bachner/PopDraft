@@ -1,0 +1,12 @@
+{
+  "master_seed": 20260624,
+  "counts": {
+    "text_actions": 900,
+    "web_research": 500,
+    "tool_calling": 500,
+    "mac_control_safety": 250,
+    "adversarial_injection": 200,
+    "refusal_safety": 150
+  },
+  "total": 2500
+}
