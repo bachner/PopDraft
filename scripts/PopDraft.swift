@@ -36,6 +36,102 @@ struct AppVersion {
     private static let buildDate: Date = Date()
 }
 
+// MARK: - App Assets
+
+/// Loads bespoke brand PNGs bundled at `Contents/Resources/Assets/`.
+///
+/// Every accessor is nil-safe: when PopDraft runs as a bare binary from the
+/// `install.sh` source-install (no `.app` bundle, no `Assets/` directory) all
+/// of these return `nil` and callers fall back to SF Symbols / code-drawn art.
+enum AppAssets {
+    /// Looks up a PNG named `<name>.png` inside the bundle's `Assets/` subdirectory.
+    private static func image(named name: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "png", subdirectory: "Assets") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }
+
+    /// Standalone orb bubble (used by the corner bubble in a later PR).
+    static var bubbleOrb: NSImage? { image(named: "popdraft-bubble") }
+
+    /// Onboarding hero illustration (used by onboarding in a later PR).
+    static var onboardingHero: NSImage? { image(named: "popdraft-onboarding-hero") }
+
+    /// Full colorful app-icon orb (e.g. for an About panel).
+    static var appIconImage: NSImage? { image(named: "popdraft-app-icon") }
+
+    /// Sheet of icon variants.
+    static var iconSet: NSImage? { image(named: "popdraft-icon-set") }
+}
+
+// MARK: - Menu Bar Glyph
+
+enum MenuBarGlyph {
+    /// Draws a bespoke, on-brand monochrome template glyph for the menu bar:
+    /// the orb silhouette (a stroked circle) with a small 4-point sparkle at the
+    /// upper-right, echoing the colorful brand orb. Returned as a template image
+    /// so AppKit tints it correctly for light/dark menu bars and active states.
+    ///
+    /// The colorful orb PNG cannot be used here because template images must be
+    /// monochrome, and rasterizing the orb to ~18px looks muddy.
+    static func template(size: CGFloat = 18) -> NSImage? {
+        let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            draw(in: rect)
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    /// Renders the same glyph onto a flat color (non-template) for previews.
+    static func preview(size: CGFloat = 128, color: NSColor = .black) -> NSImage {
+        return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            color.setStroke()
+            color.setFill()
+            draw(in: rect)
+            return true
+        }
+    }
+
+    /// Shared vector drawing for both the template and the preview. Uses the
+    /// current fill/stroke colors so the template path tints automatically.
+    private static func draw(in rect: NSRect) {
+        let w = rect.width
+        let h = rect.height
+        let unit = min(w, h)
+        let lineWidth = max(1.0, unit * 0.085)
+
+        // Orb: a stroked circle, inset to leave room for the sparkle + stroke.
+        let inset = lineWidth + unit * 0.12
+        let orbRect = NSRect(
+            x: rect.minX + inset,
+            y: rect.minY + inset,
+            width: w - inset * 2,
+            height: h - inset * 2
+        )
+        let orb = NSBezierPath(ovalIn: orbRect)
+        orb.lineWidth = lineWidth
+        orb.stroke()
+
+        // Sparkle: a 4-point star at the upper-right, echoing the brand orb.
+        let sparkleCenter = NSPoint(x: rect.maxX - unit * 0.16, y: rect.maxY - unit * 0.16)
+        let arm = unit * 0.16      // tip distance from center
+        let waist = unit * 0.045   // half-width at the pinched waist
+        let s = NSBezierPath()
+        s.move(to: NSPoint(x: sparkleCenter.x, y: sparkleCenter.y + arm))          // top tip
+        s.line(to: NSPoint(x: sparkleCenter.x + waist, y: sparkleCenter.y + waist))
+        s.line(to: NSPoint(x: sparkleCenter.x + arm, y: sparkleCenter.y))          // right tip
+        s.line(to: NSPoint(x: sparkleCenter.x + waist, y: sparkleCenter.y - waist))
+        s.line(to: NSPoint(x: sparkleCenter.x, y: sparkleCenter.y - arm))          // bottom tip
+        s.line(to: NSPoint(x: sparkleCenter.x - waist, y: sparkleCenter.y - waist))
+        s.line(to: NSPoint(x: sparkleCenter.x - arm, y: sparkleCenter.y))          // left tip
+        s.line(to: NSPoint(x: sparkleCenter.x - waist, y: sparkleCenter.y + waist))
+        s.close()
+        s.fill()
+    }
+}
+
 // MARK: - Logger
 
 class Logger {
@@ -5657,8 +5753,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "PopDraft")
-            button.image?.isTemplate = true
+            // Bespoke code-drawn template glyph (orb + sparkle) that adapts to
+            // light/dark menu bars. Fall back to the SF Symbol only if drawing
+            // somehow returns nil.
+            if let glyph = MenuBarGlyph.template() {
+                button.image = glyph
+            } else {
+                button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "PopDraft")
+                button.image?.isTemplate = true
+            }
         }
 
         // Create menu
@@ -5840,6 +5943,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "PopDraft"
         alert.informativeText = "Version: \(AppVersion.current)\n\nSystem-wide AI text processing for macOS.\n\nUsage:\n1. Select text in any app\n2. Press Option+Space\n3. Select an action\n4. Review result and Copy\n\nProvider: \(LLMClient.shared.providerName)\nModel: \(LLMClient.shared.currentModel)\n\nBuilt by Ofer Bachner"
+        // Use the bespoke brand orb when bundled; nil-safe (falls back to the
+        // app's default icon when running as a bare source-install binary).
+        if let icon = AppAssets.appIconImage {
+            alert.icon = icon
+        }
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

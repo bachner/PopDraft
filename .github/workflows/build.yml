@@ -63,6 +63,8 @@ jobs:
             '<dict>' \
             '    <key>CFBundleExecutable</key>' \
             '    <string>PopDraft</string>' \
+            '    <key>CFBundleIconFile</key>' \
+            '    <string>AppIcon</string>' \
             '    <key>CFBundleIdentifier</key>' \
             '    <string>com.popdraft.app</string>' \
             '    <key>CFBundleName</key>' \
@@ -87,10 +89,15 @@ jobs:
             '</plist>' > "${APP_BUNDLE}/Contents/Info.plist"
 
           # Copy resources (minimal - just what's needed)
+          cp resources/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/"
           cp scripts/llm-tts-server.py "${APP_BUNDLE}/Contents/Resources/"
           cp install.sh "${APP_BUNDLE}/Contents/Resources/"
           cp uninstall.sh "${APP_BUNDLE}/Contents/Resources/"
           cp README.md "${APP_BUNDLE}/Contents/Resources/"
+
+          # Copy bespoke brand PNGs (loaded at runtime by AppAssets)
+          mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
+          cp design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
 
           # Create Applications symlink
           ln -s /Applications "${BUILD_DIR}/Applications"
