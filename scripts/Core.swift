@@ -2267,6 +2267,40 @@ enum JSONSchema {
     }
 }
 
+// MARK: - Tool progress (UI streaming hook)
+
+/// A progress event emitted by `AgentLoop` as it dispatches tool calls, so a UI
+/// (PR8's chat) can show a live "running → done/error" card per call WITHOUT the
+/// pure loop taking a hard UI dependency. The hook is an optional injected
+/// closure; when `nil` the loop behaves exactly as before (the existing
+/// agentloop/toolrunner tests pass an unchanged signature via the trailing
+/// `call:` argument and never see this).
+///
+/// Each tool call surfaces two events keyed by a stable `callKey` (the loop's
+/// positional id — `pc.id` or `call_<i>` when blank — so duplicate/blank ids a
+/// small local model emits don't collide):
+///   - `.started`  → a "running" card with the tool name + raw arguments,
+///   - `.finished` → that card flips to done/error with a compact result string.
+struct ToolProgressEvent: Sendable {
+    enum Phase: Sendable {
+        case started
+        case finished(content: String, isError: Bool)
+    }
+    /// Stable per-call key (matches the emitted `role:"tool"` message's id).
+    var callKey: String
+    /// The tool name (e.g. `web_search`).
+    var name: String
+    /// The raw `arguments` JSON string for the call (for an args summary).
+    var arguments: String
+    /// 0-based index of this call within its assistant turn's batch.
+    var index: Int
+    var phase: Phase
+}
+
+/// The injected progress sink. `Sendable` so it can be captured by the loop and
+/// fired from an async context. Optional — `nil` disables progress entirely.
+typealias ToolProgressHook = @Sendable (ToolProgressEvent) -> Void
+
 // MARK: - AgentLoop (orchestrator)
 
 /// The tool-calling agent loop. `call` is INJECTED so tests can stub the model:
@@ -2304,7 +2338,18 @@ struct AgentLoop {
     /// Run the loop. `registry` supplies tools + the `tools` array; `call` is the
     /// (stubbed-in-tests) model. The returned `ChatSession` has all assistant and
     /// tool messages appended.
-    func run(session: ChatSession, registry: ToolRegistry, call: ModelCall) async throws -> Outcome {
+    ///
+    /// `onProgress` is an OPTIONAL injected sink (default `nil`): when set, the
+    /// loop emits a `.started` then a `.finished` `ToolProgressEvent` per tool
+    /// call so a UI can render live tool cards. It carries NO UI dependency — the
+    /// pure core stays testable, and the existing tests (which omit it) are
+    /// unaffected because they pass `call:` by its label.
+    func run(
+        session: ChatSession,
+        registry: ToolRegistry,
+        call: ModelCall,
+        onProgress: ToolProgressHook? = nil
+    ) async throws -> Outcome {
         var working = session
         let toolsJSON = await registry.openAITools()
         var lastText = ""
@@ -2334,6 +2379,18 @@ struct AgentLoop {
                 content: turn.content ?? "",
                 toolCalls: toolCalls,
                 thinking: turn.thinking))
+
+            // Notify the UI a batch of tool calls is starting (one "running" card
+            // each), keyed by the same positional id we'll stamp on the tool
+            // messages below.
+            if let onProgress = onProgress {
+                for (i, pc) in turn.toolCalls.enumerated() {
+                    let key = pc.id.isEmpty ? "call_\(i)" : pc.id
+                    onProgress(ToolProgressEvent(
+                        callKey: key, name: pc.name,
+                        arguments: pc.argumentsJSONString, index: i, phase: .started))
+                }
+            }
 
             // Schema-validate each call. Invalid ones get an isError tool message
             // (the model can retry) and are NOT dispatched to the runner.
@@ -2393,6 +2450,11 @@ struct AgentLoop {
                     content: result.content,
                     toolCallId: toolCallId,
                     isError: result.isError ? true : nil))
+                // Flip the running card to done/error with a compact result.
+                onProgress?(ToolProgressEvent(
+                    callKey: toolCallId, name: pc.name,
+                    arguments: pc.argumentsJSONString, index: i,
+                    phase: .finished(content: result.content, isError: result.isError)))
             }
 
             // Keep the partial assistant text (if any) as the latest answer.
