@@ -1284,12 +1284,29 @@ enum SafetyGuard {
     }
 
     /// Parse a dotted-quad IPv4 into 4 octets, or nil.
+    ///
+    /// Decimal-only and canonical: a leading-zero octet (`0177`, `010`) or a
+    /// hex octet (`0x7f`) returns nil so the literal is NOT classified here as a
+    /// bare IPv4. This matters for the SSRF guard: `inet_aton` (used by
+    /// CFNetwork/WebKit) reads `0177.0.0.1` as OCTAL → `127.0.0.1` (loopback),
+    /// whereas a naive `Int("0177")` reads decimal 177 (a public address). By
+    /// rejecting such forms we avoid mis-classifying them as public; they fall
+    /// through to `getaddrinfo`, which canonicalizes them correctly and lets the
+    /// resolved-IP check block the real (loopback) destination.
     static func parseIPv4(_ s: String) -> [Int]? {
         let parts = s.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4 else { return nil }
         var octets: [Int] = []
         for p in parts {
-            guard !p.isEmpty, p.allSatisfy({ $0.isNumber }), let n = Int(p), n >= 0, n <= 255 else { return nil }
+            guard !p.isEmpty, p.allSatisfy({ $0.isNumber }) else { return nil }
+            // Reject non-canonical octets that other resolvers read as octal/hex:
+            // a leading zero with more digits (`0177`, `010`) or any `0x`/`0X`
+            // prefix. `"0"` itself is fine. (allSatisfy isNumber already excludes
+            // the `x`, but keep the check explicit and future-proof.)
+            if p.count > 1 && p.first == "0" { return nil }
+            let lower = p.lowercased()
+            if lower.hasPrefix("0x") { return nil }
+            guard let n = Int(p), n >= 0, n <= 255 else { return nil }
             octets.append(n)
         }
         return octets

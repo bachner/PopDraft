@@ -112,6 +112,37 @@ test("pinnedAddress test-loopback hatch") {
     } else { assert(false, "non-loopback must be rejected under the loopback hatch") }
 }
 
+// MARK: - parseIPv4 canonical-form (leading-zero / hex octal rebinding guard)
+
+test("parseIPv4 rejects non-canonical octets (octal/hex)") {
+    // Leading-zero octets are read as OCTAL by inet_aton (CFNetwork/WebKit), so
+    // they must NOT parse as a bare decimal IPv4 here — else 0177.0.0.1 (=127.x
+    // loopback) would be mis-classified as public 177.x on the macOS-13 backstop.
+    assert(SafetyGuard.parseIPv4("0177.0.0.1") == nil, "0177.0.0.1 (octal loopback) rejected")
+    assert(SafetyGuard.parseIPv4("010.0.0.1") == nil, "010.0.0.1 (leading-zero) rejected")
+    assert(SafetyGuard.parseIPv4("0x7f.0.0.1") == nil, "0x7f.0.0.1 (hex) rejected")
+    assert(SafetyGuard.parseIPv4("127.0.0.01") == nil, "trailing leading-zero octet rejected")
+
+    // Canonical addresses still parse to the right octets (no regression).
+    assert(SafetyGuard.parseIPv4("127.0.0.1") == [127, 0, 0, 1], "127.0.0.1 parses")
+    assert(SafetyGuard.parseIPv4("10.0.0.5") == [10, 0, 0, 5], "10.0.0.5 parses")
+    assert(SafetyGuard.parseIPv4("192.168.1.1") == [192, 168, 1, 1], "192.168.1.1 parses")
+    assert(SafetyGuard.parseIPv4("8.8.8.8") == [8, 8, 8, 8], "8.8.8.8 parses")
+    assert(SafetyGuard.parseIPv4("0.0.0.0") == [0, 0, 0, 0], "0.0.0.0 parses (single 0 octets ok)")
+    assert(SafetyGuard.parseIPv4("169.254.169.254") == [169, 254, 169, 254], "metadata IP parses")
+}
+
+test("octal-loopback literal is not classified as public") {
+    // parseIPv4 now returns nil for the octal form, so it is NOT treated as a
+    // bare IPv4 — isLiteralHostBlocked falls through to the resolving caller,
+    // which getaddrinfo-normalizes it to 127.0.0.1 and blocks the resolved IP.
+    assert(SafetyGuard.parseIPv4("0177.0.0.1") == nil, "octal literal not a bare IPv4")
+    // The realistic flow: the RESOLVED loopback address is rejected by the pin.
+    if case .blocked = SafetyGuard.pinnedAddress(forResolved: ["127.0.0.1"]) {
+        assert(true, "resolved octal-loopback (127.0.0.1) is blocked")
+    } else { assert(false, "127.0.0.1 must be blocked") }
+}
+
 // MARK: - ProxyParser.parseConnect
 
 test("parseConnect host:port") {
