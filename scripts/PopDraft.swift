@@ -3693,8 +3693,8 @@ struct SettingsView: View {
 
     private func chipText(for v: ModelValidation) -> String {
         if v.state == .valid {
-            // Show the best (smallest) quant + size as a hint.
-            if let f = hfFiles.min(by: { $0.sizeBytes < $1.sizeBytes }) {
+            // Show the smallest known-size quant + size as a hint (skip 0-byte/unknown).
+            if let f = smallestUsableFile(hfFiles) ?? hfFiles.first {
                 let size = f.sizeBytes > 0 ? " · \(f.sizeBytes.humanReadableSize)" : ""
                 let quant = f.quant.isEmpty ? "" : " · \(f.quant)"
                 return "Found on Hugging Face\(quant)\(size)"
@@ -3766,9 +3766,15 @@ struct SettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    Text("Selecting a model here sets it as the active model for \(cloudProvider.displayName).")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
+                    if cloudProviderCanBeActive {
+                        Text("Selecting a model here sets it as the active model for \(cloudProvider.displayName).")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("\(cloudProvider.displayName) is saved for use in Agent mode (coming soon) — it can't be the active single-shot model yet.")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                    }
                 }
                 .onChange(of: cloudSelectedModel) { _, newValue in
                     applyCloudModelSelection(newValue)
@@ -3777,11 +3783,20 @@ struct SettingsView: View {
         }
     }
 
+    /// PR3 only routes single-shot generation to OpenAI (api.openai.com) and Anthropic.
+    /// Gemini/OpenRouter keys are validated + stored, but can't be the ACTIVE model yet
+    /// (full routing arrives in PR7). This guards against clobbering the OpenAI config.
+    private var cloudProviderCanBeActive: Bool {
+        cloudProvider == .openai || cloudProvider == .anthropic
+    }
+
     /// The key currently in the active-provider config field, used as a sensible default.
+    /// Only OpenAI/Anthropic mirror to real config; others read from providerKeys only.
     private func currentKeyForActiveProvider() -> String {
         switch cloudProvider {
-        case .openai, .gemini, .openrouter: return openaiAPIKey
+        case .openai: return openaiAPIKey
         case .anthropic: return claudeAPIKey
+        case .gemini, .openrouter: return providerKeys[cloudProvider.rawValue] ?? ""
         }
     }
 
@@ -4098,21 +4113,25 @@ struct SettingsView: View {
             hfFiles = []
             return
         }
+        // Clear stale state so the chip / quant picker don't show old data mid-debounce.
         hfValidating = true
+        hfValidation = nil
+        hfFiles = []
         hfDebounceTask = Task { [repo] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             if Task.isCancelled { return }
             let validation = await ModelValidator.validateHFRepo(repo)
-            var files: [GGUFFile] = []
-            if validation.isUsable {
-                files = await ModelValidator.listGGUFFiles(repo)
-            }
+            // `let` (not `var`) so the value isn't a mutable capture in the closures below
+            // — older CI Swift rejects capturing a mutated var in concurrent code.
+            let files: [GGUFFile] = validation.isUsable ? await ModelValidator.listGGUFFiles(repo) : []
             if Task.isCancelled { return }
             await MainActor.run {
                 hfValidating = false
                 hfValidation = validation
                 hfFiles = files
-                if let first = files.min(by: { $0.sizeBytes < $1.sizeBytes }) {
+                // Prefer the smallest file with a KNOWN size; size-unknown (0-byte) GGUFs
+                // (e.g. sharded parts) shouldn't win the default selection.
+                if let first = smallestUsableFile(files) {
                     hfSelectedFile = first.filename
                 } else if let first = files.first {
                     hfSelectedFile = first.filename
@@ -4121,10 +4140,25 @@ struct SettingsView: View {
         }
     }
 
+    /// The smallest GGUF file with a known (>0) size, used for the default quant pick.
+    private func smallestUsableFile(_ files: [GGUFFile]) -> GGUFFile? {
+        files.filter { $0.sizeBytes > 0 }.min(by: { $0.sizeBytes < $1.sizeBytes })
+    }
+
     /// Download the chosen GGUF file from the validated HF repo and register it as a user model.
     private func downloadHFModel() {
         let repo = ModelValidator.normalizeHFRepo(hfRepoInput)
         guard !repo.isEmpty, let file = hfFiles.first(where: { $0.filename == hfSelectedFile }) ?? hfFiles.first else { return }
+
+        // Security: reject any filename that isn't a plain `name.gguf` before it flows
+        // into a filesystem path or the launch-agent plist XML (path traversal / XML injection).
+        // Validate the bare last component — the local file + plist must be a safe name.
+        let baseName = (file.filename as NSString).lastPathComponent
+        guard let destFilename = ModelValidator.safeGGUFFilename(baseName) else {
+            downloadStatus = "Unsafe model filename — refusing to download."
+            isDownloadingModel = false
+            return
+        }
 
         let resolveURL = ModelValidator.hfResolveURL(repo: repo, file: file.filename)
         isDownloadingModel = true
@@ -4141,7 +4175,6 @@ struct SettingsView: View {
 
             let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
-            let destFilename = (file.filename as NSString).lastPathComponent
             let modelPath = "\(modelsDir)/\(destFilename)"
 
             DispatchQueue.main.async { self.downloadStatus = "Downloading \(destFilename)…" }
@@ -4228,12 +4261,16 @@ struct SettingsView: View {
     private func scheduleCloudValidation(_ raw: String) {
         cloudDebounceTask?.cancel()
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Mirror the key into the active provider config field so Save persists it.
-        switch cloudProvider {
-        case .openai, .gemini, .openrouter: openaiAPIKey = key
-        case .anthropic: claudeAPIKey = key
-        }
+        // Always store the key under its own provider slot.
         providerKeys[cloudProvider.rawValue] = key
+        // Only OpenAI/Anthropic mirror into the real config fields used by the
+        // single-shot path. Gemini/OpenRouter must NEVER overwrite the OpenAI key
+        // (PR3 routes single-shot only to api.openai.com / api.anthropic.com).
+        switch cloudProvider {
+        case .openai: openaiAPIKey = key
+        case .anthropic: claudeAPIKey = key
+        case .gemini, .openrouter: break
+        }
         guard key.count >= 8 else {
             cloudValidating = false
             cloudValidation = nil
@@ -4256,19 +4293,25 @@ struct SettingsView: View {
         }
     }
 
-    /// Apply the user's cloud model selection to the active config + user models list.
+    /// Apply the user's cloud model selection. Only OpenAI/Anthropic become the ACTIVE
+    /// single-shot model; Gemini/OpenRouter are only recorded in userModels (for PR7).
     private func applyCloudModelSelection(_ modelId: String) {
         guard !modelId.isEmpty else { return }
         switch cloudProvider {
-        case .openai, .gemini, .openrouter:
+        case .openai:
             openaiModel = modelId
             customOpenAIModel = modelId
         case .anthropic:
             claudeModel = modelId
             customClaudeModel = modelId
+        case .gemini, .openrouter:
+            // Do NOT touch openaiModel/claudeModel — those drive the live request path.
+            break
         }
-        let ref = ModelRef(provider: cloudProvider.llmProviderRawValue, name: modelId, quant: nil, source: "cloud")
-        if !userModels.contains(where: { $0.name == ref.name && $0.source == "cloud" }) {
+        // Record under the provider's own slot (gemini/openrouter use their own rawValue).
+        let provider = cloudProviderCanBeActive ? cloudProvider.llmProviderRawValue : cloudProvider.rawValue
+        let ref = ModelRef(provider: provider, name: modelId, quant: nil, source: "cloud")
+        if !userModels.contains(where: { $0.name == ref.name && $0.provider == ref.provider && $0.source == "cloud" }) {
             userModels.append(ref)
         }
     }
@@ -5063,12 +5106,27 @@ class DependencyManager {
         }
     }
 
+    /// Escape the five XML special characters so a value can be safely embedded
+    /// inside a plist `<string>` element.
+    static func xmlEscape(_ s: String) -> String {
+        return s
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+
     private func createLlamaLaunchAgent(model: LLMConfig.LlamaModel? = nil) {
         let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
 
         let selectedModel = model ?? getCurrentModel()
-        let modelPath = NSString(string: "~/.popdraft/models/\(selectedModel.filename)").expandingTildeInPath
+        // XML-escape the path before embedding it in the plist (defense-in-depth against
+        // a stray `<`, `&`, or quote in a model filename). PR3 also validates HF filenames
+        // up front, but the legacy download path reaches here too.
+        let rawModelPath = NSString(string: "~/.popdraft/models/\(selectedModel.filename)").expandingTildeInPath
+        let modelPath = Self.xmlEscape(rawModelPath)
         let llamaServerPath = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server")
             ? "/opt/homebrew/bin/llama-server"
             : "/usr/local/bin/llama-server"

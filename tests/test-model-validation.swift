@@ -259,6 +259,20 @@ test("normalizeHFRepo strips URL/suffix") {
     assert(ModelValidator.normalizeHFRepo("https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF") == "Qwen/Qwen2.5-7B-Instruct-GGUF", "url strip")
     assert(ModelValidator.normalizeHFRepo("Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M") == "Qwen/Qwen2.5-7B-Instruct-GGUF", "quant suffix strip")
     assert(ModelValidator.normalizeHFRepo("https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/tree/main") == "Qwen/Qwen2.5-7B-Instruct-GGUF", "tree tail strip")
+    // Regression: a URL's scheme colon (https:) must NOT be treated as a :quant suffix.
+    assert(ModelValidator.normalizeHFRepo("Qwen/Repo:Q4_K_M") == "Qwen/Repo", "bare repo:quant → owner/name")
+    assert(ModelValidator.normalizeHFRepo("https://huggingface.co/Qwen/Repo") == "Qwen/Repo", "pasted URL not mangled by scheme colon")
+    assert(ModelValidator.normalizeHFRepo("http://huggingface.co/Owner/My-Repo-GGUF/resolve/main/x.gguf") == "Owner/My-Repo-GGUF", "resolve URL tail dropped, scheme intact")
+}
+
+test("safeGGUFFilename rejects unsafe names") {
+    assert(ModelValidator.safeGGUFFilename("Qwen2.5-7B-Instruct-Q4_K_M.gguf") == "Qwen2.5-7B-Instruct-Q4_K_M.gguf", "plain ok")
+    assert(ModelValidator.safeGGUFFilename("../../etc/passwd.gguf") == nil, "path traversal rejected")
+    assert(ModelValidator.safeGGUFFilename("evil</string><x>.gguf") == nil, "xml injection rejected")
+    assert(ModelValidator.safeGGUFFilename("has space.gguf") == nil, "space rejected")
+    assert(ModelValidator.safeGGUFFilename("model.bin") == nil, "non-gguf rejected")
+    assert(ModelValidator.safeGGUFFilename(".gguf") == nil, "empty stem rejected")
+    assert(ModelValidator.safeGGUFFilename("name&co.gguf") == nil, "ampersand rejected")
 }
 
 test("hfResolveURL builds resolve link") {

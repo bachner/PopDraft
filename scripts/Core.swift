@@ -585,18 +585,26 @@ enum ModelValidator {
     /// drop a trailing `:quant`, trim whitespace and slashes.
     static func normalizeHFRepo(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Strip a leading huggingface.co URL.
+        // Note whether the original was a URL BEFORE we strip the scheme — a URL must
+        // never have its scheme colon (`https:`) mistaken for a `:quant` suffix.
+        let wasURL = s.contains("://")
+        // Strip a leading huggingface.co URL (any scheme).
         for prefix in ["https://huggingface.co/", "http://huggingface.co/", "huggingface.co/"] {
-            if s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
+            if s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)); break }
         }
-        // Drop a trailing `:Q4_K_M` quant suffix some users paste.
-        if let colon = s.firstIndex(of: ":") {
-            s = String(s[..<colon])
+        // Drop a trailing `:Q4_K_M` quant suffix — but ONLY from the final path component,
+        // and ONLY when the input wasn't a URL (whose `://` colon must be left alone).
+        if !wasURL {
+            let parts = s.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            if var last = parts.last, let colon = last.firstIndex(of: ":") {
+                last = String(last[..<colon])
+                s = (parts.dropLast() + [last]).joined(separator: "/")
+            }
         }
-        // Drop a trailing `/tree/...` or `/resolve/...` path tail, keep owner/name.
-        let parts = s.split(separator: "/").map(String.init)
-        if parts.count >= 2 {
-            s = "\(parts[0])/\(parts[1])"
+        // Keep just `owner/name`, dropping any `/tree/...` or `/resolve/...` tail.
+        let comps = s.split(separator: "/").map(String.init)
+        if comps.count >= 2 {
+            s = "\(comps[0])/\(comps[1])"
         }
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
     }
@@ -604,6 +612,22 @@ enum ModelValidator {
     /// Build the HF resolve URL for downloading a specific GGUF file.
     static func hfResolveURL(repo: String, file: String) -> String {
         return "https://huggingface.co/\(repo)/resolve/main/\(file)"
+    }
+
+    /// Validate a downloaded GGUF filename before it is written into a path or
+    /// embedded into the launch-agent plist XML. Guards against path traversal and
+    /// XML/shell injection: must match `^[A-Za-z0-9._-]+\.gguf$` (no slashes, no spaces,
+    /// no `<>&'"`). Returns the bare filename if safe, else nil.
+    static func safeGGUFFilename(_ filename: String) -> String? {
+        // Strictly enforce `^[A-Za-z0-9._-]+\.gguf$` on the WHOLE string — any slash,
+        // space, or XML metacharacter (so `../`, `</string>`, `&`) fails outright.
+        guard filename.lowercased().hasSuffix(".gguf"), filename.count <= 255 else { return nil }
+        let stem = String(filename.dropLast(5))           // strip ".gguf"
+        guard !stem.isEmpty else { return nil }            // ".gguf" alone has no name
+        if stem.hasPrefix(".") { return nil }              // reject hidden / dotfile names
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        guard filename.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        return filename
     }
 
     // MARK: - Thin async network methods (fetch → pure parse)
