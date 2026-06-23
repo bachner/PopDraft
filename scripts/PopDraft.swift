@@ -8,6 +8,8 @@
 import Cocoa
 import SwiftUI
 import Carbon.HIToolbox
+import WebKit
+import CryptoKit
 
 // MARK: - Version
 
@@ -6822,6 +6824,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Start TTS server if needed
         TTSServerManager.shared.ensureRunning()
 
+        // PR6: compile the web engine's content-blocking rules once at startup
+        // (cached by WebKit). The engine itself is lazy; this just primes it.
+        Task { @MainActor in await WebEngine.shared.warmUp() }
+
         // Ensure llama.cpp server is running if configured
         let config = LLMConfig.load()
         if config.provider == .llamacpp {
@@ -7094,6 +7100,1021 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = statusItem?.button {
             button.title = mgr.updateAvailable ? "·" : ""
         }
+    }
+}
+
+// =====================================================================
+// MARK: - PR6: Web Engine (WebKit-backed orchestration)
+//
+// An in-app, agent-optimized headless browser. The pure logic (SSRF, DDG
+// parsing, Markdown sanitizing, BM25 ranking, config knobs) lives in
+// Core.swift and is unit-tested without WebKit. This file wires that logic
+// to one persistent offscreen NSWindow hosting a bounded pool of fresh
+// WKWebViews, plus a keyless DuckDuckGo search path and an on-disk cache.
+//
+// Public entry point: `WebEngine.shared` (@MainActor) with async methods
+// search / open / read / screenshot / extract — each runnable in parallel
+// up to the renderer cap. PR7 registers these as tools.
+// =====================================================================
+
+// MARK: - Bundled JS (Readability + HTML→Markdown)
+
+/// JavaScript injected into a loaded page to (1) run a trimmed Mozilla
+/// Readability pass on a clone of the document and (2) convert the cleaned
+/// node tree to Markdown. Returns a JSON object the Swift side decodes.
+/// This is a compact, self-contained reimplementation of Readability's core
+/// scoring heuristics (no external file needed; nothing to bundle on disk).
+enum WebJS {
+    /// Returns `{title, byline, siteName, markdown, textLen}` as a JSON string,
+    /// or `{error: "..."}`. `dropImages` controls image handling.
+    static func extractScript(dropImages: Bool) -> String {
+        return """
+        (function() {
+          try {
+            function txt(n){ return (n.textContent || '').replace(/\\s+/g,' ').trim(); }
+            function tag(n){ return n.nodeType===1 ? n.tagName.toUpperCase() : ''; }
+
+            // ---- meta helpers ----
+            function meta(names){
+              for (var i=0;i<names.length;i++){
+                var m = document.querySelector('meta[property="'+names[i]+'"]') ||
+                        document.querySelector('meta[name="'+names[i]+'"]');
+                if (m && m.content) return m.content.trim();
+              }
+              return '';
+            }
+            var docTitle = (document.title||'').trim();
+            var ogTitle = meta(['og:title','twitter:title']);
+            var title = ogTitle || docTitle || '';
+            var byline = meta(['author','article:author','og:article:author']);
+            var siteName = meta(['og:site_name','application-name']) ||
+                           (location.hostname||'').replace(/^www\\./,'');
+
+            // ---- candidate scoring (trimmed Readability) ----
+            var UNLIKELY = /(combx|comment|community|disqus|extra|foot|header|menu|remark|rss|shoutbox|sidebar|sponsor|ad-break|agegate|pagination|pager|popup|nav|breadcrumb|share|social|promo|cookie|consent|subscribe|newsletter|related|recommend)/i;
+            var POSITIVE = /(article|body|content|entry|hentry|main|page|post|text|blog|story)/i;
+            var BLOCK_TAGS = {DIV:1,ARTICLE:1,SECTION:1,MAIN:1,TD:1};
+
+            function classId(n){ return ((n.className||'')+' '+(n.id||'')); }
+
+            var candidates = [];
+            var all = document.body ? document.body.getElementsByTagName('*') : [];
+            for (var i=0;i<all.length;i++){
+              var node = all[i];
+              var t = tag(node);
+              if (!BLOCK_TAGS[t]) continue;
+              var ci = classId(node);
+              if (UNLIKELY.test(ci) && !POSITIVE.test(ci)) continue;
+              // Count paragraph-ish text length.
+              var ps = node.getElementsByTagName('p');
+              var plen = 0, pcount = 0;
+              for (var j=0;j<ps.length;j++){ var tl = txt(ps[j]).length; if (tl>20){ plen += tl; pcount++; } }
+              var direct = txt(node).length;
+              var score = plen + pcount*25 + Math.min(direct/100, 50);
+              if (POSITIVE.test(ci)) score += 30;
+              if (t==='ARTICLE' || t==='MAIN') score += 40;
+              var commas = (txt(node).match(/,/g)||[]).length;
+              score += commas;
+              if (score > 25) candidates.push({node:node, score:score});
+            }
+            candidates.sort(function(a,b){return b.score-a.score;});
+
+            var root = candidates.length ? candidates[0].node :
+                       (document.querySelector('article') || document.querySelector('main') || document.body);
+            if (!root) return JSON.stringify({error:'no-root'});
+
+            // ---- HTML -> Markdown walk ----
+            var SKIP = {SCRIPT:1,STYLE:1,NOSCRIPT:1,NAV:1,ASIDE:1,FORM:1,BUTTON:1,SVG:1,IFRAME:1,FOOTER:1,HEADER:1};
+            var dropImages = \(dropImages ? "true" : "false");
+            var TRACK = /^(utm_[a-z]+|gclid|fbclid|dclid|gclsrc|msclkid|yclid|mc_cid|mc_eid|igshid|vero_id|vero_conv|_hsenc|_hsmi|mkt_tok|ref|ref_src|ref_url|spm|scm|_openstat|wt_mc|trk|trkcampaign)$/i;
+            function cleanURL(u){
+              if(!u) return '';
+              try{
+                var a=document.createElement('a'); a.href=u;
+                // Strip tracking query params, preserving the rest.
+                if (a.search && a.search.length>1){
+                  var parts = a.search.substring(1).split('&');
+                  var kept = [];
+                  for (var i=0;i<parts.length;i++){
+                    var kv = parts[i].split('=');
+                    if (!TRACK.test(kv[0])) kept.push(parts[i]);
+                  }
+                  a.search = kept.length ? ('?'+kept.join('&')) : '';
+                }
+                return a.href;
+              }catch(e){ return u; }
+            }
+            function inline(n){
+              if (n.nodeType===3) return n.nodeValue.replace(/\\s+/g,' ');
+              if (n.nodeType!==1) return '';
+              var t = tag(n);
+              if (SKIP[t]) return '';
+              var inner='';
+              for (var c=n.firstChild;c;c=c.nextSibling) inner += inline(c);
+              if (t==='STRONG'||t==='B'){ return inner.trim()? '**'+inner.trim()+'**' : ''; }
+              if (t==='EM'||t==='I'){ return inner.trim()? '*'+inner.trim()+'*' : ''; }
+              if (t==='CODE'){ return inner.trim()? '`'+inner.trim()+'`' : ''; }
+              if (t==='BR'){ return ' '; }
+              if (t==='A'){
+                var href = cleanURL(n.getAttribute('href'));
+                var label = inner.trim();
+                if (!label) return '';
+                if (!href || href.indexOf('javascript:')===0) return label;
+                return '['+label+']('+href+')';
+              }
+              if (t==='IMG'){
+                if (dropImages) return '';
+                var src = cleanURL(n.getAttribute('src'));
+                var alt = (n.getAttribute('alt')||'').trim();
+                return src ? '!['+alt+']('+src+')' : '';
+              }
+              return inner;
+            }
+            var out = [];
+            function block(n, depth){
+              if (n.nodeType===3){ var s=n.nodeValue.replace(/\\s+/g,' ').trim(); if(s) out.push(s); return; }
+              if (n.nodeType!==1) return;
+              var t = tag(n);
+              if (SKIP[t]) return;
+              var ci = classId(n);
+              if (UNLIKELY.test(ci) && !POSITIVE.test(ci) && t!=='P') return;
+              if (t==='H1'){ out.push('# '+txt(n)); return; }
+              if (t==='H2'){ out.push('## '+txt(n)); return; }
+              if (t==='H3'){ out.push('### '+txt(n)); return; }
+              if (t==='H4'){ out.push('#### '+txt(n)); return; }
+              if (t==='H5'){ out.push('##### '+txt(n)); return; }
+              if (t==='H6'){ out.push('###### '+txt(n)); return; }
+              if (t==='P'){ var p=inline(n).replace(/\\s+/g,' ').trim(); if(p) out.push(p); return; }
+              if (t==='BLOCKQUOTE'){
+                var q=''; for (var c=n.firstChild;c;c=c.nextSibling) q+=inline(c);
+                q=q.replace(/\\s+/g,' ').trim(); if(q) out.push('> '+q); return;
+              }
+              if (t==='PRE'){
+                var code = (n.textContent||'').replace(/\\s+$/,'');
+                if (code.trim()) out.push('```\\n'+code+'\\n```'); return;
+              }
+              if (t==='UL' || t==='OL'){
+                var ordered = (t==='OL'); var idx=1;
+                for (var c=n.firstChild;c;c=c.nextSibling){
+                  if (c.nodeType===1 && tag(c)==='LI'){
+                    var li=inline(c).replace(/\\s+/g,' ').trim();
+                    if (li){ out.push((ordered? (idx++)+'. ' : '- ')+li); }
+                  }
+                }
+                out.push('');
+                return;
+              }
+              if (t==='TABLE'){
+                var rows = n.querySelectorAll('tr');
+                var lines=[]; var headerDone=false;
+                for (var r=0;r<rows.length;r++){
+                  var cells = rows[r].querySelectorAll('th,td');
+                  if (!cells.length) continue;
+                  var cols=[];
+                  for (var k=0;k<cells.length;k++){ cols.push(inline(cells[k]).replace(/\\s+/g,' ').replace(/\\|/g,'\\\\|').trim()); }
+                  lines.push('| '+cols.join(' | ')+' |');
+                  if (!headerDone){ var sep=[]; for (var s2=0;s2<cols.length;s2++) sep.push('---'); lines.push('| '+sep.join(' | ')+' |'); headerDone=true; }
+                }
+                if (lines.length) out.push(lines.join('\\n'));
+                return;
+              }
+              if (t==='IMG' && !dropImages){ var im=inline(n); if(im) out.push(im); return; }
+              if (t==='FIGURE' || t==='HR'){ if(t==='HR') out.push('---'); }
+              // Recurse into generic containers.
+              for (var ch=n.firstChild;ch;ch=ch.nextSibling) block(ch, depth+1);
+            }
+            for (var c=root.firstChild;c;c=c.nextSibling) block(c, 0);
+
+            var md = out.join('\\n\\n');
+            return JSON.stringify({
+              title: title, byline: byline, siteName: siteName,
+              markdown: md, textLen: txt(root).length
+            });
+          } catch(e){
+            return JSON.stringify({error: String(e)});
+          }
+        })();
+        """
+    }
+
+    /// Tiny probe used by `open()`: returns `{title, text}` (first chunk of body text).
+    static let openProbeScript = """
+    (function(){
+      var t=(document.title||'').trim();
+      var b=document.body? (document.body.innerText||'').replace(/\\s+/g,' ').trim():'';
+      return JSON.stringify({title:t, text:b.slice(0,2000)});
+    })();
+    """
+
+    /// Returns the document's full scroll height for full-page screenshots.
+    static let scrollHeightScript = """
+    (function(){
+      var b=document.body, e=document.documentElement;
+      return Math.max(b?b.scrollHeight:0, b?b.offsetHeight:0, e?e.scrollHeight:0, e?e.offsetHeight:0, e?e.clientHeight:0);
+    })();
+    """
+
+    static let readyStateScript = "document.readyState"
+}
+
+// MARK: - Content blocking ruleset
+
+/// Compiles small `WKContentRuleList`s once at startup and caches them. Two
+/// variants: ads/trackers only (screenshots need images) and a read-mode
+/// variant that also drops image/media to save bandwidth.
+@MainActor
+final class ContentBlocker {
+    static let shared = ContentBlocker()
+
+    private var adsList: WKContentRuleList?
+    private var readList: WKContentRuleList?
+    private var compiled = false
+
+    private init() {}
+
+    /// A small bundled ad/tracker blocklist (host-suffix triggers).
+    private static let adHosts: [String] = [
+        "doubleclick.net", "googlesyndication.com", "google-analytics.com",
+        "googletagmanager.com", "googletagservices.com", "adservice.google.com",
+        "facebook.net", "connect.facebook.net", "ads-twitter.com", "analytics.twitter.com",
+        "scorecardresearch.com", "quantserve.com", "adnxs.com", "criteo.com",
+        "taboola.com", "outbrain.com", "amazon-adsystem.com", "adsrvr.org",
+        "hotjar.com", "mixpanel.com", "segment.io", "segment.com",
+        "moatads.com", "bidswitch.net", "rubiconproject.com", "pubmatic.com",
+        "openx.net", "casalemedia.com", "yieldmo.com", "branch.io",
+    ]
+
+    /// Build the JSON rule source. When `blockMedia`, also block image/media types.
+    private static func ruleJSON(blockMedia: Bool) -> String {
+        var rules: [[String: Any]] = []
+        // Block ad/tracker hosts entirely.
+        for host in adHosts {
+            let esc = host.replacingOccurrences(of: ".", with: "\\.")
+            rules.append([
+                "trigger": ["url-filter": ".*\(esc).*"],
+                "action": ["type": "block"],
+            ])
+        }
+        if blockMedia {
+            // Block images + media everywhere (read mode: we don't render).
+            rules.append([
+                "trigger": ["url-filter": ".*", "resource-type": ["image", "media"]],
+                "action": ["type": "block"],
+            ])
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: rules)) ?? Data("[]".utf8)
+        return String(data: data, encoding: .utf8) ?? "[]"
+    }
+
+    /// Compile both rule lists once (idempotent). Safe to call at startup.
+    func compileIfNeeded() async {
+        if compiled { return }
+        compiled = true
+        let store = WKContentRuleListStore.default()
+        if let store = store {
+            adsList = try? await store.compileContentRuleList(
+                forIdentifier: "popdraft-ads",
+                encodedContentRuleList: Self.ruleJSON(blockMedia: false))
+            readList = try? await store.compileContentRuleList(
+                forIdentifier: "popdraft-read",
+                encodedContentRuleList: Self.ruleJSON(blockMedia: true))
+        }
+    }
+
+    /// Ruleset for read/extract (drops images+media).
+    func readModeList() -> WKContentRuleList? { readList }
+    /// Ruleset for screenshots/open (ads only; keeps images).
+    func adsOnlyList() -> WKContentRuleList? { adsList }
+}
+
+// MARK: - Offscreen render host
+
+/// ONE persistent borderless window positioned far offscreen. WKWebViews are
+/// added as subviews with an explicit non-zero frame so they actually render
+/// (a zero-frame / detached webview snapshots blank). Never made key.
+@MainActor
+final class OffscreenRenderHost {
+    static let shared = OffscreenRenderHost()
+
+    private let window: NSWindow
+
+    private init() {
+        let frame = NSRect(x: -10000, y: -10000, width: 1400, height: 2200)
+        window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        window.level = .normal
+        window.ignoresMouseEvents = true
+        window.alphaValue = 1.0
+        window.hasShadow = false
+        let host = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        host.wantsLayer = true
+        window.contentView = host
+        // Render offscreen without stealing focus.
+        window.orderBack(nil)
+    }
+
+    /// Attach a webview as a subview with an explicit frame so it renders.
+    func attach(_ webView: WKWebView, frame: NSRect) {
+        webView.frame = frame
+        window.contentView?.addSubview(webView)
+    }
+
+    func detach(_ webView: WKWebView) {
+        webView.removeFromSuperview()
+    }
+}
+
+// MARK: - One-shot navigation delegate
+
+/// Bridges a single navigation to an async continuation: resolves on
+/// didFinish, throws on didFail / didFailProvisional / process crash, and
+/// enforces the SSRF/scheme policy on the initial request and EVERY redirect.
+@MainActor
+final class NavigationBridge: NSObject, WKNavigationDelegate {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var finished = false
+
+    /// Called for every navigation action — enforce SSRF + scheme here so a
+    /// redirect to an internal IP is blocked mid-flight.
+    var policyCheck: ((URL) -> Bool)?
+
+    func wait(_ body: () -> Void) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            self.continuation = cont
+            body()
+        }
+    }
+
+    private func resolve(_ result: Result<Void, Error>) {
+        guard !finished else { return }
+        finished = true
+        let cont = continuation
+        continuation = nil
+        switch result {
+        case .success: cont?.resume()
+        case .failure(let e): cont?.resume(throwing: e)
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        if let url = navigationAction.request.url {
+            // about:blank is allowed (reset); everything else passes the guard.
+            if url.absoluteString.lowercased() != "about:blank" {
+                if let check = policyCheck, check(url) == false {
+                    decisionHandler(.cancel)
+                    resolve(.failure(WebEngineError.blockedHost(url.host ?? url.absoluteString)))
+                    return
+                }
+            }
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        resolve(.success(()))
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        resolve(.failure(WebEngineError.renderProcessCrashed))
+    }
+}
+
+// MARK: - Async semaphore (continuation-based)
+
+/// A small FIFO async semaphore bounding concurrent renderers. MainActor-bound
+/// so its state is single-threaded by construction.
+@MainActor
+final class AsyncSemaphore {
+    private var permits: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(value: Int) { permits = max(1, value) }
+
+    func acquire() async {
+        if permits > 0 {
+            permits -= 1
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            waiters.append(cont)
+        }
+    }
+
+    func release() {
+        if !waiters.isEmpty {
+            let w = waiters.removeFirst()
+            w.resume()
+        } else {
+            permits += 1
+        }
+    }
+}
+
+// MARK: - Renderer pool
+
+/// Bounds concurrent WKWebViews. `withRenderer` acquires a permit, creates a
+/// FRESH webview (non-persistent store, desktop UA, content-blocking ruleset),
+/// attaches it offscreen, runs the body, and detaches + releases in `defer`.
+/// Recreate-per-job (no reuse). Per-job timeout cancels and stops loading.
+@MainActor
+final class RendererPool {
+    private let semaphore: AsyncSemaphore
+    private let userAgent: String
+    let navTimeoutMs: Int
+
+    init(maxRenderers: Int, navTimeoutMs: Int) {
+        self.semaphore = AsyncSemaphore(value: WebTuning.clampRenderers(maxRenderers))
+        self.navTimeoutMs = navTimeoutMs
+        self.userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    }
+
+    /// `readMode` selects the image/media-blocking ruleset; otherwise ads-only.
+    func withRenderer<T: Sendable>(
+        readMode: Bool,
+        frame: NSRect = NSRect(x: 0, y: 0, width: 1280, height: 2000),
+        _ body: @escaping @MainActor (WKWebView) async throws -> T
+    ) async throws -> T {
+        await semaphore.acquire()
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        let webView = WKWebView(frame: frame, configuration: config)
+        webView.customUserAgent = userAgent
+
+        // Attach the compiled content-blocking ruleset.
+        let blocker = ContentBlocker.shared
+        if let list = readMode ? blocker.readModeList() : blocker.adsOnlyList() {
+            webView.configuration.userContentController.add(list)
+        }
+
+        OffscreenRenderHost.shared.attach(webView, frame: frame)
+
+        // Run the body under a timeout. The timeout task cancels the body and
+        // stops loading; the body task races it.
+        defer {
+            webView.stopLoading()
+            webView.navigationDelegate = nil
+            OffscreenRenderHost.shared.detach(webView)
+            semaphore.release()
+        }
+
+        let timeoutNs = UInt64(max(1000, navTimeoutMs)) * 1_000_000
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { @MainActor in
+                try await body(webView)
+            }
+            group.addTask { @MainActor in
+                try await Task.sleep(nanoseconds: timeoutNs)
+                webView.stopLoading()
+                throw WebEngineError.timeout
+            }
+            // First to finish wins; cancel the rest.
+            guard let first = try await group.next() else {
+                throw WebEngineError.navigationFailed("no result")
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+}
+
+// MARK: - Search providers
+
+protocol SearchProvider: Sendable {
+    var name: String { get }
+    /// Returns nil if this provider is not configured (so the router can cascade).
+    func isConfigured(keys: [String: String]) -> Bool
+    func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult]
+}
+
+/// Keyless DuckDuckGo provider via the lite endpoint (HTML fallback), plain
+/// URLSession GET — no webview, no JS. Parsing lives in `DDGParser` (Core).
+struct DuckDuckGoProvider: SearchProvider {
+    let name = "ddg"
+    func isConfigured(keys: [String: String]) -> Bool { true }  // always available
+
+    func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
+        let trimmed = q.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        // Try lite first, then the html endpoint.
+        let endpoints = [
+            "https://lite.duckduckgo.com/lite/",
+            "https://html.duckduckgo.com/html/",
+        ]
+        var lastError: Error?
+        for endpoint in endpoints {
+            guard var comps = URLComponents(string: endpoint) else { continue }
+            comps.queryItems = [URLQueryItem(name: "q", value: trimmed)]
+            guard let url = comps.url else { continue }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 12
+            req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+            req.setValue("text/html", forHTTPHeaderField: "Accept")
+            do {
+                let (data, response) = try await URLSession.shared.data(for: req)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard status == 200, let html = String(data: data, encoding: .utf8) else {
+                    lastError = WebEngineError.searchFailed("HTTP \(status)")
+                    continue
+                }
+                let results = DDGParser.parseLite(html, maxResults: q.maxResults)
+                if !results.isEmpty { return results }
+                // Empty parse — try the next endpoint.
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        if let e = lastError { throw WebEngineError.searchFailed(String(describing: e)) }
+        return []
+    }
+}
+
+/// Key-based provider stubs. They declare configuration via `apiKeys` but are
+/// not yet wired to their APIs (PR-later); the router falls through to DDG.
+struct TavilyProvider: SearchProvider {
+    let name = "tavily"
+    func isConfigured(keys: [String: String]) -> Bool { !(keys["tavily"] ?? "").isEmpty }
+    func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
+        throw WebEngineError.searchFailed("tavily provider not implemented")
+    }
+}
+
+struct BraveProvider: SearchProvider {
+    let name = "brave"
+    func isConfigured(keys: [String: String]) -> Bool { !(keys["brave"] ?? "").isEmpty }
+    func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
+        throw WebEngineError.searchFailed("brave provider not implemented")
+    }
+}
+
+struct ExaProvider: SearchProvider {
+    let name = "exa"
+    func isConfigured(keys: [String: String]) -> Bool { !(keys["exa"] ?? "").isEmpty }
+    func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
+        throw WebEngineError.searchFailed("exa provider not implemented")
+    }
+}
+
+/// Cascades: a configured-key provider first, DuckDuckGo as the always-on
+/// fallback. Dedupes results by host+path. Politely rate-limited.
+actor SearchRouter {
+    private let apiKeys: [String: String]
+    private let preferred: String
+    private let ddg = DuckDuckGoProvider()
+    private let keyed: [SearchProvider]
+    private var lastRequest: Date = .distantPast
+    private let minInterval: TimeInterval = 0.5
+
+    init(apiKeys: [String: String], preferred: String) {
+        self.apiKeys = apiKeys
+        self.preferred = preferred
+        self.keyed = [TavilyProvider(), BraveProvider(), ExaProvider()]
+    }
+
+    private func rateLimit() async {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastRequest)
+        if elapsed < minInterval {
+            let waitNs = UInt64((minInterval - elapsed) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: waitNs)
+        }
+        lastRequest = Date()
+    }
+
+    func search(_ q: SearchQuery) async throws -> [SearchResult] {
+        await rateLimit()
+
+        // 1) A configured keyed provider matching the preferred name first.
+        var providers: [SearchProvider] = []
+        if let pref = keyed.first(where: { $0.name == preferred && $0.isConfigured(keys: apiKeys) }) {
+            providers.append(pref)
+        }
+        // 2) Any other configured keyed provider.
+        for p in keyed where p.isConfigured(keys: apiKeys) && p.name != preferred {
+            providers.append(p)
+        }
+        // 3) DDG always last as the keyless fallback.
+        providers.append(ddg)
+
+        var lastError: Error?
+        for p in providers {
+            do {
+                let results = try await p.search(q, keys: apiKeys)
+                if !results.isEmpty { return Self.dedupe(results, limit: q.maxResults) }
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        if let e = lastError { throw e }
+        return []
+    }
+
+    /// Dedupe by normalized host+path (drops scheme + query + trailing slash).
+    static func dedupe(_ results: [SearchResult], limit: Int) -> [SearchResult] {
+        var seen = Set<String>()
+        var out: [SearchResult] = []
+        for r in results {
+            let key: String
+            if let comps = URLComponents(string: r.url), let host = comps.host {
+                var path = comps.path
+                if path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+                key = (host + path).lowercased()
+            } else {
+                key = r.url.lowercased()
+            }
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            out.append(r)
+            if out.count >= limit { break }
+        }
+        return out
+    }
+}
+
+// MARK: - Web cache (actor)
+
+/// On-disk + in-memory cache keyed by sha256(method+url+variant), with TTLs per
+/// kind and in-flight coalescing so duplicate concurrent requests share one
+/// fetch. Bounded with simple LRU eviction.
+actor WebCache {
+    struct Entry {
+        let data: Data
+        let storedAt: Date
+        let ttl: TimeInterval
+        var isFresh: Bool { Date().timeIntervalSince(storedAt) < ttl }
+    }
+
+    private var memory: [String: Entry] = [:]
+    private var order: [String] = []                  // LRU: oldest first
+    private var inFlight: [String: Task<Data, Error>] = [:]
+    private let maxEntries: Int
+    private let diskDir: String
+
+    init(diskDir: String, maxEntries: Int = 128) {
+        self.diskDir = diskDir
+        self.maxEntries = maxEntries
+        try? FileManager.default.createDirectory(atPath: diskDir, withIntermediateDirectories: true)
+    }
+
+    static func key(method: String, url: String, variant: String) -> String {
+        let raw = "\(method)|\(url)|\(variant)"
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func touch(_ k: String) {
+        if let i = order.firstIndex(of: k) { order.remove(at: i) }
+        order.append(k)
+    }
+
+    private func evictIfNeeded() {
+        while memory.count > maxEntries, let oldest = order.first {
+            memory.removeValue(forKey: oldest)
+            order.removeFirst()
+        }
+    }
+
+    /// Fetch-or-compute with coalescing. `compute` runs at most once per key
+    /// while in flight; the result is cached for `ttl`.
+    func value(forKey key: String, ttl: TimeInterval, compute: @escaping @Sendable () async throws -> Data) async throws -> Data {
+        // Fresh memory hit?
+        if let e = memory[key], e.isFresh {
+            touch(key)
+            return e.data
+        }
+        // Coalesce concurrent identical requests.
+        if let task = inFlight[key] {
+            return try await task.value
+        }
+        let task = Task { try await compute() }
+        inFlight[key] = task
+        defer { inFlight[key] = nil }
+        do {
+            let data = try await task.value
+            memory[key] = Entry(data: data, storedAt: Date(), ttl: ttl)
+            touch(key)
+            evictIfNeeded()
+            return data
+        } catch {
+            throw error
+        }
+    }
+
+    /// Path for an on-disk artifact (e.g. a screenshot PNG) under the cache dir.
+    func diskPath(for name: String) -> String {
+        return (diskDir as NSString).appendingPathComponent(name)
+    }
+}
+
+// MARK: - WebEngine (public async API)
+
+/// The public façade. Owns the renderer pool, search router, content blocker,
+/// cache, and safety guard. All methods are async + parallel-safe up to the
+/// renderer cap. PR7 registers these as agent tools.
+@MainActor
+final class WebEngine {
+    static let shared = WebEngine()
+
+    private var pool: RendererPool
+    private var router: SearchRouter
+    private let cache: WebCache
+    private let shotsDir: String
+    private var config: AppConfig
+
+    private init() {
+        let cfg = AppConfig.load(dir: LLMConfig.configDir)
+        self.config = cfg
+        let cacheDir = (LLMConfig.configDir as NSString).appendingPathComponent("web-cache")
+        self.shotsDir = (cacheDir as NSString).appendingPathComponent("shots")
+        try? FileManager.default.createDirectory(atPath: shotsDir, withIntermediateDirectories: true)
+        self.cache = WebCache(diskDir: cacheDir)
+        self.pool = RendererPool(maxRenderers: cfg.webMaxRenderers, navTimeoutMs: cfg.webNavTimeoutMs)
+        self.router = SearchRouter(apiKeys: cfg.webSearch.apiKeys, preferred: cfg.webSearch.provider)
+    }
+
+    /// Re-read config (renderer cap, timeouts, search keys) and rebuild the pool
+    /// and router. Call after the user changes settings.
+    func reloadConfig() {
+        let cfg = AppConfig.load(dir: LLMConfig.configDir)
+        config = cfg
+        pool = RendererPool(maxRenderers: cfg.webMaxRenderers, navTimeoutMs: cfg.webNavTimeoutMs)
+        router = SearchRouter(apiKeys: cfg.webSearch.apiKeys, preferred: cfg.webSearch.provider)
+    }
+
+    /// Compile content-blocking rules at startup (call once from AppDelegate).
+    func warmUp() async {
+        await ContentBlocker.shared.compileIfNeeded()
+    }
+
+    // MARK: SSRF gate
+
+    /// Validate a URL's scheme + resolved IP BEFORE navigation. Throws on any
+    /// blocked scheme/host. Returns the validated URL.
+    private func guardURL(_ url: URL) throws {
+        guard SafetyGuard.isSchemeAllowed(url) else {
+            throw WebEngineError.blockedScheme(url.scheme ?? "(none)")
+        }
+        guard let host = url.host, !host.isEmpty else {
+            throw WebEngineError.invalidURL(url.absoluteString)
+        }
+        // TEST-ONLY: allow the allowlisted loopback fixture port (never set in the app).
+        if SafetyGuard.isTestLoopback(host: host, port: url.port) { return }
+        // Literal-host / obvious-local check (no DNS).
+        if SafetyGuard.isLiteralHostBlocked(host) {
+            throw WebEngineError.blockedHost(host)
+        }
+        // Resolve the host and reject if ANY resolved address is blocked.
+        let addrs = DNSResolver.resolve(host)
+        if addrs.isEmpty {
+            // Could not resolve — if it's not a literal IP, let WebKit try, but a
+            // literal that failed parsing above is fine. Conservative: allow named
+            // hosts that don't resolve here (WebKit will fail the load safely).
+            return
+        }
+        for ip in addrs where SafetyGuard.isBlockedIP(ip) {
+            throw WebEngineError.blockedHost("\(host) -> \(ip)")
+        }
+    }
+
+    /// A synchronous policy closure used inside `decidePolicyFor` so redirects
+    /// to internal IPs are blocked mid-navigation. Returns true if allowed.
+    private func redirectAllowed(_ url: URL) -> Bool {
+        guard SafetyGuard.isSchemeAllowed(url) else { return false }
+        guard let host = url.host, !host.isEmpty else { return false }
+        // TEST-ONLY: allow the allowlisted loopback fixture port (never set in the app).
+        if SafetyGuard.isTestLoopback(host: host, port: url.port) { return true }
+        if SafetyGuard.isLiteralHostBlocked(host) { return false }
+        let addrs = DNSResolver.resolve(host)
+        for ip in addrs where SafetyGuard.isBlockedIP(ip) { return false }
+        return true
+    }
+
+    // MARK: Load + settle
+
+    /// Navigate `webView` to `url`, wait for didFinish, then poll readyState and
+    /// apply a bounded settle. Enforces SSRF on the initial request + redirects.
+    private func loadAndSettle(_ webView: WKWebView, url: URL) async throws {
+        let bridge = NavigationBridge()
+        bridge.policyCheck = { [weak self] u in self?.redirectAllowed(u) ?? false }
+        webView.navigationDelegate = bridge
+        try await bridge.wait {
+            webView.load(URLRequest(url: url))
+        }
+        // Poll readyState == complete (bounded).
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline {
+            let state = try? await webView.evaluateJavaScript(WebJS.readyStateScript) as? String
+            if state == "complete" { break }
+            try? await Task.sleep(nanoseconds: 80_000_000)
+        }
+        // Bounded settle.
+        let settleNs = UInt64(max(0, config.webSettleMs)) * 1_000_000
+        if settleNs > 0 { try? await Task.sleep(nanoseconds: settleNs) }
+    }
+
+    // MARK: search
+
+    func search(_ q: SearchQuery) async throws -> [SearchResult] {
+        let key = WebCache.key(method: "GET", url: "search:\(q.query)", variant: "n=\(q.maxResults)")
+        // Capture sendable copies for the closure.
+        let router = self.router
+        let query = q
+        let data = try await cache.value(forKey: key, ttl: 300) {
+            let results = try await router.search(query)
+            return (try? JSONEncoder().encode(results)) ?? Data("[]".utf8)
+        }
+        return (try? JSONDecoder().decode([SearchResult].self, from: data)) ?? []
+    }
+
+    // MARK: open
+
+    func open(_ url: URL) async throws -> OpenResult {
+        try guardURL(url)
+        return try await pool.withRenderer(readMode: false) { webView in
+            try await self.loadAndSettle(webView, url: url)
+            let finalURL = webView.url?.absoluteString ?? url.absoluteString
+            let title = (try? await webView.evaluateJavaScript("document.title") as? String) ?? ""
+            let probeRaw = (try? await webView.evaluateJavaScript(WebJS.openProbeScript) as? String) ?? "{}"
+            var preview = ""
+            if let pdata = probeRaw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] {
+                preview = String((obj["text"] as? String ?? "").prefix(500))
+            }
+            return OpenResult(finalURL: finalURL, status: 200, title: title, preview: preview)
+        }
+    }
+
+    // MARK: read
+
+    func read(_ url: URL, maxChars: Int) async throws -> ReadResult {
+        try guardURL(url)
+        let cap = maxChars > 0 ? maxChars : config.webReadMaxChars
+        let key = WebCache.key(method: "GET", url: url.absoluteString, variant: "read:\(cap)")
+        let data = try await cache.value(forKey: key, ttl: 900) { [self] in
+            let result = try await self.performRead(url: url, maxChars: cap)
+            return (try? JSONEncoder().encode(result)) ?? Data("{}".utf8)
+        }
+        if let decoded = try? JSONDecoder().decode(ReadResult.self, from: data) { return decoded }
+        throw WebEngineError.noContent
+    }
+
+    private func performRead(url: URL, maxChars: Int) async throws -> ReadResult {
+        return try await pool.withRenderer(readMode: true) { webView in
+            try await self.loadAndSettle(webView, url: url)
+            let finalURL = webView.url?.absoluteString ?? url.absoluteString
+            let script = WebJS.extractScript(dropImages: true)
+            let raw = (try? await webView.evaluateJavaScript(script) as? String) ?? "{}"
+            guard let jdata = raw.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: jdata) as? [String: Any] else {
+                throw WebEngineError.noContent
+            }
+            if let err = obj["error"] as? String, !err.isEmpty, obj["markdown"] == nil {
+                throw WebEngineError.navigationFailed("extract: \(err)")
+            }
+            let title = (obj["title"] as? String) ?? ""
+            let byline = (obj["byline"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let siteName = (obj["siteName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            var markdown = (obj["markdown"] as? String) ?? ""
+            markdown = MarkdownSanitizer.collapseWhitespace(markdown)
+            let (capped, truncated) = MarkdownSanitizer.truncate(markdown, maxChars: maxChars)
+            return ReadResult(
+                finalURL: finalURL, status: 200, title: title,
+                byline: byline, siteName: siteName,
+                markdown: capped, charCount: capped.count, truncated: truncated)
+        }
+    }
+
+    // MARK: screenshot
+
+    func screenshot(_ url: URL, fullPage: Bool) async throws -> ShotResult {
+        try guardURL(url)
+        let hashName = WebCache.key(method: "GET", url: url.absoluteString, variant: "shot:\(fullPage)")
+        let path = (shotsDir as NSString).appendingPathComponent("\(hashName).png")
+        // Disk cache: if a fresh PNG exists, reuse it.
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let mod = attrs[.modificationDate] as? Date,
+           Date().timeIntervalSince(mod) < 900,
+           let img = NSImage(contentsOfFile: path) {
+            return ShotResult(finalURL: url.absoluteString, path: path, width: Int(img.size.width), height: Int(img.size.height), fullPage: fullPage)
+        }
+
+        return try await pool.withRenderer(readMode: false, frame: NSRect(x: 0, y: 0, width: 1280, height: 2000)) { webView in
+            try await self.loadAndSettle(webView, url: url)
+            let finalURL = webView.url?.absoluteString ?? url.absoluteString
+
+            var targetHeight = 2000
+            if fullPage {
+                if let h = try? await webView.evaluateJavaScript(WebJS.scrollHeightScript) as? Int {
+                    targetHeight = min(max(h, 400), 20000)
+                } else if let hd = try? await webView.evaluateJavaScript(WebJS.scrollHeightScript) as? Double {
+                    targetHeight = min(max(Int(hd), 400), 20000)
+                }
+                webView.frame = NSRect(x: 0, y: 0, width: 1280, height: targetHeight)
+                // Let layout settle after resize.
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+
+            let png = try await self.snapshotPNG(webView, height: targetHeight, fullPage: fullPage)
+            try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+            let img = NSImage(data: png)
+            let w = Int(img?.size.width ?? 1280)
+            let h = Int(img?.size.height ?? CGFloat(targetHeight))
+            return ShotResult(finalURL: finalURL, path: path, width: w, height: h, fullPage: fullPage)
+        }
+    }
+
+    /// Take a WKSnapshot and encode it as PNG.
+    private func snapshotPNG(_ webView: WKWebView, height: Int, fullPage: Bool) async throws -> Data {
+        let snapConfig = WKSnapshotConfiguration()
+        if fullPage {
+            snapConfig.rect = NSRect(x: 0, y: 0, width: 1280, height: height)
+        }
+        let image: NSImage = try await withCheckedThrowingContinuation { cont in
+            webView.takeSnapshot(with: snapConfig) { img, err in
+                if let img = img { cont.resume(returning: img) }
+                else { cont.resume(throwing: err ?? WebEngineError.noContent) }
+            }
+        }
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            throw WebEngineError.noContent
+        }
+        return png
+    }
+
+    // MARK: extract
+
+    func extract(_ url: URL, instruction: String) async throws -> ExtractResult {
+        let read = try await read(url, maxChars: config.webReadMaxChars)
+        let chunks = ChunkRanker.chunk(read.markdown)
+        let ranked = ChunkRanker.rank(chunks: chunks, instruction: instruction, limit: 5)
+        return ExtractResult(finalURL: read.finalURL, title: read.title, instruction: instruction, chunks: ranked)
+    }
+
+    // MARK: Tool schemas (re-exported for PR7)
+
+    static let webSearchToolSchema = WebToolSchemas.webSearch
+    static let webOpenToolSchema = WebToolSchemas.webOpen
+    static let webReadToolSchema = WebToolSchemas.webRead
+    static let webScreenshotToolSchema = WebToolSchemas.webScreenshot
+    static let webExtractToolSchema = WebToolSchemas.webExtract
+}
+
+// MARK: - DNS resolution (for SSRF on resolved IP)
+
+/// Resolves a hostname to its IP strings using getaddrinfo. Pure C API; returns
+/// every resolved address so SafetyGuard can reject if ANY is private/loopback.
+enum DNSResolver {
+    static func resolve(_ host: String) -> [String] {
+        // A literal IP resolves to itself.
+        if SafetyGuard.parseIPv4(host) != nil || SafetyGuard.parseIPv6(host) != nil {
+            return [host]
+        }
+        var hints = addrinfo(
+            ai_flags: 0,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: 0,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, nil, &hints, &result)
+        guard status == 0 else { return [] }
+        defer { freeaddrinfo(result) }
+
+        var addrs: [String] = []
+        var ptr = result
+        while let info = ptr {
+            let sa = info.pointee.ai_addr
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if let sa = sa,
+               getnameinfo(sa, info.pointee.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 {
+                let ip = String(cString: buffer)
+                if !ip.isEmpty { addrs.append(ip) }
+            }
+            ptr = info.pointee.ai_next
+        }
+        return addrs
     }
 }
 
