@@ -189,12 +189,14 @@ enum ActionType: String, Codable, CaseIterable {
     case llm = "llm"
     case tts = "tts"
     case command = "command"
+    case agent = "agent"   // PR7: runs the tool-calling agent loop
 
     var label: String {
         switch self {
         case .llm: return "LLM"
         case .tts: return "TTS"
         case .command: return "CMD"
+        case .agent: return "AGENT"
         }
     }
 }
@@ -1058,6 +1060,288 @@ class LLMClient {
             }
         }.resume()
     }
+
+    // MARK: - PR7: chatCompletion (agent-loop primitive)
+    //
+    // A full-message-array, tool-aware chat primitive used by the agent loop.
+    // It is a SEPARATE path from the single-shot `generate()` above (which is
+    // left untouched), so the existing menu-bar behavior is unchanged. This one
+    // is async/throwing and returns an `AssistantTurn` (content + tool_calls +
+    // thinking) so the loop can iterate. Streaming is kept simple here: text is
+    // pushed to `onTextDelta` only for the local providers that already stream;
+    // tool-call detection always uses the non-streamed body.
+
+    /// One chat-completion round. `messages` is the FULL OpenAI-style message
+    /// array (system/user/assistant/tool). `tools` is the OpenAI `tools` array
+    /// (nil → no tools). Returns the assistant turn. Throws on transport / API
+    /// errors. Provider is read from the current config (no fallback here — the
+    /// loop owns retry policy).
+    func chatCompletion(
+        messages: [ChatMessage],
+        tools: [[String: Any]]? = nil,
+        stream: Bool = false,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> AssistantTurn {
+        let provider = config.provider
+        activeProvider = provider
+        switch provider {
+        case .llamacpp:
+            return try await chatCompletionOpenAICompatible(
+                urlString: "\(config.llamacppURL)/v1/chat/completions",
+                model: nil, apiKey: nil, messages: messages, tools: tools,
+                isLlamaCpp: true, onTextDelta: onTextDelta)
+        case .ollama:
+            // Ollama's native /api/generate isn't tool-capable; use its
+            // OpenAI-compatible endpoint for the agent path.
+            return try await chatCompletionOpenAICompatible(
+                urlString: "\(config.ollamaURL)/v1/chat/completions",
+                model: config.ollamaModel, apiKey: nil, messages: messages, tools: tools,
+                isLlamaCpp: false, onTextDelta: onTextDelta)
+        case .openai:
+            guard !config.openaiAPIKey.isEmpty else {
+                throw NSError(domain: "OpenAI API key not configured", code: -1)
+            }
+            return try await chatCompletionOpenAICompatible(
+                urlString: "https://api.openai.com/v1/chat/completions",
+                model: config.openaiModel, apiKey: config.openaiAPIKey,
+                messages: messages, tools: tools, isLlamaCpp: false, onTextDelta: onTextDelta)
+        case .claude:
+            guard !config.claudeAPIKey.isEmpty else {
+                throw NSError(domain: "Claude API key not configured", code: -1)
+            }
+            return try await chatCompletionClaude(messages: messages, tools: tools)
+        }
+    }
+
+    /// Build the OpenAI-style `messages` array from `ChatMessage`s, including
+    /// `tool_calls` on assistant turns and `tool_call_id` on tool messages.
+    private func openAIMessagesJSON(_ messages: [ChatMessage]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for m in messages {
+            var entry: [String: Any] = ["role": m.role]
+            switch m.role {
+            case "assistant":
+                // content may be empty when only tool_calls are present.
+                entry["content"] = m.content
+                if let calls = m.toolCalls, !calls.isEmpty {
+                    entry["tool_calls"] = calls.map { c -> [String: Any] in
+                        return [
+                            "id": c.id,
+                            "type": "function",
+                            "function": ["name": c.name, "arguments": c.arguments],
+                        ]
+                    }
+                }
+            case "tool":
+                entry["content"] = m.content
+                if let id = m.toolCallId { entry["tool_call_id"] = id }
+            default:
+                entry["content"] = m.content
+            }
+            out.append(entry)
+        }
+        return out
+    }
+
+    /// One round against any OpenAI-compatible `/v1/chat/completions` endpoint
+    /// (llama.cpp, Ollama-OpenAI, OpenAI). Non-streamed (so `tool_calls` parse
+    /// reliably); pushes the final text to `onTextDelta` once.
+    private func chatCompletionOpenAICompatible(
+        urlString: String, model: String?, apiKey: String?,
+        messages: [ChatMessage], tools: [[String: Any]]?, isLlamaCpp: Bool,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> AssistantTurn {
+        guard let url = URL(string: urlString) else {
+            throw NSError(domain: "Invalid URL", code: -1)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let apiKey = apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        request.timeoutInterval = 180
+
+        var body: [String: Any] = [
+            "messages": openAIMessagesJSON(messages),
+            "stream": false,
+            "max_tokens": 4096,
+        ]
+        if let model = model { body["model"] = model }
+        if let tools = tools, !tools.isEmpty {
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            // `parallel_tool_calls` is an OpenAI-cloud field; only send it to the
+            // real OpenAI API (an `apiKey` is present). llama.cpp / Ollama-OpenAI
+            // generally ignore unknown keys, but a stricter server could 400 on it.
+            if apiKey != nil && !isLlamaCpp {
+                body["parallel_tool_calls"] = true
+            }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+            }
+            throw error
+        }
+        if isLlamaCpp, let http = response as? HTTPURLResponse, http.statusCode == 503 {
+            throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
+            throw NSError(domain: message, code: -1)
+        }
+        guard let choices = json["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let message = first["message"] as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+
+        // Parse tool_calls (OpenAI / llama.cpp shape).
+        var parsedCalls: [ParsedToolCall] = []
+        if let toolCalls = message["tool_calls"] as? [[String: Any]] {
+            for (i, tc) in toolCalls.enumerated() {
+                guard let fn = tc["function"] as? [String: Any],
+                      let name = fn["name"] as? String else { continue }
+                // Normalize a blank id to a positional one: llama.cpp sometimes
+                // emits `"id":""` for parallel tool calls, and an empty id is
+                // worthless (and collides across calls). The `?? "call_\(i)"`
+                // alone only fires when the key is ABSENT, so coalesce "" too.
+                let id = (tc["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "call_\(i)"
+                // `arguments` may be a JSON string OR an object — pass raw; the
+                // loop's ToolArgs.parse tolerates both.
+                let rawArgs = fn["arguments"]
+                parsedCalls.append(ParsedToolCall(id: id, name: name, rawArguments: rawArgs))
+            }
+        }
+
+        // Parse content + <think> blocks (llama.cpp local thinking).
+        var content = (message["content"] as? String) ?? ""
+        var thinking: String? = nil
+        if let range = content.range(of: "</think>") {
+            if let startRange = content.range(of: "<think>") {
+                thinking = String(content[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            content = String(content[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if parsedCalls.isEmpty, !content.isEmpty { onTextDeltaSafe(onTextDelta, content) }
+        return AssistantTurn(content: content.isEmpty ? nil : content, toolCalls: parsedCalls, thinking: thinking)
+    }
+
+    /// One round against Anthropic `/v1/messages`, mapping `tool_use` blocks to
+    /// `ParsedToolCall` and prior `tool` messages back into Anthropic shape.
+    private func chatCompletionClaude(
+        messages: [ChatMessage], tools: [[String: Any]]?
+    ) async throws -> AssistantTurn {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            throw NSError(domain: "Invalid URL", code: -1)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(config.claudeAPIKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.timeoutInterval = 180
+
+        // Split out a leading system message; map the rest to Anthropic content.
+        var systemPrompt: String? = nil
+        var anthropicMessages: [[String: Any]] = []
+        for m in messages {
+            switch m.role {
+            case "system":
+                systemPrompt = (systemPrompt.map { $0 + "\n" } ?? "") + m.content
+            case "user":
+                anthropicMessages.append(["role": "user", "content": m.content])
+            case "assistant":
+                var blocks: [[String: Any]] = []
+                if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
+                if let calls = m.toolCalls {
+                    for c in calls {
+                        let input = (try? ToolArgs.parse(c.arguments)) ?? [:]
+                        blocks.append(["type": "tool_use", "id": c.id, "name": c.name, "input": input])
+                    }
+                }
+                anthropicMessages.append(["role": "assistant", "content": blocks])
+            case "tool":
+                // Anthropic carries tool results as a user message with a
+                // tool_result block keyed to the tool_use id. Flag failures with
+                // `is_error` so Claude knows the tool errored (OpenAI conveys this
+                // as plain text, so only the Anthropic shape needs the flag).
+                var block: [String: Any] = [
+                    "type": "tool_result",
+                    "tool_use_id": m.toolCallId ?? "",
+                    "content": m.content,
+                ]
+                if m.isError == true { block["is_error"] = true }
+                anthropicMessages.append(["role": "user", "content": [block]])
+            default:
+                break
+            }
+        }
+
+        var body: [String: Any] = [
+            "model": config.claudeModel,
+            "max_tokens": 4096,
+            "messages": anthropicMessages,
+        ]
+        if let system = systemPrompt { body["system"] = system }
+        if let tools = tools, !tools.isEmpty {
+            // Map OpenAI function tools → Anthropic tool schema.
+            body["tools"] = tools.compactMap { t -> [String: Any]? in
+                guard let fn = t["function"] as? [String: Any], let name = fn["name"] as? String else { return nil }
+                return [
+                    "name": name,
+                    "description": fn["description"] as? String ?? "",
+                    "input_schema": fn["parameters"] as? [String: Any] ?? ["type": "object"],
+                ]
+            }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Invalid Claude response", code: -1)
+        }
+        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
+            throw NSError(domain: "Claude: \(message)", code: -1)
+        }
+        guard let content = json["content"] as? [[String: Any]] else {
+            throw NSError(domain: "Invalid Claude response", code: -1)
+        }
+
+        var textParts: [String] = []
+        var thinkingParts: [String] = []
+        var parsedCalls: [ParsedToolCall] = []
+        for block in content {
+            switch block["type"] as? String {
+            case "text":
+                if let t = block["text"] as? String { textParts.append(t) }
+            case "thinking":
+                if let t = block["thinking"] as? String { thinkingParts.append(t) }
+            case "tool_use":
+                if let name = block["name"] as? String {
+                    let id = (block["id"] as? String) ?? "call_\(parsedCalls.count)"
+                    parsedCalls.append(ParsedToolCall(id: id, name: name, rawArguments: block["input"]))
+                }
+            default:
+                break
+            }
+        }
+        let text = textParts.joined(separator: "\n")
+        let thinking = thinkingParts.isEmpty ? nil : thinkingParts.joined(separator: "\n")
+        return AssistantTurn(content: text.isEmpty ? nil : text, toolCalls: parsedCalls, thinking: thinking)
+    }
+
+    private func onTextDeltaSafe(_ cb: (@Sendable (String) -> Void)?, _ text: String) {
+        cb?(text)
+    }
 }
 
 // MARK: - Ollama Stream Delegate
@@ -1544,23 +1828,26 @@ class ActionManager {
     private let actionsFilePath: String
 
     static let defaultActions: [Action] = [
+        Action(id: "ask_agent", name: "Ask Agent", icon: "sparkles",
+               prompt: "Answer the user's request using the selected text as context. Use tools (web search/read, text tools) when helpful.",
+               actionType: .agent, isEnabled: true, order: 0, isDefault: true),
         Action(id: "fix_grammar_and_spelling", name: "Fix grammar and spelling", icon: "checkmark.circle.fill",
                prompt: "Fix any grammar, spelling, and punctuation errors in this text. Keep the same tone and meaning. Only output the corrected text, nothing else. Preserve the original language.",
-               shortcut: "G", isEnabled: true, order: 0, isDefault: true),
+               shortcut: "G", isEnabled: true, order: 1, isDefault: true),
         Action(id: "articulate", name: "Articulate", icon: "pencil.circle.fill",
                prompt: "Improve this text to be clearer and more professional while keeping the same meaning and tone. Only output the improved text, nothing else. Preserve the original language.",
-               shortcut: "A", isEnabled: true, order: 1, isDefault: true),
+               shortcut: "A", isEnabled: true, order: 2, isDefault: true),
         Action(id: "explain_simply", name: "Explain simply", icon: "lightbulb.fill",
                prompt: "Explain this text in simple terms that anyone can understand. Only output the explanation, nothing else. Preserve the original language.",
-               isEnabled: true, order: 2, isDefault: true),
+               isEnabled: true, order: 3, isDefault: true),
         Action(id: "craft_a_reply", name: "Craft a reply", icon: "arrowshape.turn.up.left.fill",
                prompt: "Write a thoughtful and helpful reply to this message. Be professional and friendly. Only output the reply, nothing else. Preserve the original language.",
-               shortcut: "C", isEnabled: true, order: 3, isDefault: true),
+               shortcut: "C", isEnabled: true, order: 4, isDefault: true),
         Action(id: "continue_writing", name: "Continue writing", icon: "arrow.right.circle.fill",
                prompt: "Continue writing from where this text ends, matching the style and tone. Only output the continuation, nothing else. Preserve the original language.",
-               isEnabled: true, order: 4, isDefault: true),
+               isEnabled: true, order: 5, isDefault: true),
         Action(id: "read_aloud", name: "Read aloud", icon: "speaker.wave.2.fill",
-               prompt: "", shortcut: "S", actionType: .tts, isEnabled: true, order: 5, isDefault: true),
+               prompt: "", shortcut: "S", actionType: .tts, isEnabled: true, order: 6, isDefault: true),
     ]
 
     init() {
@@ -3209,6 +3496,79 @@ class PopupWindowController: NSWindowController {
                     }
                     self?.updateView()
                 }
+            }
+
+        case .agent:
+            runAgent(action: action)
+        }
+    }
+
+    // MARK: - Agent (PR7)
+
+    /// Run the tool-calling agent loop for an `.agent` action. Seeds a fresh
+    /// `ChatSession` (system + user, with the selected text as context), runs
+    /// `PopDraftAgent` (which iterates the model + tools), and shows the final
+    /// answer in the EXISTING result view. The single-shot path is untouched.
+    private func runAgent(action: Action) {
+        let capturedText = clipboardText
+        let userRequest = action.prompt
+        // Build the seeding user message: the request plus the selection as context.
+        let userContent = capturedText.isEmpty
+            ? userRequest
+            : "\(userRequest)\n\nSelected text:\n\(capturedText)"
+        let now = Date().timeIntervalSince1970
+        let session = ChatSession(
+            createdAt: now, updatedAt: now,
+            model: LLMClient.shared.currentModel,
+            selectedText: capturedText.isEmpty ? nil : capturedText,
+            messages: [
+                ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
+                ChatMessage(role: "user", content: userContent, createdAt: now),
+            ])
+        let appConfig = AppConfig.load(dir: LLMConfig.configDir)
+        let startTime = Date()
+
+        state = .processing
+        updateView()
+
+        // A standalone @Sendable text-delta sink that captures `self` weakly
+        // ONCE (not via an enclosing Task), so it stays strict-concurrency clean.
+        let onDelta: @Sendable (String) -> Void = { [weak self] text in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.state = .streaming(text: text, isThinking: false)
+                self.updateView()
+            }
+        }
+
+        Task { @MainActor [weak self] in
+            do {
+                let outcome = try await PopDraftAgent.run(
+                    session: session,
+                    config: appConfig,
+                    onTextDelta: onDelta)
+                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
+                let toolTurns = outcome.session.messages.filter { $0.role == "tool" }.count
+                Logger.shared.info("Agent finished (\(elapsed), \(outcome.iterations) iters, \(toolTurns) tool calls)")
+                guard let self = self else { return }
+                let answer = outcome.finalText.isEmpty
+                    ? "(The agent stopped without a final answer.)"
+                    : outcome.finalText
+                self.resultText = answer
+                // Persist the full agent session (with tool turns) for reopening.
+                var saved = outcome.session
+                saved.refreshTitle()
+                self.currentSession = saved
+                self.didSaveCurrentSession = false
+                let lastThinking = outcome.session.messages.last(where: { $0.role == "assistant" })?.thinking
+                self.state = .result(answer, thinking: lastThinking)
+                self.updateView()
+            } catch {
+                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
+                Logger.shared.error("Agent failed (\(elapsed)): \(error.localizedDescription)")
+                guard let self = self else { return }
+                self.state = .error(error.localizedDescription)
+                self.updateView()
             }
         }
     }
@@ -5158,7 +5518,9 @@ struct ActionEditorSheet: View {
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.secondary)
                         Picker("", selection: $selectedActionType) {
-                            ForEach(ActionType.allCases, id: \.self) { type in
+                            // `.agent` is a built-in type ("Ask Agent"), not a
+                            // user-creatable custom action — hide it from the picker.
+                            ForEach(ActionType.allCases.filter { $0 != .agent }, id: \.self) { type in
                                 Text(type.label).tag(type)
                             }
                         }
@@ -5214,6 +5576,19 @@ struct ActionEditorSheet: View {
                             Text("Use {text} as placeholder for selected text, or it will be piped via stdin.")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
+                        case .agent:
+                            // Built-in "Ask Agent" type; not user-editable here,
+                            // but the switch must stay exhaustive.
+                            Text("Agent")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.secondary)
+                            Text("Runs the tool-calling agent on the selected text.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(6)
                         }
                     }
                 }
@@ -5620,6 +5995,7 @@ class DependencyManager {
         <string>\(port)</string>
         <string>-ngl</string>
         <string>99</string>
+        <string>--jinja</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -8208,6 +8584,237 @@ final class WebEngine {
     static let webReadToolSchema = WebToolSchemas.webRead
     static let webScreenshotToolSchema = WebToolSchemas.webScreenshot
     static let webExtractToolSchema = WebToolSchemas.webExtract
+}
+
+// =====================================================================
+// MARK: - PR7: Agent tools (WebEngine-backed + text) + PopDraftAgent
+//
+// Concrete `AgentTool`s. The web tools wrap `WebEngine.shared` (PR6) and
+// return compact JSON/text the model can read; the text tools are local
+// transforms that need no network. `PopDraftAgent` builds the registry and
+// runs `AgentLoop` using `LLMClient.chatCompletion` as the injected model.
+// =====================================================================
+
+/// Encode a Codable result as compact JSON for a tool's string output. On
+/// failure, falls back to a short description so the tool never returns nothing.
+private func toolJSON<T: Encodable>(_ value: T) -> String {
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.sortedKeys]
+    if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
+        return s
+    }
+    return "\(value)"
+}
+
+/// Parse a `WebToolSchemas` constant into a `ToolSpec`, degrading to a minimal
+/// spec (named, no params) instead of crashing if the JSON is ever broken. The
+/// constants are valid today (a test asserts it), so this is purely defensive.
+private func webToolSpec(_ json: String, fallbackName: String, fallbackDescription: String) -> ToolSpec {
+    return ToolSpec.fromOpenAIJSON(json)
+        ?? ToolSpec(name: fallbackName, description: fallbackDescription)
+}
+
+/// `web_search` — search the web, return [{title,url,snippet}].
+struct WebSearchTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.webSearch, fallbackName: "web_search", fallbackDescription: "Search the web.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let query = (d["query"] as? String) ?? ""
+        guard !query.isEmpty else { return "Error: 'query' is required." }
+        var maxResults = 8
+        if let n = d["max_results"] as? Int { maxResults = n }
+        else if let n = d["max_results"] as? NSNumber { maxResults = n.intValue }
+        maxResults = min(10, max(1, maxResults))
+        let results = try await WebEngine.shared.search(SearchQuery(query: query, maxResults: maxResults))
+        if results.isEmpty { return "No results found for \"\(query)\"." }
+        return toolJSON(results)
+    }
+}
+
+/// Shared helper to validate + build a URL from a tool argument.
+private func toolURL(_ raw: Any?) throws -> URL {
+    func err(_ msg: String) -> NSError {
+        // Put the message in localizedDescription so the model reads a clean
+        // "Error: ..." string (not "Error Domain=...").
+        NSError(domain: "PopDraftTool", code: -1, userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+    guard let s = raw as? String, !s.isEmpty else {
+        throw err("Error: 'url' is required.")
+    }
+    guard let url = URL(string: s), let scheme = url.scheme, scheme == "http" || scheme == "https" else {
+        throw err("Error: 'url' must be an absolute http(s) URL.")
+    }
+    return url
+}
+
+/// `web_open` — load a URL, return {finalURL,status,title,preview}.
+struct WebOpenTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.webOpen, fallbackName: "web_open", fallbackDescription: "Open a URL.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let url = try toolURL(args.dictionary["url"])
+        return toolJSON(try await WebEngine.shared.open(url))
+    }
+}
+
+/// `web_read` — load a URL, return its main content as clean Markdown.
+struct WebReadTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.webRead, fallbackName: "web_read", fallbackDescription: "Read a URL as Markdown.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let url = try toolURL(d["url"])
+        var maxChars = 0
+        if let n = d["max_chars"] as? Int { maxChars = n }
+        else if let n = d["max_chars"] as? NSNumber { maxChars = n.intValue }
+        let r = try await WebEngine.shared.read(url, maxChars: maxChars)
+        // The model mostly wants the Markdown + a little provenance; keep it compact.
+        var header = "# \(r.title)\nURL: \(r.finalURL)"
+        if let byline = r.byline, !byline.isEmpty { header += "\nBy: \(byline)" }
+        if r.truncated { header += "\n(truncated to \(r.charCount) chars)" }
+        return header + "\n\n" + r.markdown
+    }
+}
+
+/// `web_screenshot` — render a URL, save a PNG, return {path,width,height}.
+struct WebScreenshotTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.webScreenshot, fallbackName: "web_screenshot", fallbackDescription: "Screenshot a URL.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let url = try toolURL(d["url"])
+        let fullPage = (d["full_page"] as? Bool) ?? ((d["full_page"] as? NSNumber)?.boolValue ?? false)
+        return toolJSON(try await WebEngine.shared.screenshot(url, fullPage: fullPage))
+    }
+}
+
+/// `web_extract` — read a URL and return the chunks most relevant to an instruction.
+struct WebExtractTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.webExtract, fallbackName: "web_extract", fallbackDescription: "Extract relevant chunks from a URL.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let url = try toolURL(d["url"])
+        let instruction = (d["instruction"] as? String) ?? ""
+        guard !instruction.isEmpty else { return "Error: 'instruction' is required." }
+        let r = try await WebEngine.shared.extract(url, instruction: instruction)
+        if r.chunks.isEmpty { return "No content on \(r.finalURL) matched: \(instruction)" }
+        return toolJSON(r)
+    }
+}
+
+// MARK: - Text tools (no network)
+
+private enum TextToolSchemas {
+    // Computed (not stored) so they don't count as non-Sendable shared mutable
+    // state under -strict-concurrency=complete; each access builds a fresh dict.
+    static var summarize: [String: Any] {
+        [
+            "type": "object",
+            "properties": ["text": ["type": "string", "description": "The text to summarize."]],
+            "required": ["text"],
+        ]
+    }
+    static var extractText: [String: Any] {
+        [
+            "type": "object",
+            "properties": [
+                "text": ["type": "string", "description": "The text to search."],
+                "instruction": ["type": "string", "description": "What to extract / look for."],
+            ],
+            "required": ["text", "instruction"],
+        ]
+    }
+}
+
+/// `summarize_text` — return the leading portion of provided text as a compact
+/// excerpt the model can reason over (a deterministic local transform).
+struct SummarizeTextTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(name: "summarize_text",
+                 description: "Condense provided text to a compact excerpt (first paragraphs, char-capped). Use to shrink long text you already have before reasoning over it.",
+                 parametersSchema: TextToolSchemas.summarize)
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let text = (args.dictionary["text"] as? String) ?? ""
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        let cleaned = MarkdownSanitizer.collapseWhitespace(text)
+        let (out, _) = MarkdownSanitizer.truncate(cleaned, maxChars: 2000)
+        return out
+    }
+}
+
+/// `extract_text` — return the chunks of provided text most relevant to an
+/// instruction (keyword/BM25 ranked; local, no network).
+struct ExtractTextTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(name: "extract_text",
+                 description: "Return the chunks of provided text most relevant to an instruction (keyword-ranked). Use to pull a specific answer out of long text you already have.",
+                 parametersSchema: TextToolSchemas.extractText)
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let text = (d["text"] as? String) ?? ""
+        let instruction = (d["instruction"] as? String) ?? ""
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        guard !instruction.isEmpty else { return "Error: 'instruction' is required." }
+        let chunks = ChunkRanker.chunk(text)
+        let ranked = ChunkRanker.rank(chunks: chunks, instruction: instruction, limit: 5)
+        if ranked.isEmpty { return "No part of the text matched: \(instruction)" }
+        return toolJSON(ranked)
+    }
+}
+
+// MARK: - PopDraftAgent (registry + loop wiring)
+
+/// Builds the tool registry from config and runs the `AgentLoop` over the real
+/// model via `LLMClient.chatCompletion`. Minimal entry point for the "Ask Agent"
+/// action — returns the final answer plus the updated session.
+struct PopDraftAgent {
+    /// Default system prompt seeding the agent.
+    static let systemPrompt = """
+    You are PopDraft, a helpful desktop assistant. You can call tools to search \
+    and read the web and to transform text. Think step by step. Prefer to verify \
+    facts with the web tools when a question needs current or external \
+    information; otherwise answer directly. When you call a tool, wait for its \
+    result before answering. Keep final answers concise and well-formatted.
+    """
+
+    /// Build the registry of tools the agent may use, honoring config gates.
+    /// Web tools are gated on `agentSettings.enableWebSearch`. (Mac-control + MCP
+    /// tools are PR9 and are intentionally NOT registered here.)
+    static func buildRegistry(config: AppConfig) async -> ToolRegistry {
+        let registry = ToolRegistry()
+        // Text tools are always available (no network).
+        await registry.register([SummarizeTextTool(), ExtractTextTool()])
+        if config.agentSettings.enableWebSearch {
+            await registry.register([
+                WebSearchTool(), WebOpenTool(), WebReadTool(),
+                WebScreenshotTool(), WebExtractTool(),
+            ])
+        }
+        return registry
+    }
+
+    /// Run the agent loop on `session`. Returns the loop outcome (updated session
+    /// + final answer). The model `call` is `LLMClient.chatCompletion`; tools run
+    /// in parallel via `ToolRunner` with the renderer cap as the concurrency cap.
+    static func run(
+        session: ChatSession,
+        config: AppConfig,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> AgentLoop.Outcome {
+        let registry = await buildRegistry(config: config)
+        // Tool concurrency cap == renderer pool size (web tools are the heavy ones).
+        let runner = ToolRunner(
+            maxConcurrent: max(1, config.webMaxRenderers),
+            perToolTimeoutMs: max(5000, config.webNavTimeoutMs + 5000))
+        let loop = AgentLoop(maxIterations: config.agentSettings.maxIterations, runner: runner)
+
+        let modelCall: AgentLoop.ModelCall = { messages, toolsBoxed in
+            let tools = unboxTools(toolsBoxed)
+            return try await LLMClient.shared.chatCompletion(
+                messages: messages, tools: tools.isEmpty ? nil : tools,
+                stream: false, onTextDelta: onTextDelta)
+        }
+        return try await loop.run(session: session, registry: registry, call: modelCall)
+    }
 }
 
 // MARK: - DNS resolution (for SSRF on resolved IP)
