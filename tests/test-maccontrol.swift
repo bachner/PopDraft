@@ -50,6 +50,13 @@ let denied: [String] = [
     "echo hi; sudo reboot",            // sudo after a chain
     "doas pkg_add x",
     "su root",
+    // AppleScript / osascript admin privilege escalation — must be caught for BOTH
+    // run_applescript inputs AND osascript invoked from the shell side.
+    "do shell script \"rm -rf ~/x\" with administrator privileges",
+    "osascript -e 'do shell script \"id\" with administrator privileges'",
+    "do shell script \"id\"   with   administrator   privileges",   // extra whitespace
+    "do shell script \"id\" WITH ADMINISTRATOR PRIVILEGES",         // case-insensitive
+    "do shell script \"x\" with admin privileges",                  // 'admin' variant
     // recursive force-delete of root/home/glob
     "rm -rf /",
     "rm -fr /",
@@ -114,6 +121,11 @@ let safe: [String] = [
     "echo x > /dev/null",               // /dev/null is benign
     "curl https://example.com",         // curl WITHOUT pipe-to-shell
     "wget https://example.com/file",
+    // Benign AppleScript / shell — no admin escalation, must NOT be flagged.
+    "display notification \"hi\"",
+    "echo hello",
+    "do shell script \"ls -la\"",       // do shell script WITHOUT admin privileges
+    "tell application \"Finder\" to get name of every file",
 ]
 
 for cmd in safe {

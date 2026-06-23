@@ -2589,6 +2589,17 @@ enum MacControlGuard {
             return "privilege escalation (sudo/su/doas) is not allowed"
         }
 
+        // 1b. AppleScript admin escalation — `do shell script "…" with administrator
+        //     privileges` (and the `with admin privileges` variant). Applies to BOTH
+        //     run_applescript inputs AND `osascript -e '… with administrator privileges'`
+        //     from the shell side. Matched on the whitespace-stripped, lowercased form
+        //     so extra spaces/newlines/tabs can't slip it past us. Precise enough that
+        //     a benign script (display notification, do shell script without admin)
+        //     is unaffected.
+        if nospace.contains("withadministratorprivileges") || nospace.contains("withadminprivileges") {
+            return "AppleScript/admin privilege escalation (with administrator privileges) is not allowed"
+        }
+
         // 2. Recursive force-remove of root / home / glob roots.
         //    Matches `rm -rf /`, `rm -fr /`, `rm -rf ~`, `rm -rf /*`, `rm -rf .` etc.
         if isDangerousRm(collapsed) {
