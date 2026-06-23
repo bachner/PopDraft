@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PopDraft Redesign — 6 Style Directions</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+    background: #1d1d1f;
+    color: #f5f5f7;
+  }
+  header {
+    padding: 40px 48px 28px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  header h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.02em; }
+  header p { margin: 0; color: #a1a1a6; font-size: 14px; max-width: 760px; line-height: 1.5; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 28px;
+    padding: 32px 48px 64px;
+  }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: #0b0b0c;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+  .card .bar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .card .bar .name { font-size: 15px; font-weight: 600; }
+  .card .bar .num {
+    font-size: 11px; font-weight: 700; color: #1d1d1f;
+    background: #f5f5f7; border-radius: 999px; padding: 3px 9px; margin-right: 10px;
+  }
+  .card .bar a {
+    color: #2997ff; text-decoration: none; font-size: 13px; font-weight: 500;
+  }
+  .card .bar a:hover { text-decoration: underline; }
+  .frame-wrap {
+    height: 460px;
+    overflow: hidden;
+    background: #000;
+    position: relative;
+  }
+  /* render the 1280-wide mock and scale it to fit the column */
+  .frame-wrap iframe {
+    width: 1280px;
+    height: 1840px;
+    border: 0;
+    transform-origin: top left;
+    /* scaled by JS to fit width */
+  }
+  .tag { color:#86868b; font-size:12px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>PopDraft Redesign — 6 Style Directions</h1>
+    <p>Each tile is the same four surfaces — the corner <b>bubble</b>, the <b>action menu</b> (with the new “Ask Agent” default), the <b>Claude-style agent chat</b>, and the <b>paste-a-model-name</b> settings with live validation — rendered in a different visual language. Click “Open full” to view any one at full size and hover its interactive states.</p>
+  </header>
+  <div class="grid" id="grid"></div>
+<script>
+  const mocks = [
+    { n: 1, name: "Liquid Glass (visionOS)", file: "mock-1-liquid-glass.html" },
+    { n: 2, name: "Warm Editorial (Claude.ai)", file: "mock-2-warm-editorial.html" },
+    { n: 3, name: "macOS Native (HIG)", file: "mock-3-mac-native.html" },
+    { n: 4, name: "Neo-Brutalist Bold", file: "mock-4-neo-brutalist.html" },
+    { n: 5, name: "Dark Developer Console", file: "mock-5-dark-console.html" },
+    { n: 6, name: "Soft Aurora Gradient", file: "mock-6-aurora-gradient.html" },
+  ];
+  const grid = document.getElementById('grid');
+  mocks.forEach(m => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="bar">
+        <div><span class="num">${m.n}</span><span class="name">${m.name}</span></div>
+        <a href="${m.file}" target="_blank">Open full →</a>
+      </div>
+      <div class="frame-wrap">
+        <iframe src="${m.file}" scrolling="no" loading="lazy"></iframe>
+      </div>`;
+    grid.appendChild(card);
+  });
+  function scaleFrames() {
+    document.querySelectorAll('.frame-wrap').forEach(w => {
+      const scale = w.clientWidth / 1280;
+      const f = w.querySelector('iframe');
+      f.style.transform = `scale(${scale})`;
+    });
+  }
+  window.addEventListener('resize', scaleFrames);
+  window.addEventListener('load', scaleFrames);
+  setTimeout(scaleFrames, 300);
+</script>
+</body>
+</html>

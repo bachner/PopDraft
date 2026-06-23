@@ -1,0 +1,1260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PopDraft — Warm Editorial</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Warm paper / cream palette */
+    --paper:        #EFEEE6;
+    --paper-deep:   #E7E5DB;
+    --surface:      #FBFAF6;
+    --surface-2:    #F5F3EC;
+    --surface-raise:#FFFFFF;
+
+    /* Clay / terracotta accent */
+    --clay:         #D97757;
+    --clay-deep:    #C15F3C;
+    --clay-soft:    #F3E0D6;
+    --clay-tint:    #FAEFE8;
+
+    /* Secondary — muted sage + ink */
+    --sage:         #7C8471;
+    --sage-soft:    #E7EAE0;
+    --ink:          #2A2622;
+    --ink-2:        #4A443D;
+    --muted:        #8A8378;
+    --muted-2:      #A8A294;
+    --hairline:     #E2DFD4;
+    --hairline-2:   #D9D5C8;
+
+    /* Status */
+    --ready:        #5E8C5A;
+    --ready-soft:   #E1ECDD;
+
+    --shadow-sm: 0 1px 2px rgba(74, 60, 44, 0.06), 0 1px 1px rgba(74, 60, 44, 0.04);
+    --shadow-md: 0 4px 14px rgba(74, 60, 44, 0.08), 0 1px 3px rgba(74, 60, 44, 0.05);
+    --shadow-lg: 0 18px 50px rgba(74, 60, 44, 0.16), 0 6px 18px rgba(74, 60, 44, 0.08);
+    --shadow-bubble: 0 10px 28px rgba(193, 95, 60, 0.28), 0 3px 8px rgba(74, 60, 44, 0.14);
+
+    --font-sans: -apple-system, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+    --font-serif: "Source Serif 4", ui-serif, "New York", Georgia, serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--paper);
+    font-family: var(--font-sans);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ===== Desktop canvas ===== */
+  .desktop {
+    width: 1280px;
+    margin: 0 auto;
+    min-height: 100vh;
+    position: relative;
+    /* faux warm wallpaper */
+    background:
+      radial-gradient(1200px 700px at 78% -10%, rgba(217, 119, 87, 0.10), transparent 60%),
+      radial-gradient(900px 600px at 8% 110%, rgba(124, 132, 113, 0.10), transparent 55%),
+      linear-gradient(160deg, #F1EFE6 0%, #E9E6DB 48%, #EFEADF 100%);
+    overflow: hidden;
+  }
+
+  /* thin top menu bar */
+  .menubar {
+    height: 30px;
+    background: rgba(251, 250, 246, 0.72);
+    backdrop-filter: saturate(160%) blur(18px);
+    -webkit-backdrop-filter: saturate(160%) blur(18px);
+    border-bottom: 1px solid rgba(226, 223, 212, 0.7);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    gap: 20px;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .menubar .mb-logo {
+    font-family: var(--font-serif);
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    color: var(--ink);
+  }
+  .menubar .mb-item { font-weight: 500; color: var(--ink-2); }
+  .menubar .mb-item.dim { color: var(--muted); font-weight: 400; }
+  .menubar .mb-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    color: var(--ink-2);
+  }
+  .mb-glyph {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+    color: var(--clay-deep);
+  }
+  .mb-glyph .seal {
+    width: 17px; height: 17px;
+    border-radius: 6px;
+    background: linear-gradient(150deg, var(--clay) 0%, var(--clay-deep) 100%);
+    display: inline-flex; align-items: center; justify-content: center;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.35), 0 1px 2px rgba(193,95,60,0.4);
+  }
+
+  /* ===== Board layout ===== */
+  .board {
+    padding: 40px 48px 72px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 44px 40px;
+    align-items: start;
+  }
+  .board-head {
+    grid-column: 1 / -1;
+    margin-bottom: 2px;
+  }
+  .board-head h1 {
+    font-family: var(--font-serif);
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -0.2px;
+    color: var(--ink);
+  }
+  .board-head p {
+    margin-top: 6px;
+    font-size: 14px;
+    color: var(--muted);
+    max-width: 640px;
+    line-height: 1.5;
+  }
+  .board-head .kicker {
+    display: inline-block;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 1.6px;
+    color: var(--clay-deep);
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+
+  .cell { display: flex; flex-direction: column; }
+  .cell.wide { grid-column: 1 / -1; }
+  .caption {
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+    padding-left: 2px;
+  }
+  .caption b {
+    font-family: var(--font-serif);
+    font-weight: 600;
+    color: var(--ink-2);
+    font-size: 13.5px;
+  }
+
+  /* ===== Generic window chrome ===== */
+  .win {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+  }
+  .win-bar {
+    height: 38px;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    gap: 8px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .traffic { display: flex; gap: 8px; }
+  .traffic i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+  .traffic .r { background: #E3A299; }
+  .traffic .y { background: #E6CB8E; }
+  .traffic .g { background: #A7C79B; }
+  .win-title {
+    font-size: 12.5px;
+    color: var(--muted);
+    font-weight: 500;
+    margin-left: 6px;
+  }
+
+  /* ============================================================
+     SURFACE A — Minimized bubble
+     ============================================================ */
+  .surface-a {
+    position: relative;
+    height: 392px;
+    border-radius: 16px;
+    border: 1px solid var(--hairline);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+    background:
+      radial-gradient(700px 420px at 85% 95%, rgba(217,119,87,0.14), transparent 60%),
+      radial-gradient(600px 380px at 10% 8%, rgba(124,132,113,0.12), transparent 55%),
+      linear-gradient(155deg, #F4F1E8 0%, #EAE6DA 55%, #F1ECE1 100%);
+  }
+  /* faint desktop "files" to set scene */
+  .desk-icon {
+    position: absolute;
+    width: 56px; text-align: center;
+    color: var(--ink-2);
+    font-size: 10.5px;
+    opacity: 0.8;
+  }
+  .desk-icon .ico {
+    width: 44px; height: 36px; margin: 0 auto 6px;
+    border-radius: 7px;
+    background: linear-gradient(160deg, #FBFAF6, #EDEAE0);
+    border: 1px solid var(--hairline-2);
+    box-shadow: var(--shadow-sm);
+    position: relative;
+  }
+  .desk-icon .ico::before {
+    content:""; position:absolute; top:0; left:10px; right:6px; height:7px;
+    background: var(--clay-soft);
+    border-radius: 0 0 4px 4px;
+  }
+  .surface-a-label {
+    position: absolute; top: 18px; left: 20px;
+    font-family: var(--font-serif);
+    font-size: 13px; color: var(--muted);
+    letter-spacing: 0.2px;
+  }
+
+  /* Bubble cluster bottom-right */
+  .bubble-zone {
+    position: absolute;
+    right: 26px; bottom: 26px;
+    display: flex; align-items: flex-end; gap: 12px;
+  }
+  .peek-label {
+    background: rgba(43, 38, 34, 0.92);
+    color: #F6F2EC;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 8px 12px 8px 11px;
+    border-radius: 11px;
+    box-shadow: var(--shadow-md);
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 8px;
+    position: relative;
+    white-space: nowrap;
+  }
+  .peek-label::after {
+    content:""; position:absolute; right:-6px; bottom:14px;
+    width:12px; height:12px; background: rgba(43,38,34,0.92);
+    transform: rotate(45deg);
+    border-radius: 2px;
+  }
+  .peek-label .kbd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: rgba(255,255,255,0.14);
+    border: 1px solid rgba(255,255,255,0.18);
+    padding: 1.5px 6px;
+    border-radius: 6px;
+    color: #FBEFE7;
+  }
+
+  .bubble {
+    width: 66px; height: 66px;
+    border-radius: 21px;
+    background:
+      radial-gradient(120% 120% at 30% 22%, #E69173 0%, var(--clay) 42%, var(--clay-deep) 100%);
+    box-shadow:
+      var(--shadow-bubble),
+      inset 0 2px 3px rgba(255,255,255,0.4),
+      inset 0 -4px 8px rgba(120,46,24,0.34);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  /* wax-seal sheen */
+  .bubble::before {
+    content:""; position:absolute; inset:0; border-radius:21px;
+    background: linear-gradient(150deg, rgba(255,255,255,0.32), transparent 46%);
+    mix-blend-mode: screen;
+  }
+  .bubble svg { width: 32px; height: 32px; position: relative; z-index: 2; }
+  /* ready status dot */
+  .bubble .status-dot {
+    position: absolute;
+    right: -3px; top: -3px;
+    width: 17px; height: 17px;
+    border-radius: 50%;
+    background: var(--ready);
+    border: 3px solid #F4F1E8;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.18);
+    z-index: 3;
+  }
+  .bubble .status-dot::after {
+    content:""; position:absolute; inset:3px;
+    border-radius:50%;
+    background: #DFF0DB;
+    opacity: 0.6;
+  }
+
+  /* ============================================================
+     SURFACE B — Action menu panel
+     ============================================================ */
+  .surface-b-stage {
+    position: relative;
+    height: 392px;
+    border-radius: 16px;
+    border: 1px solid var(--hairline);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+    background:
+      radial-gradient(600px 400px at 20% 100%, rgba(124,132,113,0.10), transparent 55%),
+      linear-gradient(150deg, #F2EFE6 0%, #E9E5DA 100%);
+    padding: 22px;
+    display: flex; align-items: flex-start; justify-content: center;
+  }
+  /* a hint of selected text behind the panel */
+  .ghost-doc {
+    position: absolute; left: 28px; top: 26px; right: 28px;
+    font-family: var(--font-serif);
+    font-size: 13.5px; line-height: 1.7;
+    color: var(--muted-2);
+    opacity: 0.5;
+    max-width: 280px;
+  }
+  .ghost-doc .sel {
+    background: rgba(217,119,87,0.16);
+    color: var(--ink-2);
+    border-radius: 3px;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  .panel {
+    width: 358px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+    position: relative;
+    z-index: 2;
+    margin-top: 18px;
+  }
+  .panel-quote {
+    padding: 14px 16px 13px;
+    border-bottom: 1px solid var(--hairline);
+    background: var(--surface-2);
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .panel-quote .qmark {
+    font-family: var(--font-serif);
+    font-size: 30px; line-height: 0.7;
+    color: var(--clay);
+    margin-top: 6px;
+  }
+  .panel-quote .qtext {
+    font-family: var(--font-serif);
+    font-size: 13px; line-height: 1.5;
+    color: var(--ink-2);
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .actions { padding: 7px; }
+  .action-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 11px;
+    border-radius: 11px;
+    cursor: default;
+    position: relative;
+  }
+  .action-row .a-icon {
+    width: 30px; height: 30px; flex-shrink: 0;
+    border-radius: 9px;
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-2);
+  }
+  .action-row .a-icon svg { width: 16px; height: 16px; }
+  .action-row .a-name {
+    font-size: 14px; font-weight: 500; color: var(--ink);
+    flex: 1;
+  }
+  .action-row .a-sub {
+    font-size: 11.5px; color: var(--muted);
+    font-family: var(--font-serif);
+    margin-top: 1px;
+  }
+  .action-row .a-kbd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    padding: 2px 7px;
+    border-radius: 7px;
+  }
+  /* Primary "Ask Agent" */
+  .action-row.primary {
+    background: linear-gradient(150deg, var(--clay) 0%, var(--clay-deep) 100%);
+    box-shadow: 0 6px 16px rgba(193,95,60,0.28), inset 0 1px 1px rgba(255,255,255,0.25);
+    margin: 2px 0 6px;
+  }
+  .action-row.primary .a-icon {
+    background: rgba(255,255,255,0.18);
+    border-color: rgba(255,255,255,0.28);
+    color: #fff;
+  }
+  .action-row.primary .a-name { color: #FFF; font-weight: 600; }
+  .action-row.primary .a-sub { color: rgba(255,255,255,0.82); }
+  .action-row.primary .a-kbd {
+    background: rgba(255,255,255,0.16);
+    border-color: rgba(255,255,255,0.26);
+    color: #FFF3EC;
+  }
+  .action-row.primary .a-default {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: rgba(255,255,255,0.85); font-weight: 600;
+    margin-right: 2px;
+  }
+  /* hovered row */
+  .action-row.hover {
+    background: var(--clay-tint);
+  }
+  .action-row.hover .a-icon {
+    background: #fff; border-color: var(--clay-soft); color: var(--clay-deep);
+  }
+  .action-row.hover .a-name { color: var(--clay-deep); }
+
+  .panel-footer {
+    border-top: 1px solid var(--hairline);
+    background: var(--surface-2);
+    padding: 9px 11px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .copy-btn {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; font-weight: 600;
+    color: var(--ink);
+    background: var(--surface-raise);
+    border: 1px solid var(--hairline-2);
+    padding: 7px 13px;
+    border-radius: 10px;
+    box-shadow: var(--shadow-sm);
+  }
+  .copy-btn svg { width: 14px; height: 14px; color: var(--sage); }
+  .footer-hint {
+    font-size: 11.5px; color: var(--muted);
+    font-family: var(--font-serif);
+  }
+
+  /* ============================================================
+     SURFACE C — Agent chat (centerpiece)
+     ============================================================ */
+  .chat-win { display: flex; flex-direction: column; height: 642px; }
+  .chat-header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 13px 18px;
+    border-bottom: 1px solid var(--hairline);
+    background: var(--surface-2);
+  }
+  .chat-seal {
+    width: 30px; height: 30px; border-radius: 10px;
+    background: linear-gradient(150deg, var(--clay), var(--clay-deep));
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.35), 0 2px 5px rgba(193,95,60,0.32);
+    flex-shrink: 0;
+  }
+  .chat-seal svg { width: 17px; height: 17px; }
+  .chat-title-wrap { display: flex; flex-direction: column; }
+  .chat-title {
+    font-family: var(--font-serif);
+    font-size: 15.5px; font-weight: 600; color: var(--ink);
+    letter-spacing: 0.1px;
+  }
+  .model-ind {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--muted);
+    margin-top: 2px;
+  }
+  .model-ind .ready {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ready);
+    box-shadow: 0 0 0 3px var(--ready-soft);
+  }
+  .model-ind .mono { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
+  .chat-tools { margin-left: auto; display: flex; gap: 7px; }
+  .icon-btn {
+    width: 32px; height: 32px; border-radius: 9px;
+    background: var(--surface-raise);
+    border: 1px solid var(--hairline-2);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-2);
+    box-shadow: var(--shadow-sm);
+  }
+  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn.min { color: var(--clay-deep); }
+
+  .chat-body {
+    flex: 1;
+    overflow: hidden;
+    padding: 22px 26px 8px;
+    background:
+      radial-gradient(900px 500px at 100% 0%, rgba(217,119,87,0.05), transparent 60%),
+      var(--surface);
+    display: flex; flex-direction: column; gap: 20px;
+  }
+
+  /* context chip */
+  .ctx-chip {
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--clay);
+    background: var(--surface-2);
+    border-radius: 10px;
+    padding: 11px 14px;
+    display: flex; gap: 11px; align-items: flex-start;
+  }
+  .ctx-chip .ctx-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--clay-deep); font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .ctx-chip .ctx-text {
+    font-family: var(--font-serif);
+    font-size: 13.5px; line-height: 1.55; color: var(--ink-2);
+  }
+  .ctx-chip .paperclip { color: var(--muted-2); margin-top: 2px; }
+  .ctx-chip .paperclip svg { width: 15px; height: 15px; }
+
+  /* message blocks */
+  .msg { display: flex; flex-direction: column; gap: 8px; }
+  .msg-head { display: flex; align-items: center; gap: 9px; }
+  .author {
+    font-family: var(--font-serif);
+    font-size: 13.5px; font-weight: 600;
+    letter-spacing: 0.2px;
+  }
+  .msg.user .author { color: var(--ink); }
+  .msg.assistant .author { color: var(--clay-deep); }
+  .avatar {
+    width: 22px; height: 22px; border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-serif); font-weight: 700; font-size: 12px;
+    flex-shrink: 0;
+  }
+  .avatar.u { background: var(--sage-soft); color: var(--sage); }
+  .avatar.a {
+    background: linear-gradient(150deg, var(--clay), var(--clay-deep));
+    color: #fff;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.3);
+  }
+  .msg-head .copy-msg {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 500;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    padding: 4px 8px;
+    border-radius: 8px;
+  }
+  .msg-head .copy-msg svg { width: 13px; height: 13px; }
+  .msg-head .copy-msg.show {
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-color: var(--hairline);
+  }
+
+  .msg-body {
+    padding-left: 31px;
+    font-size: 14.5px;
+    line-height: 1.62;
+    color: var(--ink-2);
+  }
+  .msg.user .msg-body { color: var(--ink); }
+
+  /* thinking disclosure */
+  .thinking {
+    border: 1px solid var(--hairline);
+    background: var(--surface-2);
+    border-radius: 11px;
+    overflow: hidden;
+  }
+  .thinking-head {
+    display: flex; align-items: center; gap: 9px;
+    padding: 9px 13px;
+    font-size: 12.5px;
+    color: var(--sage);
+    font-weight: 500;
+  }
+  .thinking-head .chev { color: var(--muted-2); transition: transform .2s; }
+  .thinking-head .chev svg { width: 13px; height: 13px; display:block; }
+  .thinking-head .spark { color: var(--sage); }
+  .thinking-head .spark svg { width: 14px; height: 14px; display:block; }
+  .thinking-head .ti-label { font-family: var(--font-serif); font-style: italic; font-size: 13px; }
+  .thinking-head .dur { margin-left: auto; font-size: 11px; color: var(--muted-2); font-family: var(--font-mono); }
+  .thinking-body {
+    padding: 0 14px 13px 35px;
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--muted);
+    border-top: 1px dashed var(--hairline-2);
+    padding-top: 11px;
+    margin: 0 0 0 0;
+  }
+
+  /* tool call card */
+  .toolcall {
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    overflow: hidden;
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+  }
+  .toolcall-head {
+    display: flex; align-items: center; gap: 9px;
+    padding: 10px 13px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .toolcall-head .tc-ico {
+    width: 22px; height: 22px; border-radius: 7px;
+    background: var(--sage-soft); color: var(--sage);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .toolcall-head .tc-ico svg { width: 14px; height: 14px; }
+  .toolcall-head .tc-name {
+    font-family: var(--font-mono);
+    font-size: 12.5px; color: var(--ink-2);
+  }
+  .toolcall-head .tc-name .fn { color: var(--clay-deep); font-weight: 600; }
+  .toolcall-head .tc-name .arg { color: var(--sage); }
+  .toolcall-head .tc-badge {
+    margin-left: auto;
+    font-size: 10.5px; font-weight: 600;
+    color: var(--ready);
+    background: var(--ready-soft);
+    padding: 2.5px 8px;
+    border-radius: 20px;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .toolcall-head .tc-badge .d { width: 6px; height: 6px; border-radius:50%; background: var(--ready); }
+  .toolcall-result {
+    padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .tc-snippet {
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .tc-snippet .favicon {
+    width: 18px; height: 18px; border-radius: 5px;
+    background: linear-gradient(150deg, #E9DFD2, #D8CDBC);
+    flex-shrink: 0; margin-top: 2px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px; color: var(--ink-2); font-weight: 700;
+  }
+  .tc-snippet .src {
+    font-size: 11.5px; color: var(--sage); font-weight: 500;
+    margin-bottom: 2px;
+  }
+  .tc-snippet .snip {
+    font-size: 12.5px; line-height: 1.5; color: var(--ink-2);
+  }
+  .tc-snippet .snip b { color: var(--ink); font-weight: 600; }
+
+  /* the rewrite block + its copy */
+  .rewrite {
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    background: var(--surface-2);
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .rewrite-head {
+    display: flex; align-items: center;
+    padding: 8px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .rewrite-head .rw-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.1px;
+    color: var(--muted); font-weight: 600;
+  }
+  .rewrite-head .copy-block {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 600;
+    color: var(--clay-deep);
+    background: var(--clay-tint);
+    border: 1px solid var(--clay-soft);
+    padding: 4px 9px;
+    border-radius: 8px;
+  }
+  .rewrite-head .copy-block svg { width: 13px; height: 13px; }
+  .rewrite-text {
+    padding: 13px 15px;
+    font-family: var(--font-serif);
+    font-size: 14px; line-height: 1.6;
+    color: var(--ink);
+  }
+
+  .stream-line { color: var(--ink-2); }
+  .cursor {
+    display: inline-block;
+    width: 8px; height: 1.05em;
+    background: var(--clay);
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    border-radius: 1.5px;
+    animation: blink 1.05s steps(2, start) infinite;
+  }
+  @keyframes blink { 0%,50% { opacity:1; } 50.01%,100% { opacity:0; } }
+
+  /* chat input */
+  .chat-input-wrap {
+    padding: 14px 20px 18px;
+    border-top: 1px solid var(--hairline);
+    background: var(--surface-2);
+  }
+  .chat-input {
+    background: var(--surface-raise);
+    border: 1px solid var(--hairline-2);
+    border-radius: 14px;
+    box-shadow: var(--shadow-sm);
+    padding: 12px 12px 10px 15px;
+    display: flex; flex-direction: column; gap: 11px;
+  }
+  .chat-input .ci-placeholder {
+    font-size: 14px; color: var(--muted-2);
+    font-family: var(--font-serif);
+    padding-top: 1px;
+  }
+  .ci-bottom { display: flex; align-items: center; gap: 8px; }
+  .tool-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 500;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    padding: 5px 10px;
+    border-radius: 9px;
+  }
+  .tool-chip svg { width: 13px; height: 13px; color: var(--sage); }
+  .tool-chip.on {
+    color: var(--clay-deep);
+    background: var(--clay-tint);
+    border-color: var(--clay-soft);
+  }
+  .tool-chip.on svg { color: var(--clay); }
+  .send-btn {
+    margin-left: auto;
+    width: 36px; height: 36px;
+    border-radius: 11px;
+    background: linear-gradient(150deg, var(--clay), var(--clay-deep));
+    box-shadow: 0 4px 12px rgba(193,95,60,0.32), inset 0 1px 1px rgba(255,255,255,0.3);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff;
+  }
+  .send-btn svg { width: 17px; height: 17px; }
+
+  /* ============================================================
+     SURFACE D — Model settings
+     ============================================================ */
+  .settings-body { padding: 22px 24px 24px; background: var(--surface); }
+  .settings-section + .settings-section { margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--hairline); }
+  .set-label {
+    font-family: var(--font-serif);
+    font-size: 15px; font-weight: 600; color: var(--ink);
+    margin-bottom: 4px;
+  }
+  .set-help { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin-bottom: 13px; }
+
+  .field {
+    display: flex; align-items: center;
+    background: var(--surface-raise);
+    border: 1px solid var(--hairline-2);
+    border-radius: 11px;
+    padding: 0 6px 0 14px;
+    box-shadow: var(--shadow-sm);
+    height: 44px;
+  }
+  .field.focus {
+    border-color: var(--clay);
+    box-shadow: 0 0 0 3px rgba(217,119,87,0.16), var(--shadow-sm);
+  }
+  .field .f-mono {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 13.5px; color: var(--ink);
+  }
+  .field .f-mono .ph { color: var(--muted-2); }
+  .field .caret {
+    width: 1.5px; height: 17px; background: var(--clay);
+    animation: blink 1.05s steps(2,start) infinite;
+    margin-left: 1px;
+  }
+  .dl-btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; font-weight: 600; color: #fff;
+    background: linear-gradient(150deg, var(--clay), var(--clay-deep));
+    padding: 8px 14px;
+    border-radius: 8px;
+    box-shadow: 0 3px 9px rgba(193,95,60,0.28), inset 0 1px 1px rgba(255,255,255,0.25);
+  }
+  .dl-btn svg { width: 14px; height: 14px; }
+
+  .val-row { display: flex; align-items: center; gap: 10px; margin-top: 11px; flex-wrap: wrap; }
+  .val-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12.5px; font-weight: 500;
+    padding: 6px 12px;
+    border-radius: 9px;
+  }
+  .val-chip .vc-ico { width: 15px; height: 15px; display: flex; }
+  .val-chip.valid {
+    color: var(--ready);
+    background: var(--ready-soft);
+    border: 1px solid #CFE2CA;
+  }
+  .val-chip.valid .meta { color: var(--ink-2); font-weight: 400; }
+  .val-chip.valid .meta .mono { font-family: var(--font-mono); font-size: 11.5px; }
+  .val-chip.invalid {
+    color: #B4503D;
+    background: #F6E3DC;
+    border: 1px solid #E9CBC0;
+  }
+  .val-example {
+    font-size: 12px; color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 12px;
+  }
+  .val-example .ex-name {
+    font-family: var(--font-mono); font-size: 11.5px;
+    color: var(--muted-2);
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    padding: 2px 7px; border-radius: 6px;
+  }
+
+  /* provider segmented control */
+  .segmented {
+    display: inline-flex;
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    padding: 3px;
+    gap: 2px;
+    margin-bottom: 14px;
+  }
+  .seg {
+    font-size: 12.5px; font-weight: 500;
+    color: var(--ink-2);
+    padding: 6px 13px;
+    border-radius: 8px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .seg.active {
+    background: var(--surface-raise);
+    color: var(--clay-deep);
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+    border: 1px solid var(--hairline-2);
+  }
+  .seg .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted-2); }
+  .seg.active .dot { background: var(--clay); }
+
+  .key-row { display: flex; gap: 10px; align-items: center; }
+  .key-field {
+    flex: 1;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface-raise);
+    border: 1px solid var(--hairline-2);
+    border-radius: 11px;
+    padding: 0 14px;
+    height: 44px;
+    box-shadow: var(--shadow-sm);
+  }
+  .key-field .key-ico { color: var(--muted-2); }
+  .key-field .key-ico svg { width: 15px; height: 15px; display:block; }
+  .key-field .masked {
+    font-family: var(--font-mono);
+    font-size: 14px; letter-spacing: 1px; color: var(--ink-2);
+    flex: 1;
+  }
+  .key-field .key-valid {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; color: var(--ready);
+  }
+  .key-field .key-valid svg { width: 14px; height: 14px; }
+
+  .footer-note {
+    grid-column: 1 / -1;
+    text-align: center;
+    font-family: var(--font-serif);
+    font-size: 12.5px;
+    color: var(--muted-2);
+    margin-top: 8px;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+<div class="desktop">
+
+  <!-- macOS menu bar -->
+  <div class="menubar">
+    <span class="mb-logo"> PopDraft</span>
+    <span class="mb-item">File</span>
+    <span class="mb-item dim">Edit</span>
+    <span class="mb-item dim">Actions</span>
+    <span class="mb-item dim">Window</span>
+    <span class="mb-item dim">Help</span>
+    <span class="mb-right">
+      <span class="mb-glyph">
+        <span class="seal">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l1.6 4.3L18 9l-4.4 1.7L12 15l-1.6-4.3L6 9l4.4-1.7L12 3z" fill="#fff"/><circle cx="18.5" cy="5.5" r="1.3" fill="#fff"/></svg>
+        </span>
+        Ready
+      </span>
+      <span class="mb-item dim">100%</span>
+      <span class="mb-item dim">Mon 9:41</span>
+    </span>
+  </div>
+
+  <div class="board">
+
+    <div class="board-head">
+      <span class="kicker">PopDraft · Redesign</span>
+      <h1>An unhurried companion for everything you write.</h1>
+      <p>Warm editorial direction — paper-cream surfaces, a clay wax-seal bubble, and a serif-and-sans
+         pairing that makes the whole thing feel like a well-set page rather than a control panel.</p>
+    </div>
+
+    <!-- ===================== SURFACE A ===================== -->
+    <div class="cell">
+      <div class="surface-a">
+        <span class="surface-a-label">Desktop · bottom-right corner</span>
+
+        <div class="desk-icon" style="left:30px; top:62px;"><div class="ico"></div>Notes.txt</div>
+        <div class="desk-icon" style="left:30px; top:138px;"><div class="ico"></div>Draft v3</div>
+
+        <div class="bubble-zone">
+          <div class="peek-label">
+            <span class="kbd">⌥Space</span> to ask
+          </div>
+          <div class="bubble">
+            <span class="status-dot"></span>
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M12 2.6l1.9 5.1 5.5 2-5.5 2L12 17l-1.9-5.3-5.5-2 5.5-2L12 2.6z" fill="#fff"/>
+              <path d="M19 3.4l.7 1.9 2 .7-2 .7-.7 1.9-.7-1.9-2-.7 2-.7.7-1.9z" fill="#FFE6DA"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+      <div class="caption"><b>A · Resting bubble.</b> A clay wax-seal pebble pinned to the chosen corner.
+        A green dot signals the local model is loaded; a soft tooltip peeks the hotkey on hover.</div>
+    </div>
+
+    <!-- ===================== SURFACE B ===================== -->
+    <div class="cell">
+      <div class="surface-b-stage">
+        <div class="ghost-doc">
+          Our platform helps teams ship faster.
+          <span class="sel">We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days.</span>
+        </div>
+
+        <div class="panel">
+          <div class="panel-quote">
+            <span class="qmark">&ldquo;</span>
+            <span class="qtext">We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days.</span>
+          </div>
+
+          <div class="actions">
+            <!-- PRIMARY -->
+            <div class="action-row primary">
+              <span class="a-icon">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l1.7 4.6L18 9l-4.3 1.4L12 15l-1.7-4.6L6 9l4.3-1.4L12 3z" fill="currentColor"/></svg>
+              </span>
+              <span class="a-name">Ask Agent
+                <div class="a-sub">Chat, reason, search & take actions</div>
+              </span>
+              <span class="a-default">Default</span>
+              <span class="a-kbd">⌥Space</span>
+            </div>
+
+            <div class="action-row">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h12M4 17h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M17 15.5l1.5 1.5 3-3.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="a-name">Grammar Check</span>
+              <span class="a-kbd">⌃⌥G</span>
+            </div>
+
+            <!-- hovered -->
+            <div class="action-row hover">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M5 17l4.5-9 4.5 9M6.6 14h5.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 8.5c2.5 0 3.5 1.5 3.5 4s-1.2 4-3.3 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+              <span class="a-name">Articulate</span>
+              <span class="a-kbd">⌃⌥A</span>
+            </div>
+
+            <div class="action-row">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6.5A2.5 2.5 0 016.5 4h11A2.5 2.5 0 0120 6.5v7A2.5 2.5 0 0117.5 16H9l-4 4v-4H6.5" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>
+              <span class="a-name">Craft a Reply</span>
+              <span class="a-kbd">⌃⌥C</span>
+            </div>
+
+            <div class="action-row">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.4" stroke="currentColor" stroke-width="1.7"/><path d="M12 16.5v.01M10.4 9.8c0-1 .8-1.8 1.8-1.8s1.8.7 1.8 1.7c0 1.4-1.7 1.5-1.7 3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+              <span class="a-name">Explain Simply</span>
+            </div>
+
+            <div class="action-row">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M5 19l1-3.6 9-9a2.1 2.1 0 013 3l-9 9L5 19z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M13.5 6.5l3 3" stroke="currentColor" stroke-width="1.7"/></svg></span>
+              <span class="a-name">Continue Writing</span>
+            </div>
+
+            <div class="action-row">
+              <span class="a-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 9.5v5h3l4.5 3.5v-12L7 9.5H4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M16 9c1 .9 1.6 2 1.6 3s-.6 2.1-1.6 3M18.6 7c1.6 1.3 2.4 3 2.4 5s-.8 3.7-2.4 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+              <span class="a-name">Read Aloud</span>
+              <span class="a-kbd">⌃⌥S</span>
+            </div>
+          </div>
+
+          <div class="panel-footer">
+            <span class="footer-hint">Any action opens the chat.</span>
+            <span class="copy-btn">
+              <svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="12" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.2A2.2 2.2 0 0013.8 4H6.2A2.2 2.2 0 004 6.2v7.6A2.2 2.2 0 006.2 16H8" stroke="currentColor" stroke-width="1.8"/></svg>
+              Copy
+            </span>
+          </div>
+        </div>
+      </div>
+      <div class="caption"><b>B · Action menu.</b> The selected sentence sits up top as a serif pull-quote.
+        <em>Ask Agent</em> is the clay-sealed default; a persistent Copy lives in the footer and returns
+        the bubble to its corner.</div>
+    </div>
+
+    <!-- ===================== SURFACE C ===================== -->
+    <div class="cell wide">
+      <div class="win chat-win">
+        <div class="chat-header">
+          <span class="chat-seal">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l1.7 4.6L18 9l-4.3 1.4L12 15l-1.7-4.6L6 9l4.3-1.4L12 3z" fill="#fff"/></svg>
+          </span>
+          <div class="chat-title-wrap">
+            <span class="chat-title">Tightening the product blurb</span>
+            <span class="model-ind">
+              <span class="ready"></span>
+              <span class="mono">Qwen2.5-7B</span> · local · ready
+            </span>
+          </div>
+          <div class="chat-tools">
+            <span class="icon-btn min" title="Minimize to bubble">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="19" cy="19" r="2.4" fill="currentColor"/></svg>
+            </span>
+            <span class="icon-btn" title="Session menu">
+              <svg viewBox="0 0 24 24" fill="none"><circle cx="6" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="18" cy="12" r="1.6" fill="currentColor"/></svg>
+            </span>
+          </div>
+        </div>
+
+        <div class="chat-body">
+
+          <!-- context chip -->
+          <div class="ctx-chip">
+            <span class="paperclip"><svg viewBox="0 0 24 24" fill="none"><path d="M19 11l-7.5 7.5a4 4 0 01-5.7-5.7l8-8a2.6 2.6 0 013.7 3.7l-8 8a1.2 1.2 0 01-1.8-1.7l7.2-7.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <div>
+              <div class="ctx-label">Selected text · attached</div>
+              <div class="ctx-text">"Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days."</div>
+            </div>
+          </div>
+
+          <!-- user message -->
+          <div class="msg user">
+            <div class="msg-head">
+              <span class="avatar u">O</span>
+              <span class="author">You</span>
+              <span class="copy-msg"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="12" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.2A2.2 2.2 0 0013.8 4H6.2A2.2 2.2 0 004 6.2v7.6A2.2 2.2 0 006.2 16H8" stroke="currentColor" stroke-width="1.8"/></svg>Copy</span>
+            </div>
+            <div class="msg-body">Make this more concise, and double-check the 40% pricing claim.</div>
+          </div>
+
+          <!-- assistant message -->
+          <div class="msg assistant">
+            <div class="msg-head">
+              <span class="avatar a">P</span>
+              <span class="author">PopDraft Agent</span>
+              <span class="copy-msg show"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="12" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.2A2.2 2.2 0 0013.8 4H6.2A2.2 2.2 0 004 6.2v7.6A2.2 2.2 0 006.2 16H8" stroke="currentColor" stroke-width="1.8"/></svg>Copy</span>
+            </div>
+            <div class="msg-body" style="display:flex; flex-direction:column; gap:13px;">
+
+              <!-- thinking -->
+              <div class="thinking">
+                <div class="thinking-head">
+                  <span class="chev"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                  <span class="spark"><svg viewBox="0 0 24 24" fill="none"><path d="M12 4l1.3 3.7L17 9l-3.7 1.3L12 14l-1.3-3.7L7 9l3.7-1.3L12 4z" fill="currentColor"/></svg></span>
+                  <span class="ti-label">Reasoning…</span>
+                  <span class="dur">2.4s · 3 steps</span>
+                </div>
+                <div class="thinking-body">
+                  The sentence is wordy — I can cut "on average" and merge the two clauses. The 40%
+                  figure is a factual claim worth verifying, so I'll search for a recent benchmark
+                  before committing to it in the rewrite.
+                </div>
+              </div>
+
+              <!-- tool call -->
+              <div class="toolcall">
+                <div class="toolcall-head">
+                  <span class="tc-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.6" stroke="currentColor" stroke-width="1.8"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>
+                  <span class="tc-name"><span class="fn">web_search</span>(<span class="arg">"enterprise SaaS pricing benchmark 2026"</span>)</span>
+                  <span class="tc-badge"><span class="d"></span>Done · 5 results</span>
+                </div>
+                <div class="toolcall-result">
+                  <div class="tc-snippet">
+                    <span class="favicon">SB</span>
+                    <div>
+                      <div class="src">stateofsaas.io · 2026 Deployment Report</div>
+                      <div class="snip">Teams adopting automated CI/CD pipelines cut median deployment time by <b>38–42%</b> within the first quarter — consistent with the figure cited.</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- streamed rewrite -->
+              <div class="rewrite">
+                <div class="rewrite-head">
+                  <span class="rw-label">Concise rewrite</span>
+                  <span class="copy-block"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="12" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.2A2.2 2.2 0 0013.8 4H6.2A2.2 2.2 0 004 6.2v7.6A2.2 2.2 0 006.2 16H8" stroke="currentColor" stroke-width="1.8"/></svg>Copy</span>
+                </div>
+                <div class="rewrite-text">Our platform helps teams ship faster — cutting deployment time by roughly 40% and getting new users onboarded in days.</div>
+              </div>
+
+              <div class="stream-line" style="font-size:14px; line-height:1.6;">
+                I verified the 40% claim against a 2026 deployment benchmark, which reports a
+                38–42% reduction — so the figure holds. I softened it to "roughly 40%" for honesty<span class="cursor"></span>
+              </div>
+
+            </div>
+          </div>
+
+        </div>
+
+        <!-- input -->
+        <div class="chat-input-wrap">
+          <div class="chat-input">
+            <span class="ci-placeholder">Ask anything, or paste more text…</span>
+            <div class="ci-bottom">
+              <span class="tool-chip on">
+                <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18" stroke="currentColor" stroke-width="1.5"/></svg>
+                Web
+              </span>
+              <span class="tool-chip">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 4v6c0 4-3 6.5-7 8-4-1.5-7-4-7-8V7l7-4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9.5 12l1.8 1.8L15 10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Actions
+              </span>
+              <span class="send-btn">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h13M13 6l6 6-6 6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="caption"><b>C · Agent chat.</b> The centerpiece, modeled on claude.ai: roomy author-labeled
+        blocks, an italic serif "Reasoning…" disclosure, a sage-tinted <em>web_search</em> tool card with its
+        result, a copyable rewrite, and a live streaming cursor. Every message and block carries its own Copy.</div>
+    </div>
+
+    <!-- ===================== SURFACE D ===================== -->
+    <div class="cell wide">
+      <div class="win">
+        <div class="win-bar">
+          <span class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></span>
+          <span class="win-title">Settings — Models</span>
+        </div>
+        <div class="settings-body">
+
+          <div class="settings-section">
+            <div class="set-label">Local model</div>
+            <div class="set-help">Paste any model name. PopDraft checks Hugging Face instantly and validates it's downloadable as GGUF.</div>
+
+            <div class="field focus">
+              <span class="f-mono">Qwen2.5-7B-Instruct-GGUF<span class="caret"></span></span>
+              <span class="dl-btn">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 4v11M7.5 11l4.5 4.5 4.5-4.5" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 19h14" stroke="#fff" stroke-width="1.9" stroke-linecap="round"/></svg>
+                Download
+              </span>
+            </div>
+
+            <div class="val-row">
+              <span class="val-chip valid">
+                <span class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" fill="#DDEDD8"/><path d="M8 12.3l2.6 2.6L16 9.4" stroke="#5E8C5A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                Found on Hugging Face
+                <span class="meta">· <span class="mono">Q4_K_M</span> · 4.7 GB</span>
+              </span>
+            </div>
+
+            <div class="val-example">
+              <span>Type something unknown and you'll see it at once —</span>
+              <span class="ex-name">llama-9000-ultra</span>
+              <span class="val-chip invalid" style="padding:4px 10px;">
+                <span class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" fill="#F0D2C8"/><path d="M9 9l6 6M15 9l-6 6" stroke="#B4503D" stroke-width="2" stroke-linecap="round"/></svg></span>
+                Not found
+              </span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="set-label">Cloud provider</div>
+            <div class="set-help">Or connect a hosted model with an API key — validated the moment you paste it.</div>
+
+            <div class="segmented">
+              <span class="seg"><span class="dot"></span>Local</span>
+              <span class="seg"><span class="dot"></span>OpenAI</span>
+              <span class="seg active"><span class="dot"></span>Anthropic</span>
+              <span class="seg"><span class="dot"></span>Gemini</span>
+              <span class="seg"><span class="dot"></span>OpenRouter</span>
+            </div>
+
+            <div class="key-row">
+              <div class="key-field">
+                <span class="key-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="8" cy="12" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M11.5 12H20l-2 2.4M16 12v2.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                <span class="masked">sk-ant-•••••••••••••••••••••••••3f9a</span>
+                <span class="key-valid"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12.5l4 4L19 7" stroke="#5E8C5A" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>key valid</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+      <div class="caption"><b>D · Model settings.</b> Paste-to-validate, no fixed list. A green "Found on Hugging
+        Face · Q4_K_M · 4.7 GB" chip with a clay Download button, plus an inline "Not found" example so the instant
+        feedback reads instantly. Cloud providers get a segmented control, masked key, and a "key valid" check.</div>
+    </div>
+
+    <div class="footer-note">PopDraft · Warm Editorial direction — paper, clay, and a serif that knows how to sit still.</div>
+
+  </div>
+</div>
+</body>
+</html>

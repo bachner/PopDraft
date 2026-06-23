@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PopDraft — Liquid Glass</title>
+<style>
+  /* ============================================================
+     PopDraft Redesign — "Liquid Glass / visionOS" mock
+     macOS Tahoe / visionOS system look.
+     ============================================================ */
+
+  :root {
+    --blue: #0A84FF;
+    --blue-soft: rgba(10, 132, 255, 0.14);
+    --ink: #1c1c1e;
+    --ink-2: #3a3a3c;
+    --ink-3: rgba(60, 60, 67, 0.6);
+    --ink-4: rgba(60, 60, 67, 0.4);
+    --glass: rgba(255, 255, 255, 0.62);
+    --glass-strong: rgba(255, 255, 255, 0.78);
+    --glass-thin: rgba(255, 255, 255, 0.34);
+    --hair-light: rgba(255, 255, 255, 0.7);
+    --hair-dark: rgba(0, 0, 0, 0.06);
+    --green: #30D158;
+    --font-ui: -apple-system, "SF Pro Text", "SF Pro Display", system-ui, BlinkMacSystemFont, sans-serif;
+    --font-serif: ui-serif, "New York", Georgia, serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --shadow-card:
+      0 1px 1px rgba(0,0,0,0.04),
+      0 8px 24px rgba(0,0,0,0.10),
+      0 28px 64px rgba(0,0,0,0.14);
+    --shadow-soft: 0 2px 10px rgba(0,0,0,0.08), 0 12px 30px rgba(0,0,0,0.10);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    font-family: var(--font-ui);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    color: var(--ink);
+  }
+
+  /* ---- Desktop wallpaper: soft multi-color gradient blobs ---- */
+  body {
+    min-height: 100vh;
+    position: relative;
+    background:
+      radial-gradient(1100px 720px at 12% 8%, #ffd9a8 0%, rgba(255,217,168,0) 60%),
+      radial-gradient(1000px 800px at 88% 4%, #b8c9ff 0%, rgba(184,201,255,0) 58%),
+      radial-gradient(1200px 900px at 78% 96%, #ffc1e3 0%, rgba(255,193,227,0) 60%),
+      radial-gradient(1100px 820px at 6% 92%, #a9f0d8 0%, rgba(169,240,216,0) 60%),
+      linear-gradient(135deg, #eef1f7 0%, #e7ecf6 50%, #f3eef7 100%);
+    background-attachment: fixed;
+    overflow-x: hidden;
+  }
+  /* extra floating color blobs for vibrancy depth */
+  body::before, body::after {
+    content: "";
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(90px);
+    opacity: 0.55;
+    z-index: 0;
+    pointer-events: none;
+  }
+  body::before {
+    width: 620px; height: 620px;
+    left: 40%; top: 22%;
+    background: radial-gradient(circle at 30% 30%, #8ab6ff, #c69bff 70%);
+  }
+  body::after {
+    width: 520px; height: 520px;
+    right: 26%; bottom: 8%;
+    background: radial-gradient(circle at 60% 40%, #ffb1c8, #ffd79a 70%);
+  }
+
+  /* ---- macOS top menu bar ---- */
+  .menubar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 30px;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 0 16px;
+    background: rgba(255,255,255,0.42);
+    backdrop-filter: blur(26px) saturate(180%);
+    -webkit-backdrop-filter: blur(26px) saturate(180%);
+    border-bottom: 0.5px solid rgba(255,255,255,0.5);
+    font-size: 13px;
+    font-weight: 500;
+    color: rgba(20,20,22,0.82);
+  }
+  .menubar .apple { font-size: 15px; opacity: 0.85; }
+  .menubar .mb-app { font-weight: 700; }
+  .menubar .mb-item { opacity: 0.72; font-weight: 400; }
+  .menubar .spacer { margin-left: auto; }
+  .menubar .mb-right {
+    display: flex; align-items: center; gap: 16px;
+    color: rgba(20,20,22,0.72);
+    font-weight: 400;
+  }
+  .menubar .pd-glyph {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-weight: 500;
+  }
+  .menubar .pd-glyph svg { display: block; }
+
+  /* ---- Board layout ---- */
+  .board {
+    position: relative;
+    z-index: 10;
+    width: 1280px;
+    margin: 0 auto;
+    padding: 64px 40px 80px;
+  }
+  .board-head {
+    margin-bottom: 30px;
+    padding-left: 4px;
+  }
+  .board-head h1 {
+    font-family: "SF Pro Display", var(--font-ui);
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: rgba(20,20,24,0.92);
+  }
+  .board-head p {
+    margin-top: 5px;
+    font-size: 14px;
+    color: rgba(40,40,46,0.62);
+    letter-spacing: -0.01em;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px 36px;
+    align-items: start;
+  }
+
+  .surface { display: flex; flex-direction: column; }
+  .caption {
+    margin-top: 14px;
+    padding: 0 6px;
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: rgba(30,30,36,0.66);
+  }
+  .caption b { color: rgba(20,20,24,0.9); font-weight: 700; }
+
+  /* ============================================================
+     Shared glass primitives
+     ============================================================ */
+  .glass {
+    background: var(--glass);
+    backdrop-filter: blur(40px) saturate(190%);
+    -webkit-backdrop-filter: blur(40px) saturate(190%);
+    border: 0.5px solid var(--hair-light);
+    box-shadow: var(--shadow-card);
+  }
+  .glass-inner {
+    background: var(--glass-thin);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border: 0.5px solid rgba(255,255,255,0.5);
+  }
+
+  /* window chrome traffic lights */
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .traffic i {
+    width: 12px; height: 12px; border-radius: 50%;
+    display: inline-block;
+    box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.12);
+  }
+  .traffic .r { background: #ff5f57; }
+  .traffic .y { background: #febc2e; }
+  .traffic .g { background: #28c840; }
+
+  /* ============================================================
+     SURFACE A — Minimized bubble (resting state)
+     ============================================================ */
+  .desk-card {
+    position: relative;
+    height: 360px;
+    border-radius: 26px;
+    overflow: hidden;
+    background:
+      radial-gradient(700px 460px at 18% 14%, rgba(255,221,170,0.9), rgba(255,221,170,0) 62%),
+      radial-gradient(620px 520px at 92% 88%, rgba(255,176,212,0.95), rgba(255,176,212,0) 60%),
+      radial-gradient(640px 520px at 88% 10%, rgba(170,196,255,0.9), rgba(170,196,255,0) 60%),
+      linear-gradient(140deg, #f3ece0, #e9eefb 55%, #f6eaf3);
+    border: 0.5px solid rgba(255,255,255,0.7);
+    box-shadow: var(--shadow-card);
+  }
+  .desk-card .desk-grain {
+    position: absolute; inset: 0;
+    background: radial-gradient(420px 320px at 60% 40%, rgba(255,255,255,0.4), rgba(255,255,255,0) 70%);
+    pointer-events: none;
+  }
+
+  /* the bubble, pinned bottom-right */
+  .bubble-wrap {
+    position: absolute;
+    right: 26px; bottom: 26px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  /* hover peek pill */
+  .peek-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 13px 8px 11px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.66);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 0.5px solid rgba(255,255,255,0.8);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+    font-size: 12.5px;
+    font-weight: 500;
+    color: rgba(30,30,36,0.85);
+    white-space: nowrap;
+  }
+  .peek-pill .status-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 3px rgba(48,209,88,0.18), 0 0 8px rgba(48,209,88,0.7);
+  }
+  .peek-pill kbd {
+    font-family: var(--font-ui);
+    font-size: 11px; font-weight: 600;
+    padding: 1.5px 5px;
+    border-radius: 5px;
+    background: rgba(0,0,0,0.06);
+    color: rgba(20,20,24,0.78);
+    box-shadow: inset 0 -0.5px 0 rgba(0,0,0,0.06);
+  }
+
+  .bubble {
+    position: relative;
+    width: 66px; height: 66px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background:
+      radial-gradient(circle at 32% 26%, rgba(255,255,255,0.95), rgba(255,255,255,0.32) 46%, rgba(255,255,255,0.05) 70%),
+      radial-gradient(circle at 70% 78%, rgba(10,132,255,0.42), rgba(10,132,255,0) 60%),
+      linear-gradient(150deg, rgba(190,214,255,0.85), rgba(214,196,255,0.78));
+    border: 0.75px solid rgba(255,255,255,0.85);
+    box-shadow:
+      inset 0 1px 2px rgba(255,255,255,0.9),
+      inset 0 -8px 18px rgba(10,132,255,0.18),
+      0 10px 26px rgba(60,80,160,0.30),
+      0 2px 6px rgba(0,0,0,0.10);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+  .bubble::after { /* specular highlight */
+    content: "";
+    position: absolute;
+    top: 8px; left: 14px;
+    width: 26px; height: 16px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,255,255,0.95), rgba(255,255,255,0) 70%);
+    filter: blur(1px);
+  }
+  .bubble svg { position: relative; z-index: 2; }
+  /* tiny ready dot on the orb */
+  .bubble .orb-ready {
+    position: absolute;
+    right: 3px; bottom: 4px;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--green);
+    border: 2.5px solid rgba(255,255,255,0.95);
+    box-shadow: 0 0 8px rgba(48,209,88,0.6);
+    z-index: 3;
+  }
+
+  /* faux dock hint at bottom */
+  .desk-dock {
+    position: absolute;
+    left: 50%; bottom: 14px;
+    transform: translateX(-50%);
+    display: flex; gap: 10px;
+    padding: 8px 12px;
+    border-radius: 18px;
+    background: rgba(255,255,255,0.34);
+    backdrop-filter: blur(18px) saturate(160%);
+    -webkit-backdrop-filter: blur(18px) saturate(160%);
+    border: 0.5px solid rgba(255,255,255,0.55);
+  }
+  .desk-dock i {
+    width: 34px; height: 34px; border-radius: 9px;
+    display: block;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6), 0 2px 5px rgba(0,0,0,0.12);
+  }
+  .desk-dock i:nth-child(1){ background: linear-gradient(160deg,#7ab8ff,#3a82f6); }
+  .desk-dock i:nth-child(2){ background: linear-gradient(160deg,#ffd36b,#ff9f43); }
+  .desk-dock i:nth-child(3){ background: linear-gradient(160deg,#a0e8b0,#34c759); }
+  .desk-dock i:nth-child(4){ background: linear-gradient(160deg,#ffa6c4,#ff5e9c); }
+
+  /* ============================================================
+     SURFACE B — Action menu
+     ============================================================ */
+  .panel {
+    width: 360px;
+    border-radius: 22px;
+    overflow: hidden;
+    padding: 8px;
+  }
+  .panel-quote {
+    margin: 4px 6px 8px;
+    padding: 11px 13px;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.36);
+    border: 0.5px solid rgba(255,255,255,0.5);
+    font-family: var(--font-serif);
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--ink-2);
+    display: flex; gap: 9px; align-items: flex-start;
+  }
+  .panel-quote .qbar {
+    flex: 0 0 3px; align-self: stretch;
+    border-radius: 3px;
+    background: linear-gradient(var(--blue), #66b2ff);
+    margin-top: 1px;
+  }
+  .panel-quote .qtext {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 290px;
+  }
+  .action-list { display: flex; flex-direction: column; gap: 2px; }
+  .action {
+    display: flex; align-items: center; gap: 11px;
+    padding: 9px 11px;
+    border-radius: 13px;
+    cursor: default;
+    position: relative;
+  }
+  .action .ico {
+    width: 30px; height: 30px; border-radius: 9px;
+    display: grid; place-items: center;
+    background: rgba(255,255,255,0.5);
+    border: 0.5px solid rgba(255,255,255,0.6);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.7);
+    color: var(--ink-2);
+    flex: 0 0 auto;
+  }
+  .action .name {
+    font-size: 14px; font-weight: 500; letter-spacing: -0.01em;
+    color: var(--ink);
+    flex: 1;
+  }
+  .action .name small {
+    display: block; font-weight: 400; font-size: 11.5px;
+    color: var(--ink-3); margin-top: 1px;
+  }
+  .action .keys { display: flex; gap: 4px; }
+  .action kbd {
+    font-family: var(--font-ui);
+    font-size: 11px; font-weight: 600;
+    min-width: 18px; text-align: center;
+    padding: 2px 5px;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.05);
+    color: var(--ink-3);
+    box-shadow: inset 0 -0.5px 0 rgba(0,0,0,0.06);
+  }
+  /* primary / default action */
+  .action.primary {
+    background: linear-gradient(135deg, rgba(10,132,255,0.16), rgba(10,132,255,0.08));
+    border: 0.5px solid rgba(10,132,255,0.32);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6), 0 2px 10px rgba(10,132,255,0.14);
+  }
+  .action.primary .ico {
+    background: linear-gradient(150deg, #2f97ff, var(--blue));
+    border-color: rgba(255,255,255,0.5);
+    color: #fff;
+    box-shadow: 0 3px 10px rgba(10,132,255,0.4), inset 0 1px 1px rgba(255,255,255,0.5);
+  }
+  .action.primary .name { font-weight: 600; color: #0a4da8; }
+  .action.primary kbd { background: rgba(10,132,255,0.16); color: #0a5dc2; }
+  .action.primary .badge {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--blue);
+    background: rgba(10,132,255,0.14);
+    padding: 2px 7px; border-radius: 999px;
+    margin-left: 2px;
+  }
+  /* hover/selected row */
+  .action.hover {
+    background: rgba(255,255,255,0.55);
+    border: 0.5px solid rgba(255,255,255,0.7);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.8), 0 2px 8px rgba(0,0,0,0.06);
+  }
+  .panel-foot {
+    margin: 8px 4px 4px;
+    display: flex; gap: 8px;
+  }
+  .copy-btn {
+    flex: 1;
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 10px;
+    border-radius: 13px;
+    background: rgba(255,255,255,0.55);
+    border: 0.5px solid rgba(255,255,255,0.75);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.8), 0 2px 8px rgba(0,0,0,0.07);
+    font-size: 13.5px; font-weight: 600; color: var(--ink-2);
+    letter-spacing: -0.01em;
+  }
+  .copy-btn small { font-weight: 400; color: var(--ink-3); margin-left: 2px; }
+
+  /* ============================================================
+     SURFACE C — Agent chat (centerpiece)
+     ============================================================ */
+  .chat {
+    border-radius: 24px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    height: 620px;
+  }
+  .chat-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 16px;
+    border-bottom: 0.5px solid rgba(255,255,255,0.5);
+    background: rgba(255,255,255,0.3);
+  }
+  .chat-head .traffic { margin-right: 4px; }
+  .chat-title {
+    font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+  .chat-title small { display:block; font-weight: 400; font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+  .model-chip {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.5);
+    border: 0.5px solid rgba(255,255,255,0.7);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.7);
+    font-size: 12px; font-weight: 500; color: var(--ink-2);
+  }
+  .model-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 0 2.5px rgba(48,209,88,0.18); }
+  .chat-head .min-btn {
+    width: 30px; height: 30px; border-radius: 9px;
+    display: grid; place-items: center;
+    background: rgba(255,255,255,0.5);
+    border: 0.5px solid rgba(255,255,255,0.7);
+    color: var(--ink-3);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.7);
+  }
+
+  .chat-body {
+    flex: 1;
+    overflow: hidden;
+    padding: 18px 18px 8px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  /* context quote chip */
+  .ctx-chip {
+    align-self: flex-start;
+    max-width: 100%;
+    padding: 10px 13px;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.34);
+    border: 0.5px solid rgba(255,255,255,0.55);
+    display: flex; gap: 9px; align-items: flex-start;
+  }
+  .ctx-chip .qbar { flex:0 0 3px; align-self: stretch; border-radius:3px;
+    background: linear-gradient(var(--blue), #66b2ff); }
+  .ctx-chip .ctx-label {
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--ink-4); margin-bottom: 3px;
+  }
+  .ctx-chip .ctx-text {
+    font-family: var(--font-serif); font-size: 12.5px; line-height: 1.45; color: var(--ink-2);
+  }
+
+  /* messages */
+  .msg { display: flex; flex-direction: column; gap: 5px; }
+  .msg.user { align-items: flex-end; }
+  .bubble-msg {
+    position: relative;
+    max-width: 86%;
+    padding: 11px 14px;
+    border-radius: 16px;
+    font-size: 13.5px; line-height: 1.5; letter-spacing: -0.01em;
+  }
+  .msg.user .bubble-msg {
+    background: linear-gradient(135deg, #2f97ff, var(--blue));
+    color: #fff;
+    border: 0.5px solid rgba(255,255,255,0.25);
+    box-shadow: 0 4px 14px rgba(10,132,255,0.32);
+    border-bottom-right-radius: 6px;
+  }
+  .msg.assistant .bubble-msg {
+    background: rgba(255,255,255,0.58);
+    border: 0.5px solid rgba(255,255,255,0.7);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.7), 0 2px 10px rgba(0,0,0,0.05);
+    color: var(--ink);
+    border-bottom-left-radius: 6px;
+  }
+
+  /* per-message copy button */
+  .msg-tools { display: flex; gap: 6px; align-items: center; padding: 0 4px; }
+  .msg.user .msg-tools { justify-content: flex-end; }
+  .icon-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.45);
+    border: 0.5px solid rgba(255,255,255,0.6);
+    font-size: 11px; font-weight: 500; color: var(--ink-3);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6);
+  }
+  .icon-btn svg { display:block; }
+
+  /* thinking line (collapsible) */
+  .think {
+    display: inline-flex; align-items: center; gap: 8px;
+    align-self: flex-start;
+    padding: 7px 12px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.32);
+    border: 0.5px solid rgba(255,255,255,0.5);
+    font-size: 12px; font-weight: 500; color: var(--ink-3);
+  }
+  .think .chev { color: var(--ink-4); transition: transform .2s; }
+  .think .spark { color: #a98bff; }
+
+  /* tool call card */
+  .toolcall {
+    align-self: flex-start;
+    max-width: 92%;
+    border-radius: 14px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.4);
+    border: 0.5px solid rgba(255,255,255,0.6);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6);
+  }
+  .toolcall .tc-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px;
+    border-bottom: 0.5px solid rgba(0,0,0,0.05);
+    font-family: var(--font-mono);
+    font-size: 12px; color: var(--ink-2);
+  }
+  .toolcall .tc-head .tc-ico {
+    width: 20px; height: 20px; border-radius: 6px;
+    display: grid; place-items: center;
+    background: var(--blue-soft); color: var(--blue);
+  }
+  .toolcall .tc-head .tc-fn { color: #0a5dc2; font-weight: 600; }
+  .toolcall .tc-head .tc-arg { color: var(--ink-3); }
+  .toolcall .tc-head .tc-ok {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
+    color: var(--green);
+  }
+  .toolcall .tc-result {
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .tc-snip {
+    display: flex; gap: 9px; align-items: flex-start;
+    font-size: 11.5px; line-height: 1.4; color: var(--ink-2);
+  }
+  .tc-snip .fav {
+    flex: 0 0 16px; height: 16px; border-radius: 4px; margin-top: 1px;
+    background: linear-gradient(150deg,#ff9f43,#ff5e7e);
+  }
+  .tc-snip .fav.b { background: linear-gradient(150deg,#5ea0ff,#3a6df0); }
+  .tc-snip b { color: var(--ink); font-weight: 600; }
+  .tc-snip .src { color: var(--ink-4); font-size: 10.5px; }
+
+  /* streaming shimmer on last line */
+  .stream-line {
+    position: relative;
+  }
+  .stream-line .cursor {
+    display: inline-block;
+    width: 2px; height: 1.05em;
+    vertical-align: text-bottom;
+    margin-left: 1px;
+    background: var(--blue);
+    border-radius: 1px;
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .shimmer {
+    background: linear-gradient(100deg,
+      var(--ink) 0%, var(--ink) 38%,
+      rgba(10,132,255,0.55) 50%,
+      var(--ink) 62%, var(--ink) 100%);
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 2.4s linear infinite;
+  }
+  @keyframes shimmer { from { background-position: 160% 0; } to { background-position: -60% 0; } }
+
+  /* chat input */
+  .chat-input {
+    padding: 12px 14px 14px;
+    border-top: 0.5px solid rgba(255,255,255,0.5);
+    background: rgba(255,255,255,0.3);
+  }
+  .input-box {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 8px 8px 14px;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.6);
+    border: 0.5px solid rgba(255,255,255,0.8);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.8), 0 2px 8px rgba(0,0,0,0.05);
+  }
+  .input-box .placeholder { flex: 1; font-size: 13.5px; color: var(--ink-4); letter-spacing: -0.01em; }
+  .send-btn {
+    width: 34px; height: 34px; border-radius: 11px;
+    display: grid; place-items: center;
+    background: linear-gradient(150deg, #2f97ff, var(--blue));
+    border: 0.5px solid rgba(255,255,255,0.35);
+    box-shadow: 0 3px 10px rgba(10,132,255,0.4), inset 0 1px 1px rgba(255,255,255,0.4);
+    color: #fff;
+  }
+  .input-chips { display: flex; gap: 8px; margin-top: 10px; padding-left: 2px; }
+  .tool-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.45);
+    border: 0.5px solid rgba(255,255,255,0.6);
+    font-size: 11.5px; font-weight: 500; color: var(--ink-2);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6);
+  }
+  .tool-chip.on { background: var(--blue-soft); border-color: rgba(10,132,255,0.3); color: #0a5dc2; }
+  .tool-chip svg { display:block; }
+
+  /* ============================================================
+     SURFACE D — Model settings
+     ============================================================ */
+  .settings {
+    border-radius: 22px;
+    overflow: hidden;
+  }
+  .settings-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 18px;
+    border-bottom: 0.5px solid rgba(255,255,255,0.5);
+    background: rgba(255,255,255,0.3);
+  }
+  .settings-head .s-title { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+  .settings-body { padding: 18px; display: flex; flex-direction: column; gap: 20px; }
+
+  .field-label {
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.01em;
+    color: var(--ink-3); margin-bottom: 8px; display: block;
+  }
+  .text-field {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 14px;
+    border-radius: 13px;
+    background: rgba(255,255,255,0.6);
+    border: 0.5px solid rgba(255,255,255,0.8);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.8), 0 1px 6px rgba(0,0,0,0.04);
+    font-family: var(--font-mono);
+    font-size: 13px; color: var(--ink);
+  }
+  .text-field.focus {
+    border: 1px solid var(--blue);
+    box-shadow: 0 0 0 3.5px rgba(10,132,255,0.18), inset 0 1px 1px rgba(255,255,255,0.8);
+  }
+  .text-field .caret {
+    width: 1.5px; height: 16px; background: var(--blue); border-radius: 1px;
+    animation: blink 1s steps(1) infinite;
+  }
+  .text-field .grow { flex: 1; }
+  .text-field .ph { color: var(--ink-4); }
+
+  /* validation chips */
+  .vchip {
+    margin-top: 9px;
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 9px 11px 9px 12px;
+    border-radius: 12px;
+    font-size: 12.5px; font-weight: 500;
+  }
+  .vchip.valid {
+    background: rgba(48,209,88,0.12);
+    border: 0.5px solid rgba(48,209,88,0.3);
+    color: #1d8a3c;
+  }
+  .vchip.valid .tick {
+    width: 18px; height: 18px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--green); color: #fff; flex: 0 0 auto;
+  }
+  .vchip.valid .meta { color: rgba(29,138,60,0.78); font-weight: 400; }
+  .vchip.valid .meta b { font-weight: 600; color: #1d8a3c; }
+  .vchip .dl-btn {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 13px;
+    border-radius: 9px;
+    background: linear-gradient(150deg, #2f97ff, var(--blue));
+    color: #fff; font-size: 12px; font-weight: 600;
+    border: 0.5px solid rgba(255,255,255,0.3);
+    box-shadow: 0 3px 10px rgba(10,132,255,0.34), inset 0 1px 1px rgba(255,255,255,0.4);
+  }
+  .vchip.invalid {
+    background: rgba(255,69,58,0.1);
+    border: 0.5px solid rgba(255,69,58,0.28);
+    color: #c4321f;
+  }
+  .vchip.invalid .cross {
+    width: 18px; height: 18px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: #ff453a; color: #fff; flex: 0 0 auto;
+  }
+  .vchip.invalid .mono { font-family: var(--font-mono); font-size: 12px; opacity: 0.9; }
+
+  .field-divider { height: 0.5px; background: rgba(0,0,0,0.07); margin: 2px 0; }
+
+  /* segmented control */
+  .segmented {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 11px;
+    background: rgba(0,0,0,0.05);
+    border: 0.5px solid rgba(255,255,255,0.5);
+    gap: 2px;
+  }
+  .segmented .seg {
+    padding: 6px 13px;
+    border-radius: 8px;
+    font-size: 12.5px; font-weight: 500; color: var(--ink-3);
+  }
+  .segmented .seg.active {
+    background: rgba(255,255,255,0.92);
+    color: var(--ink);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12), inset 0 0.5px 0 rgba(255,255,255,0.9);
+  }
+
+  .key-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .key-row .text-field { flex: 1; }
+
+  /* helper */
+  .hint { font-size: 11.5px; color: var(--ink-4); margin-top: 7px; letter-spacing: -0.005em; }
+  .sub-label { font-size: 11px; color: var(--ink-4); margin-top: 6px; }
+
+</style>
+</head>
+<body>
+
+  <!-- ===== macOS menu bar ===== -->
+  <div class="menubar">
+    <span class="apple"></span>
+    <span class="mb-app">PopDraft</span>
+    <span class="mb-item">File</span>
+    <span class="mb-item">Edit</span>
+    <span class="mb-item">View</span>
+    <span class="mb-item">Window</span>
+    <span class="mb-item">Help</span>
+    <span class="spacer"></span>
+    <span class="mb-right">
+      <span class="pd-glyph">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2.5l1.6 4.2c.3.8.9 1.4 1.7 1.7L19.5 10l-4.2 1.6c-.8.3-1.4.9-1.7 1.7L12 17.5l-1.6-4.2c-.3-.8-.9-1.4-1.7-1.7L4.5 10l4.2-1.6c.8-.3 1.4-.9 1.7-1.7L12 2.5z" fill="#0A84FF"/>
+          <path d="M18.5 14l.7 1.9c.13.35.4.62.75.75L21.8 17.4l-1.85.72a1.2 1.2 0 00-.72.75L18.5 20.8l-.72-1.93a1.2 1.2 0 00-.72-.75L15.2 17.4l1.86-.72a1.2 1.2 0 00.72-.75L18.5 14z" fill="#0A84FF" opacity="0.7"/>
+        </svg>
+      </span>
+      <span>100%</span>
+      <span>Mon 2:14 PM</span>
+    </span>
+  </div>
+
+  <!-- ===== Board ===== -->
+  <div class="board">
+    <div class="board-head">
+      <h1>PopDraft — Liquid Glass</h1>
+      <p>A persistent corner companion that turns selected text into agent conversations. macOS Tahoe / visionOS concept.</p>
+    </div>
+
+    <div class="grid">
+
+      <!-- ================= SURFACE A ================= -->
+      <div class="surface">
+        <div class="desk-card">
+          <div class="desk-grain"></div>
+
+          <!-- faux dock -->
+          <div class="desk-dock">
+            <i></i><i></i><i></i><i></i>
+          </div>
+
+          <!-- bubble at rest -->
+          <div class="bubble-wrap">
+            <div class="peek-pill">
+              <span class="status-dot"></span>
+              <span>Qwen2.5-7B ready</span>
+              <span>·</span>
+              <kbd>⌥Space</kbd>
+              <span>to ask</span>
+            </div>
+            <div class="bubble">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+                <path d="M12 2.2l1.85 4.85c.34.9 1.05 1.6 1.95 1.95L20.65 10.85l-4.85 1.85c-.9.34-1.6 1.05-1.95 1.95L12 19.5l-1.85-4.85c-.34-.9-1.05-1.6-1.95-1.95L3.35 10.85l4.85-1.85c.9-.34 1.6-1.05 1.95-1.95L12 2.2z" fill="#fff"/>
+                <path d="M18.8 14.4l.78 2.05c.15.4.46.71.86.86l2.05.78-2.05.78c-.4.15-.71.46-.86.86l-.78 2.05-.78-2.05a1.35 1.35 0 00-.86-.86l-2.05-.78 2.05-.78c.4-.15.71-.46.86-.86l.78-2.05z" fill="#fff" opacity="0.85"/>
+              </svg>
+              <span class="orb-ready"></span>
+            </div>
+          </div>
+        </div>
+        <div class="caption"><b>A · Minimized bubble</b> — resting in the bottom-right corner. A luminous frosted orb; hover peeks a glass pill with the local model status and hotkey.</div>
+      </div>
+
+      <!-- ================= SURFACE B ================= -->
+      <div class="surface">
+        <div class="panel glass">
+          <div class="panel-quote">
+            <span class="qbar"></span>
+            <span class="qtext">"Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40%…"</span>
+          </div>
+
+          <div class="action-list">
+            <!-- primary / default -->
+            <div class="action primary">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 3l1.5 4c.3.7.8 1.2 1.5 1.5L19 10l-4 1.5c-.7.3-1.2.8-1.5 1.5L12 17l-1.5-4c-.3-.7-.8-1.2-1.5-1.5L5 10l4-1.5c.7-.3 1.2-.8 1.5-1.5L12 3z" fill="currentColor"/>
+                </svg>
+              </span>
+              <span class="name">Ask Agent</span>
+              <span class="badge">Default</span>
+              <span class="keys"><kbd>⌥</kbd><kbd>Space</kbd></span>
+            </div>
+
+            <!-- Grammar (hover state) -->
+            <div class="action hover">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 17l3.5-9 3.5 9M5.2 14h4.6"/><path d="M14 17c1-1.6 3-1.6 3.6 0M14 13.6c.7-1.4 3-1.4 3.6 0v3.4"/>
+                </svg>
+              </span>
+              <span class="name">Grammar Check</span>
+              <span class="keys"><kbd>⌃</kbd><kbd>⌥</kbd><kbd>G</kbd></span>
+            </div>
+
+            <div class="action">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 7h16M4 12h12M4 17h8"/><path d="M16.5 16l2 2 3.5-4"/>
+                </svg>
+              </span>
+              <span class="name">Articulate</span>
+              <span class="keys"><kbd>⌃</kbd><kbd>⌥</kbd><kbd>A</kbd></span>
+            </div>
+
+            <div class="action">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 11.5a8.4 8.4 0 01-12 7.6L3 21l1.9-6A8.5 8.5 0 1121 11.5z"/><path d="M8.5 11.5h7M8.5 14.5h4"/>
+                </svg>
+              </span>
+              <span class="name">Craft a Reply</span>
+              <span class="keys"><kbd>⌃</kbd><kbd>⌥</kbd><kbd>C</kbd></span>
+            </div>
+
+            <div class="action">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.6 2.6 0 015 .8c0 1.7-2.5 2.2-2.5 4M12 17.2h.01"/>
+                </svg>
+              </span>
+              <span class="name">Explain Simply</span>
+            </div>
+
+            <div class="action">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M16.5 4.5l3 3L9 18l-4 1 1-4 10.5-10.5z"/><path d="M14 7l3 3"/>
+                </svg>
+              </span>
+              <span class="name">Continue Writing</span>
+            </div>
+
+            <div class="action">
+              <span class="ico">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 6a8.5 8.5 0 010 12"/>
+                </svg>
+              </span>
+              <span class="name">Read Aloud</span>
+              <span class="keys"><kbd>⌃</kbd><kbd>⌥</kbd><kbd>S</kbd></span>
+            </div>
+          </div>
+
+          <div class="panel-foot">
+            <div class="copy-btn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+              </svg>
+              Copy &amp; dismiss <small>— returns bubble to corner</small>
+            </div>
+          </div>
+        </div>
+        <div class="caption"><b>B · Action menu</b> — appears at the cursor on hotkey. "Ask Agent" is the new primary default; any non-Copy choice opens the chat. Grammar row shown hovered.</div>
+      </div>
+
+      <!-- ================= SURFACE C ================= -->
+      <div class="surface">
+        <div class="chat glass">
+          <!-- header -->
+          <div class="chat-head">
+            <div class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+            <div class="chat-title">Tighten product blurb
+              <small>Agent session · saved on Copy</small>
+            </div>
+            <div class="model-chip"><span class="dot"></span>Qwen2.5-7B · local</div>
+            <div class="min-btn" title="Minimize to bubble">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M5 12h14"/>
+              </svg>
+            </div>
+          </div>
+
+          <!-- body -->
+          <div class="chat-body">
+            <!-- context chip -->
+            <div class="ctx-chip">
+              <span class="qbar"></span>
+              <div>
+                <div class="ctx-label">Selected text</div>
+                <div class="ctx-text">"Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days."</div>
+              </div>
+            </div>
+
+            <!-- user message -->
+            <div class="msg user">
+              <div class="bubble-msg">Make this more concise, and double-check the 40% pricing claim.</div>
+              <div class="msg-tools">
+                <span class="icon-btn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                  Copy
+                </span>
+              </div>
+            </div>
+
+            <!-- assistant turn -->
+            <div class="msg assistant">
+              <!-- thinking -->
+              <div class="think">
+                <svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+                <span class="spark">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l1.4 3.8c.25.66.78 1.2 1.45 1.45L18.6 9.6l-3.75 1.35c-.67.25-1.2.79-1.45 1.45L12 16.2l-1.4-3.8a2.1 2.1 0 00-1.45-1.45L5.4 9.6l3.75-1.35c.67-.25 1.2-.79 1.45-1.45L12 3z"/></svg>
+                </span>
+                <span>Reasoning — read the claim, planned a web check, then a rewrite</span>
+                <span style="color:var(--ink-4)">· 4s</span>
+              </div>
+
+              <!-- tool call -->
+              <div class="toolcall">
+                <div class="tc-head">
+                  <span class="tc-ico">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+                  </span>
+                  <span class="tc-fn">web_search</span><span class="tc-arg">("enterprise SaaS pricing benchmark 2026")</span>
+                  <span class="tc-ok">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-11"/></svg>
+                    3 results
+                  </span>
+                </div>
+                <div class="tc-result">
+                  <div class="tc-snip">
+                    <span class="fav b"></span>
+                    <span><b>2026 SaaS Deployment Benchmark Report</b> — Median teams cut deployment time 34–41% after adopting CI/CD automation. <span class="src">stateofsaas.dev</span></span>
+                  </div>
+                  <div class="tc-snip">
+                    <span class="fav"></span>
+                    <span><b>DORA Metrics, Enterprise Cohort</b> — Top-quartile orgs report ~40% faster lead time year over year. <span class="src">devops-research.org</span></span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- streamed answer -->
+              <div class="bubble-msg">
+                Here's a tighter version:
+                <div style="height:8px"></div>
+                <span style="font-family:var(--font-serif); color:var(--ink-2);">"Ship faster: teams cut deployment time ~40% on average and onboard in days, not weeks."</span>
+                <div style="height:9px"></div>
+                <span class="stream-line">I confirmed the <b>40%</b> figure — independent 2026 benchmarks put deployment-time reductions at 34–41%, so the claim holds<span class="shimmer"> and is safe to publish</span><span class="cursor"></span></span>
+              </div>
+              <div class="msg-tools">
+                <span class="icon-btn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                  Copy
+                </span>
+                <span class="icon-btn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M21 4v4h-4"/></svg>
+                  Retry
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- input -->
+          <div class="chat-input">
+            <div class="input-box">
+              <span class="placeholder">Ask anything, or paste more text…</span>
+              <span class="send-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+              </span>
+            </div>
+            <div class="input-chips">
+              <span class="tool-chip on">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18" stroke-linecap="round"/></svg>
+                Web
+              </span>
+              <span class="tool-chip">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2 2-7 7-3 1 1-3 7-7z" transform="translate(2 2)"/><circle cx="6" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><path d="M8 8l8 8"/></svg>
+                Actions
+              </span>
+              <span class="tool-chip">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H8l-4 4V5a2 2 0 012-2h13a2 2 0 012 2z"/></svg>
+                Style
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="caption"><b>C · Agent chat</b> — collapsible Thinking, a visible <span style="font-family:var(--font-mono)">web_search</span> tool call with results, then a streamed rewrite (note the shimmer + caret). Per-message copy buttons throughout.</div>
+      </div>
+
+      <!-- ================= SURFACE D ================= -->
+      <div class="surface">
+        <div class="settings glass">
+          <div class="settings-head">
+            <div class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+            <span class="s-title">Models</span>
+          </div>
+
+          <div class="settings-body">
+            <!-- local model field -->
+            <div>
+              <label class="field-label">LOCAL MODEL</label>
+              <div class="text-field focus">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--ink-4)" stroke-width="1.8"><rect x="3" y="4" width="18" height="14" rx="2.5"/><path d="M7 21h10M9 18v3M15 18v3" stroke-linecap="round"/></svg>
+                <span class="grow">Qwen2.5-7B-Instruct-GGUF</span>
+                <span class="caret"></span>
+              </div>
+
+              <!-- VALID chip -->
+              <div class="vchip valid">
+                <span class="tick">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-11"/></svg>
+                </span>
+                <span>Found on Hugging Face <span class="meta">· <b>Q4_K_M</b> · 4.7 GB</span></span>
+                <span class="dl-btn">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>
+                  Download
+                </span>
+              </div>
+
+              <!-- INVALID example -->
+              <div class="vchip invalid">
+                <span class="cross">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </span>
+                <span>Not found — <span class="mono">llama4-turbo-xl</span> isn't a known repo</span>
+              </div>
+            </div>
+
+            <div class="field-divider"></div>
+
+            <!-- cloud providers -->
+            <div>
+              <label class="field-label">CLOUD PROVIDER</label>
+              <div class="segmented">
+                <span class="seg">Local</span>
+                <span class="seg">OpenAI</span>
+                <span class="seg active">Anthropic</span>
+                <span class="seg">Gemini</span>
+                <span class="seg">OpenRouter</span>
+              </div>
+
+              <div class="key-row">
+                <div class="text-field" style="font-family:var(--font-ui);">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--ink-4)" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="12" r="4"/><path d="M11.5 12H21l-2 2 2 2M16 12v3"/></svg>
+                  <span class="grow ph" style="font-family:var(--font-mono); letter-spacing:2px;">sk-ant-•••••••••••••••••••• 4QzR</span>
+                </div>
+                <div class="vchip valid" style="margin-top:0;">
+                  <span class="tick" style="width:16px;height:16px;">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-11"/></svg>
+                  </span>
+                  Key valid
+                </div>
+              </div>
+              <div class="sub-label">Claude Sonnet 4 available · paste a key for any provider to switch instantly.</div>
+            </div>
+          </div>
+        </div>
+        <div class="caption"><b>D · Model settings</b> — paste a model name and it validates live (valid + downloadable, or "Not found"). Provider segmented control with masked key field and an inline "Key valid" tick.</div>
+      </div>
+
+    </div>
+  </div>
+
+</body>
+</html>

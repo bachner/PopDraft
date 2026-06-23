@@ -515,7 +515,7 @@ fi
 section "20: Swift compilation check"
 # ===================================================================
 if [ -f "$SCRIPT_DIR/scripts/PopDraft.swift" ]; then
-    if swiftc -parse "$SCRIPT_DIR/scripts/PopDraft.swift" -framework Cocoa -framework Carbon 2>&1; then
+    if swiftc -parse "$SCRIPT_DIR/scripts/PopDraft.swift" "$SCRIPT_DIR/scripts/Core.swift" -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation 2>&1; then
         pass "Swift file compiles cleanly"
     else
         fail "Swift compilation errors"

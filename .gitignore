@@ -42,3 +42,6 @@ env/
 .env
 .env.local
 PopDraft
+
+# Generated image scratch (raw Gemini renders)
+generated_imgs/

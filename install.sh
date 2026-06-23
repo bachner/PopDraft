@@ -36,7 +36,7 @@ else
     echo ""
     echo "Compiling PopDraft..."
 
-    if swiftc -O -o "$CONFIG_DIR/PopDraft" "$SCRIPT_DIR/scripts/PopDraft.swift" -framework Cocoa -framework Carbon 2>/dev/null; then
+    if swiftc -O -o "$CONFIG_DIR/PopDraft" "$SCRIPT_DIR/scripts/PopDraft.swift" "$SCRIPT_DIR/scripts/Core.swift" -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation 2>/dev/null; then
         echo "  [OK] PopDraft compiled"
     else
         echo "  [ERROR] Failed to compile PopDraft"
@@ -56,8 +56,16 @@ fi
 # Copy TTS server script
 echo ""
 echo "Setting up TTS server..."
+TTS_SCRIPT=""
 if [ -f "$SCRIPT_DIR/scripts/llm-tts-server.py" ]; then
-    cp "$SCRIPT_DIR/scripts/llm-tts-server.py" "$CONFIG_DIR/"
+    TTS_SCRIPT="$SCRIPT_DIR/scripts/llm-tts-server.py"
+elif [ -f "$SCRIPT_DIR/llm-tts-server.py" ]; then
+    # App bundle path: script is in Contents/Resources/ directly
+    TTS_SCRIPT="$SCRIPT_DIR/llm-tts-server.py"
+fi
+
+if [ -n "$TTS_SCRIPT" ]; then
+    cp "$TTS_SCRIPT" "$CONFIG_DIR/"
     chmod +x "$CONFIG_DIR/llm-tts-server.py"
     echo "  [OK] TTS server installed"
 else
@@ -81,22 +89,63 @@ else
 fi
 
 # Install Python packages into venv
-echo "  Creating Python virtual environment..."
-# Remove old venv to avoid issues with corrupted/partial venvs
-rm -rf "$CONFIG_DIR/tts-venv"
-if python3 -m venv "$CONFIG_DIR/tts-venv" 2>/dev/null; then
-    echo "  [OK] Virtual environment created"
-    echo "  Installing Python packages (this may take a few minutes)..."
-    if "$CONFIG_DIR/tts-venv/bin/pip" install "kokoro>=0.9.4" "misaki[ja]" "misaki[zh]" soundfile numpy 2>/dev/null; then
-        echo "  [OK] TTS packages installed"
+# kokoro >= 0.9.4 requires Python 3.10-3.12, so we can't use the macOS system python3 (3.9)
+# or recent Homebrew pythons (3.13+). Find a compatible interpreter, installing one if needed.
+echo "  Looking for Python 3.10-3.12 (required by kokoro)..."
+
+PYTHON_BIN=""
+for py in python3.12 python3.11 python3.10 \
+          /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
+          /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.10; do
+    if command -v "$py" &> /dev/null; then
+        PYTHON_BIN="$py"
+        break
+    fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "  No Python 3.10-3.12 found. Installing python@3.12 via Homebrew..."
+    if command -v brew &> /dev/null; then
+        if brew install python@3.12; then
+            BREW_PREFIX="$(brew --prefix)"
+            if [ -x "$BREW_PREFIX/opt/python@3.12/bin/python3.12" ]; then
+                PYTHON_BIN="$BREW_PREFIX/opt/python@3.12/bin/python3.12"
+            elif command -v python3.12 &> /dev/null; then
+                PYTHON_BIN="python3.12"
+            fi
+        else
+            echo "  [ERROR] brew install python@3.12 failed"
+        fi
     else
-        echo "  [WARN] Could not install TTS packages. Install manually:"
-        echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
+        echo "  [ERROR] Homebrew not found. Install Python 3.10-3.12 manually, then re-run."
+    fi
+fi
+
+if [ -n "$PYTHON_BIN" ]; then
+    echo "  [OK] Using $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+    echo "  Creating Python virtual environment..."
+    # Remove old venv to avoid issues with corrupted/partial venvs
+    rm -rf "$CONFIG_DIR/tts-venv"
+    if "$PYTHON_BIN" -m venv "$CONFIG_DIR/tts-venv"; then
+        echo "  [OK] Virtual environment created"
+        echo "  Upgrading pip..."
+        "$CONFIG_DIR/tts-venv/bin/pip" install --upgrade pip > /dev/null
+        echo "  Installing Python packages (this may take a few minutes)..."
+        if "$CONFIG_DIR/tts-venv/bin/pip" install "kokoro>=0.9.4" "misaki[ja]" "misaki[zh]" soundfile numpy; then
+            if "$CONFIG_DIR/tts-venv/bin/python3" -c "import kokoro" 2>/dev/null; then
+                echo "  [OK] TTS packages installed and verified"
+            else
+                echo "  [WARN] kokoro installed but import failed"
+            fi
+        else
+            echo "  [ERROR] Failed to install TTS packages. Install manually:"
+            echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
+        fi
+    else
+        echo "  [ERROR] Could not create Python venv with $PYTHON_BIN"
     fi
 else
-    echo "  [WARN] Could not create Python venv. Install manually:"
-    echo "         python3 -m venv $CONFIG_DIR/tts-venv"
-    echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
+    echo "  [ERROR] No usable Python found. TTS will not work until Python 3.10-3.12 is installed."
 fi
 
 # Restore config from backup if it doesn't exist (e.g., after uninstall + reinstall)

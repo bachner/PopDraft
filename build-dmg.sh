@@ -28,7 +28,8 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 echo "Compiling PopDraft..."
 swiftc -O -o "${APP_BUNDLE}/Contents/MacOS/PopDraft" \
     "${SCRIPT_DIR}/scripts/PopDraft.swift" \
-    -framework Cocoa -framework Carbon
+    "${SCRIPT_DIR}/scripts/Core.swift" \
+    -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation
 
 if [ $? -ne 0 ]; then
     echo "[ERROR] Failed to compile PopDraft"
@@ -124,8 +125,18 @@ xattr -cr "$APP_DEST" 2>/dev/null || true
 
 echo "[OK] PopDraft installed"
 echo ""
-echo "Launching PopDraft..."
-open "$APP_DEST"
+
+# Run full setup: TTS dependencies, config, and app launch
+# install.sh detects it's running from the app bundle and skips compilation
+INSTALL_SCRIPT="$APP_DEST/Contents/Resources/install.sh"
+if [ -f "$INSTALL_SCRIPT" ]; then
+    echo "Setting up dependencies (TTS, config)..."
+    echo ""
+    bash "$INSTALL_SCRIPT"
+else
+    echo "[WARN] Setup script not found, launching without TTS setup..."
+    open "$APP_DEST"
+fi
 
 echo ""
 echo "Done! You can close this window."
