@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PopDraft — Soft Aurora Gradient</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --canvas: #F6F5FB;
+    --ink: #1C1A2E;
+    --ink-soft: #4A4763;
+    --ink-mute: #8A86A6;
+    --line: #ECE9F6;
+    --card: #FFFFFF;
+
+    --violet: #7C5CFC;
+    --indigo: #5B8DEF;
+    --pink: #E879C9;
+    --primary: #6D5DF6;
+    --primary-deep: #5B4BE0;
+
+    --aurora: linear-gradient(135deg, #7C5CFC 0%, #5B8DEF 52%, #E879C9 100%);
+    --aurora-soft: linear-gradient(135deg, #8E72FF 0%, #6E9CF2 55%, #ED93D6 100%);
+
+    --r-window: 26px;
+    --r-card: 20px;
+    --r-chip: 14px;
+
+    --font-ui: "Plus Jakarta Sans", -apple-system, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+    --font-serif: ui-serif, "New York", Georgia, serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", monospace;
+
+    --sh-card: 0 18px 50px -22px rgba(109, 93, 246, 0.30), 0 2px 8px -2px rgba(28, 26, 46, 0.06);
+    --sh-soft: 0 8px 24px -10px rgba(109, 93, 246, 0.28);
+    --sh-glow: 0 10px 40px -8px rgba(124, 92, 252, 0.55);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--canvas);
+    font-family: var(--font-ui);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ===== Desktop canvas with faux wallpaper ===== */
+  .desktop {
+    width: 1280px;
+    margin: 0 auto;
+    position: relative;
+    min-height: 100vh;
+    background:
+      radial-gradient(1100px 620px at 16% -8%, rgba(124, 92, 252, 0.20), transparent 60%),
+      radial-gradient(900px 560px at 92% 4%, rgba(232, 121, 201, 0.16), transparent 58%),
+      radial-gradient(1000px 700px at 70% 110%, rgba(91, 141, 239, 0.18), transparent 60%),
+      var(--canvas);
+    overflow: hidden;
+  }
+
+  /* ===== Top menu bar ===== */
+  .menubar {
+    height: 30px;
+    width: 100%;
+    background: rgba(255, 255, 255, 0.62);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid rgba(255,255,255,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    position: sticky;
+    top: 0;
+    z-index: 30;
+  }
+  .menubar .left { display: flex; align-items: center; gap: 18px; }
+  .menubar .left .apple { font-size: 14px; }
+  .menubar .left .app-name { font-weight: 800; color: var(--ink); }
+  .menubar .left .menu-item { font-weight: 500; color: var(--ink-soft); }
+  .menubar .right { display: flex; align-items: center; gap: 16px; }
+  .menubar .right .pd-glyph {
+    width: 19px; height: 19px; border-radius: 7px;
+    background: var(--aurora);
+    display: grid; place-items: center;
+    box-shadow: 0 2px 8px -1px rgba(124,92,252,0.6);
+  }
+  .menubar .clock { font-variant-numeric: tabular-nums; }
+
+  /* ===== Board layout ===== */
+  .board {
+    padding: 56px 64px 80px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 56px 48px;
+    align-items: start;
+  }
+  .page-title {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: -8px;
+  }
+  .page-title .mark {
+    width: 44px; height: 44px; border-radius: 14px;
+    background: var(--aurora);
+    display: grid; place-items: center;
+    box-shadow: var(--sh-glow);
+  }
+  .page-title h1 {
+    font-size: 26px; font-weight: 800; letter-spacing: -0.02em;
+  }
+  .page-title .sub {
+    font-size: 13.5px; color: var(--ink-mute); font-weight: 500; margin-top: 2px;
+  }
+  .page-title .pill-style {
+    margin-left: auto;
+    font-size: 12.5px; font-weight: 700;
+    padding: 8px 16px;
+    border-radius: 999px;
+    color: #fff;
+    background: var(--aurora);
+    box-shadow: var(--sh-soft);
+    letter-spacing: 0.01em;
+  }
+
+  .surface { display: flex; flex-direction: column; gap: 14px; }
+  .caption {
+    display: flex; align-items: baseline; gap: 10px;
+    padding-left: 6px;
+  }
+  .caption .tag {
+    font-size: 11px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--primary);
+    background: rgba(109, 93, 246, 0.10);
+    padding: 4px 9px; border-radius: 8px;
+  }
+  .caption .desc { font-size: 13px; color: var(--ink-mute); font-weight: 500; }
+
+  /* generic window */
+  .window {
+    background: var(--card);
+    border-radius: var(--r-window);
+    box-shadow: var(--sh-card);
+    border: 1px solid rgba(255,255,255,0.9);
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* ============================================================
+     SURFACE A — Minimized bubble (resting state)
+     ============================================================ */
+  .deskA {
+    height: 360px;
+    border-radius: var(--r-window);
+    position: relative;
+    overflow: hidden;
+    box-shadow: var(--sh-card);
+    border: 1px solid rgba(255,255,255,0.9);
+    background:
+      radial-gradient(700px 420px at 12% 8%, rgba(124,92,252,0.28), transparent 60%),
+      radial-gradient(640px 420px at 100% 100%, rgba(232,121,201,0.26), transparent 58%),
+      linear-gradient(160deg, #EFEBFC 0%, #E7EEFB 48%, #F7ECF6 100%);
+  }
+  .deskA .menustrip {
+    height: 26px; width: 100%;
+    background: rgba(255,255,255,0.5);
+    backdrop-filter: blur(12px);
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 12px; padding: 0 14px;
+    font-size: 11px; font-weight: 600; color: var(--ink-soft);
+    border-bottom: 1px solid rgba(255,255,255,0.6);
+  }
+  .deskA .menustrip .dotglyph {
+    width: 14px; height: 14px; border-radius: 5px; background: var(--aurora);
+  }
+  .deskA .desk-icons {
+    position: absolute; top: 44px; left: 26px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .deskA .desk-icon { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 64px; }
+  .deskA .desk-icon .ic {
+    width: 46px; height: 46px; border-radius: 12px;
+    background: rgba(255,255,255,0.55);
+    border: 1px solid rgba(255,255,255,0.8);
+    box-shadow: 0 6px 16px -8px rgba(28,26,46,0.25);
+  }
+  .deskA .desk-icon .lbl { font-size: 11px; font-weight: 600; color: var(--ink-soft); text-shadow: 0 1px 2px rgba(255,255,255,0.6); }
+
+  /* the bubble cluster bottom-right */
+  .bubble-zone {
+    position: absolute;
+    bottom: 28px; right: 30px;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .peek-label {
+    background: rgba(255,255,255,0.86);
+    backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,0.9);
+    border-radius: 14px;
+    padding: 9px 14px;
+    box-shadow: 0 12px 30px -14px rgba(28,26,46,0.35);
+    display: flex; flex-direction: column; gap: 4px;
+    position: relative;
+  }
+  .peek-label .row1 { display: flex; align-items: center; gap: 8px; }
+  .peek-label .ready-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #34D399;
+    box-shadow: 0 0 0 3px rgba(52,211,153,0.22);
+  }
+  .peek-label .ready-text { font-size: 12px; font-weight: 700; color: var(--ink); }
+  .peek-label .sub { font-size: 11.5px; color: var(--ink-mute); font-weight: 500; }
+  .peek-label kbd {
+    font-family: var(--font-ui);
+    font-size: 11px; font-weight: 700;
+    background: rgba(109,93,246,0.10);
+    color: var(--primary);
+    border-radius: 6px; padding: 2px 6px;
+  }
+  /* little arrow pointing to bubble */
+  .peek-label::after {
+    content: ""; position: absolute; right: -6px; top: 50%;
+    width: 12px; height: 12px;
+    background: rgba(255,255,255,0.86);
+    border-right: 1px solid rgba(255,255,255,0.9);
+    border-top: 1px solid rgba(255,255,255,0.9);
+    transform: translateY(-50%) rotate(45deg);
+  }
+
+  .bubble {
+    width: 66px; height: 66px;
+    border-radius: 50%;
+    background: var(--aurora);
+    display: grid; place-items: center;
+    position: relative;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.5),
+      0 16px 40px -8px rgba(124,92,252,0.65),
+      0 4px 14px -2px rgba(232,121,201,0.5);
+  }
+  /* outer ambient glow */
+  .bubble::before {
+    content: ""; position: absolute; inset: -16px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(124,92,252,0.45), rgba(232,121,201,0.20) 55%, transparent 72%);
+    filter: blur(6px);
+    z-index: -1;
+  }
+  /* glossy highlight */
+  .bubble::after {
+    content: ""; position: absolute;
+    top: 8px; left: 12px; width: 30px; height: 22px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.75), transparent 70%);
+  }
+  .bubble .mini-status {
+    position: absolute; bottom: 2px; right: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #34D399;
+    border: 3px solid #fff;
+    box-shadow: 0 2px 6px -1px rgba(52,211,153,0.5);
+  }
+
+  /* ============================================================
+     SURFACE B — Action menu
+     ============================================================ */
+  .panel-stage {
+    border-radius: var(--r-window);
+    box-shadow: var(--sh-card);
+    border: 1px solid rgba(255,255,255,0.9);
+    background:
+      radial-gradient(560px 360px at 80% 6%, rgba(232,121,201,0.18), transparent 60%),
+      radial-gradient(560px 360px at 6% 100%, rgba(91,141,239,0.20), transparent 60%),
+      linear-gradient(160deg, #EFEBFC, #EAF0FB);
+    padding: 34px;
+    display: grid; place-items: center;
+    min-height: 360px;
+  }
+  .panel {
+    width: 360px;
+    background: rgba(255,255,255,0.92);
+    backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
+    border-radius: 22px;
+    border: 1px solid rgba(255,255,255,0.95);
+    box-shadow:
+      0 30px 70px -28px rgba(28,26,46,0.4),
+      0 2px 0 rgba(255,255,255,0.7) inset;
+    overflow: hidden;
+  }
+  .panel .quote {
+    padding: 16px 18px 14px;
+    border-bottom: 1px solid var(--line);
+    display: flex; gap: 11px; align-items: flex-start;
+  }
+  .panel .quote .qmark {
+    flex: 0 0 auto;
+    width: 26px; height: 26px; border-radius: 9px;
+    background: var(--aurora);
+    display: grid; place-items: center;
+    box-shadow: 0 4px 12px -3px rgba(124,92,252,0.6);
+  }
+  .panel .quote .qtext {
+    font-family: var(--font-serif);
+    font-size: 13px; line-height: 1.5; color: var(--ink-soft);
+    font-style: italic;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .panel .actions { padding: 8px; }
+  .action-row {
+    display: flex; align-items: center; gap: 13px;
+    padding: 11px 12px;
+    border-radius: 14px;
+    cursor: pointer;
+    position: relative;
+  }
+  .action-row .ic {
+    width: 34px; height: 34px; border-radius: 11px;
+    display: grid; place-items: center;
+    background: rgba(109,93,246,0.08);
+    color: var(--primary);
+    flex: 0 0 auto;
+  }
+  .action-row .name { font-size: 14px; font-weight: 600; color: var(--ink); flex: 1; }
+  .action-row .sub { font-size: 11.5px; color: var(--ink-mute); font-weight: 500; display: block; margin-top: 1px; }
+  .action-row .sc {
+    font-size: 11px; font-weight: 700; color: var(--ink-mute);
+    background: #F2F0FA; border-radius: 8px; padding: 4px 8px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* primary "Ask Agent" row */
+  .action-row.primary {
+    background: var(--aurora);
+    box-shadow: var(--sh-glow);
+    margin-bottom: 6px;
+  }
+  .action-row.primary .ic {
+    background: rgba(255,255,255,0.22);
+    color: #fff;
+  }
+  .action-row.primary .name { color: #fff; font-weight: 700; }
+  .action-row.primary .sub { color: rgba(255,255,255,0.85); }
+  .action-row.primary .sc {
+    background: rgba(255,255,255,0.22); color: #fff;
+  }
+  .action-row.primary .badge {
+    font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
+    background: rgba(255,255,255,0.25); color: #fff;
+    padding: 3px 7px; border-radius: 7px; text-transform: uppercase;
+  }
+
+  /* hovered/selected row */
+  .action-row.hover {
+    background: rgba(109,93,246,0.07);
+    box-shadow: inset 0 0 0 1.5px rgba(109,93,246,0.18);
+  }
+  .action-row.hover .ic { background: rgba(109,93,246,0.16); }
+
+  .panel .footer {
+    border-top: 1px solid var(--line);
+    padding: 11px 12px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .copy-btn {
+    flex: 1;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 11px;
+    border-radius: 13px;
+    background: #fff;
+    border: 1.5px solid var(--line);
+    font-size: 13.5px; font-weight: 700; color: var(--ink-soft);
+    cursor: pointer;
+  }
+  .copy-btn svg { color: var(--primary); }
+  .footer .hint { font-size: 11px; color: var(--ink-mute); font-weight: 500; }
+
+  /* ============================================================
+     SURFACE C — Agent chat (centerpiece)
+     ============================================================ */
+  .chat-window { display: flex; flex-direction: column; height: 720px; }
+  .chat-header {
+    position: relative;
+    padding: 16px 18px;
+    display: flex; align-items: center; gap: 12px;
+    border-bottom: 1px solid var(--line);
+    background: #fff;
+    overflow: hidden;
+  }
+  /* ambient aurora glow behind header */
+  .chat-header::before {
+    content: ""; position: absolute; inset: -40% -10% auto -10%; height: 180%;
+    background: radial-gradient(420px 120px at 18% 30%, rgba(124,92,252,0.18), transparent 70%),
+                radial-gradient(420px 120px at 86% 70%, rgba(232,121,201,0.16), transparent 70%);
+    pointer-events: none;
+  }
+  .chat-header > * { position: relative; }
+  .chat-header .avatar {
+    width: 38px; height: 38px; border-radius: 13px;
+    background: var(--aurora);
+    display: grid; place-items: center;
+    box-shadow: var(--sh-soft);
+    flex: 0 0 auto;
+  }
+  .chat-header .titles { flex: 1; }
+  .chat-header .t1 { font-size: 14.5px; font-weight: 700; color: var(--ink); letter-spacing: -0.01em; }
+  .chat-header .t2 { display: flex; align-items: center; gap: 7px; margin-top: 3px; font-size: 12px; color: var(--ink-mute); font-weight: 500; }
+  .chat-header .t2 .ready-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: #34D399;
+    box-shadow: 0 0 0 3px rgba(52,211,153,0.2);
+  }
+  .chat-header .t2 .model-pill {
+    background: rgba(109,93,246,0.09); color: var(--primary);
+    font-weight: 700; font-size: 11.5px; padding: 3px 9px; border-radius: 8px;
+  }
+  .chat-header .min-btn {
+    width: 34px; height: 34px; border-radius: 11px;
+    border: 1px solid var(--line); background: #fff;
+    display: grid; place-items: center; cursor: pointer; color: var(--ink-soft);
+  }
+
+  .chat-body {
+    flex: 1; overflow: hidden;
+    padding: 20px 20px 8px;
+    display: flex; flex-direction: column; gap: 18px;
+    background:
+      radial-gradient(700px 400px at 100% 0%, rgba(232,121,201,0.05), transparent 60%),
+      #FCFBFF;
+  }
+
+  .ctx-chip {
+    align-self: stretch;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-left: 3px solid transparent;
+    border-image: var(--aurora) 1;
+    border-radius: 14px;
+    padding: 12px 14px;
+    display: flex; gap: 11px; align-items: flex-start;
+    box-shadow: 0 6px 18px -12px rgba(28,26,46,0.18);
+  }
+  .ctx-chip .ic { color: var(--primary); flex: 0 0 auto; margin-top: 1px; }
+  .ctx-chip .label { font-size: 10.5px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; color: var(--primary); margin-bottom: 4px; }
+  .ctx-chip .text { font-family: var(--font-serif); font-style: italic; font-size: 13px; line-height: 1.5; color: var(--ink-soft); }
+
+  .msg { display: flex; gap: 11px; }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .bubble-msg {
+    background: var(--aurora);
+    color: #fff;
+    border-radius: 18px 18px 6px 18px;
+    padding: 12px 15px;
+    max-width: 76%;
+    font-size: 13.5px; line-height: 1.5; font-weight: 500;
+    box-shadow: var(--sh-soft);
+  }
+  .msg.assistant { flex-direction: column; gap: 0; }
+  .msg.assistant .a-head {
+    display: flex; align-items: center; gap: 9px; margin-bottom: 10px;
+  }
+  .msg.assistant .a-head .av {
+    width: 26px; height: 26px; border-radius: 9px; background: var(--aurora);
+    display: grid; place-items: center; box-shadow: 0 4px 12px -4px rgba(124,92,252,0.6);
+  }
+  .msg.assistant .a-head .nm { font-size: 12.5px; font-weight: 700; color: var(--ink); }
+
+  /* thinking line (collapsible) */
+  .thinking {
+    display: flex; align-items: center; gap: 9px;
+    background: rgba(109,93,246,0.05);
+    border: 1px solid rgba(109,93,246,0.12);
+    border-radius: 12px;
+    padding: 9px 12px;
+    margin-bottom: 10px;
+    cursor: pointer;
+  }
+  .thinking .chev { color: var(--ink-mute); transition: transform .2s; }
+  .thinking .spark { color: var(--primary); }
+  .thinking .txt { font-size: 12.5px; font-weight: 600; color: var(--ink-soft); flex: 1; }
+  .thinking .dur { font-size: 11px; color: var(--ink-mute); font-weight: 600; }
+
+  /* tool call card */
+  .tool-card {
+    border-radius: 14px;
+    border: 1px solid rgba(91,141,239,0.18);
+    background: linear-gradient(180deg, rgba(91,141,239,0.05), rgba(124,92,252,0.03));
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .tool-card .tc-head {
+    display: flex; align-items: center; gap: 9px;
+    padding: 10px 13px;
+    border-bottom: 1px solid rgba(91,141,239,0.13);
+  }
+  .tool-card .tc-head .tic {
+    width: 24px; height: 24px; border-radius: 8px;
+    background: rgba(91,141,239,0.14); color: var(--indigo);
+    display: grid; place-items: center; flex: 0 0 auto;
+  }
+  .tool-card .tc-head .call {
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink); font-weight: 500;
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tool-card .tc-head .call .fn { color: var(--indigo); font-weight: 600; }
+  .tool-card .tc-head .status {
+    font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em;
+    color: #0F9D6E; background: rgba(52,211,153,0.13);
+    padding: 3px 8px; border-radius: 7px;
+  }
+  .tool-card .tc-result {
+    padding: 11px 13px;
+    display: flex; flex-direction: column; gap: 7px;
+  }
+  .tool-card .tc-result .snip {
+    display: flex; gap: 9px; align-items: flex-start;
+  }
+  .tool-card .tc-result .favi {
+    width: 16px; height: 16px; border-radius: 5px; flex: 0 0 auto; margin-top: 2px;
+    background: linear-gradient(135deg, #5B8DEF, #7C5CFC);
+  }
+  .tool-card .tc-result .rtitle { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+  .tool-card .tc-result .rurl { font-size: 11px; color: var(--indigo); font-weight: 500; }
+  .tool-card .tc-result .rdesc { font-size: 12px; color: var(--ink-soft); line-height: 1.45; margin-top: 2px; }
+  .tool-card .tc-result mark { background: rgba(124,92,252,0.16); color: var(--primary-deep); border-radius: 4px; padding: 0 3px; font-weight: 600; }
+
+  /* assistant answer body */
+  .answer {
+    position: relative;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 14px 16px 14px;
+    font-size: 13.5px; line-height: 1.62; color: var(--ink);
+    box-shadow: 0 8px 22px -16px rgba(28,26,46,0.25);
+  }
+  .answer p { margin-bottom: 10px; }
+  .answer p:last-child { margin-bottom: 0; }
+  .answer .verified {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 700; color: #0F9D6E;
+    background: rgba(52,211,153,0.1); border-radius: 8px; padding: 2px 8px;
+    vertical-align: middle;
+  }
+  /* quote/code block inside answer */
+  .rewrite-block {
+    margin: 4px 0 10px;
+    background: linear-gradient(180deg, rgba(124,92,252,0.05), rgba(232,121,201,0.04));
+    border: 1px solid rgba(124,92,252,0.16);
+    border-radius: 13px;
+    padding: 12px 14px 12px;
+    position: relative;
+  }
+  .rewrite-block .rb-head {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;
+  }
+  .rewrite-block .rb-label { font-size: 10.5px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--primary); }
+  .rewrite-block .rb-text { font-family: var(--font-serif); font-size: 13.5px; line-height: 1.55; color: var(--ink); }
+
+  /* copy buttons */
+  .copy-mini {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 700; color: var(--ink-mute);
+    background: #fff; border: 1px solid var(--line);
+    border-radius: 9px; padding: 4px 9px; cursor: pointer;
+  }
+  .copy-mini svg { color: var(--primary); }
+  .copy-mini.on-block { background: rgba(255,255,255,0.8); }
+
+  .msg-toolbar {
+    display: flex; align-items: center; gap: 8px; margin-top: 9px; padding-left: 2px;
+  }
+  .msg-toolbar .copy-mini.primary {
+    color: var(--primary); border-color: rgba(109,93,246,0.3);
+    background: rgba(109,93,246,0.06);
+  }
+  .msg-toolbar .icon-btn {
+    width: 28px; height: 28px; border-radius: 9px;
+    border: 1px solid var(--line); background: #fff;
+    display: grid; place-items: center; cursor: pointer; color: var(--ink-mute);
+  }
+
+  /* streaming cursor */
+  .stream-cursor {
+    display: inline-block; width: 8px; height: 16px;
+    background: var(--aurora);
+    border-radius: 3px; vertical-align: text-bottom; margin-left: 2px;
+    animation: blink 1.05s step-end infinite;
+  }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
+  .streaming-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 700; color: var(--primary);
+    margin-left: 8px;
+  }
+  .streaming-tag .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); animation: blink 1.05s ease-in-out infinite; }
+
+  /* chat input */
+  .chat-input-wrap {
+    padding: 14px 18px 18px;
+    border-top: 1px solid var(--line);
+    background: #fff;
+  }
+  .tool-chips { display: flex; gap: 8px; margin-bottom: 10px; }
+  .tool-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; color: var(--ink-soft);
+    background: #F4F2FC; border: 1px solid var(--line);
+    border-radius: 999px; padding: 6px 12px; cursor: pointer;
+  }
+  .tool-chip.on {
+    background: rgba(109,93,246,0.10); color: var(--primary);
+    border-color: rgba(109,93,246,0.25);
+  }
+  .tool-chip svg { width: 13px; height: 13px; }
+  .input-box {
+    display: flex; align-items: center; gap: 10px;
+    background: #F7F6FC;
+    border: 1.5px solid var(--line);
+    border-radius: 18px;
+    padding: 7px 7px 7px 16px;
+    box-shadow: 0 0 0 4px rgba(109,93,246,0.05);
+  }
+  .input-box .ph { flex: 1; font-size: 13.5px; color: var(--ink-mute); font-weight: 500; }
+  .send-btn {
+    width: 40px; height: 40px; border-radius: 14px;
+    background: var(--aurora);
+    border: none; cursor: pointer;
+    display: grid; place-items: center;
+    box-shadow: var(--sh-glow);
+    flex: 0 0 auto;
+  }
+
+  /* ============================================================
+     SURFACE D — Model settings
+     ============================================================ */
+  .settings { padding: 24px 26px 26px; }
+  .settings .s-title {
+    font-size: 17px; font-weight: 800; letter-spacing: -0.01em; color: var(--ink);
+    margin-bottom: 4px;
+  }
+  .settings .s-sub { font-size: 13px; color: var(--ink-mute); font-weight: 500; margin-bottom: 22px; }
+
+  .field-label { font-size: 12.5px; font-weight: 700; color: var(--ink-soft); margin-bottom: 9px; display: block; }
+
+  .model-input {
+    display: flex; align-items: center; gap: 10px;
+    background: #fff;
+    border: 1.5px solid rgba(109,93,246,0.35);
+    border-radius: 14px;
+    padding: 12px 14px;
+    box-shadow: 0 0 0 4px rgba(109,93,246,0.07);
+    margin-bottom: 12px;
+  }
+  .model-input .mi-ic { color: var(--primary); flex: 0 0 auto; }
+  .model-input .mi-text { flex: 1; font-family: var(--font-mono); font-size: 13.5px; color: var(--ink); font-weight: 500; }
+  .model-input .mi-text .cursor { display: inline-block; width: 1.5px; height: 15px; background: var(--primary); vertical-align: middle; margin-left: 1px; animation: blink 1.05s step-end infinite; }
+
+  .valid-chip {
+    display: flex; align-items: center; gap: 11px;
+    background: linear-gradient(135deg, rgba(52,211,153,0.10), rgba(91,141,239,0.07));
+    border: 1px solid rgba(52,211,153,0.25);
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .valid-chip .vc-ic {
+    width: 28px; height: 28px; border-radius: 9px;
+    background: #34D399; color: #fff;
+    display: grid; place-items: center; flex: 0 0 auto;
+    box-shadow: 0 4px 12px -3px rgba(52,211,153,0.6);
+  }
+  .valid-chip .vc-main { flex: 1; }
+  .valid-chip .vc-t1 { font-size: 13px; font-weight: 700; color: var(--ink); }
+  .valid-chip .vc-t2 { font-size: 11.5px; color: var(--ink-soft); font-weight: 500; margin-top: 2px; display: flex; align-items: center; gap: 8px; }
+  .valid-chip .vc-t2 .meta { display: inline-flex; align-items: center; gap: 4px; }
+  .valid-chip .vc-t2 .dot-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--ink-mute); }
+  .download-btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--aurora);
+    color: #fff; font-size: 13px; font-weight: 700;
+    border: none; border-radius: 12px;
+    padding: 9px 16px; cursor: pointer;
+    box-shadow: var(--sh-soft);
+    flex: 0 0 auto;
+  }
+
+  .invalid-example {
+    display: flex; align-items: center; gap: 11px;
+    background: #FAFAFC;
+    border: 1px dashed var(--line);
+    border-radius: 14px;
+    padding: 11px 14px;
+    margin-bottom: 24px;
+  }
+  .invalid-example .ie-mono { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-mute); flex: 1; }
+  .invalid-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 700; color: #DC4C64;
+    background: rgba(220,76,100,0.08); border: 1px solid rgba(220,76,100,0.18);
+    border-radius: 10px; padding: 5px 11px;
+  }
+
+  .divider { height: 1px; background: var(--line); margin: 2px 0 22px; }
+
+  .seg {
+    display: flex; gap: 4px;
+    background: #F4F2FC;
+    border-radius: 13px;
+    padding: 4px;
+    margin-bottom: 16px;
+  }
+  .seg .seg-item {
+    flex: 1; text-align: center;
+    font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+    padding: 8px 6px; border-radius: 10px; cursor: pointer;
+  }
+  .seg .seg-item.active {
+    background: #fff; color: var(--primary); font-weight: 700;
+    box-shadow: 0 4px 12px -6px rgba(109,93,246,0.4), inset 0 0 0 1px rgba(109,93,246,0.12);
+  }
+
+  .key-row { display: flex; gap: 10px; align-items: stretch; }
+  .key-input {
+    flex: 1;
+    display: flex; align-items: center; gap: 10px;
+    background: #fff; border: 1.5px solid var(--line);
+    border-radius: 13px; padding: 11px 14px;
+  }
+  .key-input .ki-ic { color: var(--ink-mute); flex: 0 0 auto; }
+  .key-input .ki-text { font-family: var(--font-mono); font-size: 13px; color: var(--ink-soft); letter-spacing: 0.06em; }
+  .key-valid {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 700; color: #0F9D6E;
+    background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.22);
+    border-radius: 12px; padding: 0 14px;
+  }
+  .key-valid svg { color: #0F9D6E; }
+
+  .footer-credit {
+    grid-column: 1 / -1;
+    text-align: center;
+    font-size: 12px; color: var(--ink-mute); font-weight: 500;
+    margin-top: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="desktop">
+
+  <!-- ===== macOS menu bar ===== -->
+  <div class="menubar">
+    <div class="left">
+      <span class="apple"></span>
+      <span class="app-name">PopDraft</span>
+      <span class="menu-item">File</span>
+      <span class="menu-item">Edit</span>
+      <span class="menu-item">Actions</span>
+      <span class="menu-item">Window</span>
+      <span class="menu-item">Help</span>
+    </div>
+    <div class="right">
+      <span>100%</span>
+      <span>Wed 23 Jun</span>
+      <span class="clock">9:41 AM</span>
+      <span class="pd-glyph">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M12 2l1.8 5.4a4 4 0 0 0 2.8 2.8L22 12l-5.4 1.8a4 4 0 0 0-2.8 2.8L12 22l-1.8-5.4a4 4 0 0 0-2.8-2.8L2 12l5.4-1.8a4 4 0 0 0 2.8-2.8L12 2z" fill="#fff"/></svg>
+      </span>
+    </div>
+  </div>
+
+  <div class="board">
+
+    <!-- ===== Page heading ===== -->
+    <div class="page-title">
+      <div class="mark">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 2l1.8 5.4a4 4 0 0 0 2.8 2.8L22 12l-5.4 1.8a4 4 0 0 0-2.8 2.8L12 22l-1.8-5.4a4 4 0 0 0-2.8-2.8L2 12l5.4-1.8a4 4 0 0 0 2.8-2.8L12 2z" fill="#fff"/></svg>
+      </div>
+      <div>
+        <h1>PopDraft</h1>
+        <div class="sub">System-wide LLM text actions, reimagined as a friendly agent.</div>
+      </div>
+      <div class="pill-style">Soft Aurora Gradient</div>
+    </div>
+
+    <!-- ============================================================
+         SURFACE A — Minimized bubble
+         ============================================================ -->
+    <div class="surface">
+      <div class="deskA">
+        <div class="menustrip">
+          <span>Finder</span>
+          <span>⌥Space to ask</span>
+          <span class="dotglyph"></span>
+        </div>
+        <div class="desk-icons">
+          <div class="desk-icon"><div class="ic"></div><div class="lbl">Drafts</div></div>
+          <div class="desk-icon"><div class="ic"></div><div class="lbl">Notes.rtf</div></div>
+        </div>
+
+        <div class="bubble-zone">
+          <div class="peek-label">
+            <div class="row1">
+              <span class="ready-dot"></span>
+              <span class="ready-text">Qwen2.5-7B ready</span>
+            </div>
+            <div class="sub">Press <kbd>⌥Space</kbd> to ask</div>
+          </div>
+          <div class="bubble">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 2l1.8 5.4a4 4 0 0 0 2.8 2.8L22 12l-5.4 1.8a4 4 0 0 0-2.8 2.8L12 22l-1.8-5.4a4 4 0 0 0-2.8-2.8L2 12l5.4-1.8a4 4 0 0 0 2.8-2.8L12 2z" fill="#fff"/></svg>
+            <div class="mini-status"></div>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <span class="tag">A</span>
+        <span class="desc">Resting bubble — pinned to the bottom-right corner, model ready.</span>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         SURFACE B — Action menu
+         ============================================================ -->
+    <div class="surface">
+      <div class="panel-stage">
+        <div class="panel">
+          <div class="quote">
+            <span class="qmark">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 21l1.5-4.5L15 6l3 3L7.5 19.5 3 21z" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 7l3 3" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
+            </span>
+            <div class="qtext">"Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days."</div>
+          </div>
+
+          <div class="actions">
+            <!-- Primary: Ask Agent -->
+            <div class="action-row primary">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3l1.6 4.4a3 3 0 0 0 2 2L20 11l-4.4 1.6a3 3 0 0 0-2 2L12 19l-1.6-4.4a3 3 0 0 0-2-2L4 11l4.4-1.6a3 3 0 0 0 2-2L12 3z" fill="#fff"/></svg>
+              </span>
+              <div class="name">Ask Agent<span class="sub">Chat, search the web, take actions</span></div>
+              <span class="badge">Default</span>
+              <span class="sc">⌥Space</span>
+            </div>
+
+            <!-- hovered row -->
+            <div class="action-row hover">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M9 11l3 3L22 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              <div class="name">Grammar Check</div>
+              <span class="sc">⌃⌥G</span>
+            </div>
+
+            <div class="action-row">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2M9 20h6M12 4v16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              <div class="name">Articulate</div>
+              <span class="sc">⌃⌥A</span>
+            </div>
+
+            <div class="action-row">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              <div class="name">Craft a Reply</div>
+              <span class="sc">⌃⌥C</span>
+            </div>
+
+            <div class="action-row">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M12 16v-4M12 8h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              </span>
+              <div class="name">Explain Simply</div>
+            </div>
+
+            <div class="action-row">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 19l7-7 3 3-7 7-3-3z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 2l7.5 7.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              </span>
+              <div class="name">Continue Writing</div>
+            </div>
+
+            <div class="action-row">
+              <span class="ic">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M11 5L6 9H2v6h4l5 4V5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              </span>
+              <div class="name">Read Aloud</div>
+              <span class="sc">⌃⌥S</span>
+            </div>
+          </div>
+
+          <div class="footer">
+            <button class="copy-btn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="11" height="11" rx="2.5" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              Copy &amp; tuck away
+            </button>
+            <span class="hint">↩ to run</span>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <span class="tag">B</span>
+        <span class="desc">Action menu — "Ask Agent" is the new primary default.</span>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         SURFACE C — Agent chat (centerpiece)
+         ============================================================ -->
+    <div class="surface">
+      <div class="window chat-window">
+        <!-- header -->
+        <div class="chat-header">
+          <div class="avatar">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M12 2l1.8 5.4a4 4 0 0 0 2.8 2.8L22 12l-5.4 1.8a4 4 0 0 0-2.8 2.8L12 22l-1.8-5.4a4 4 0 0 0-2.8-2.8L2 12l5.4-1.8a4 4 0 0 0 2.8-2.8L12 2z" fill="#fff"/></svg>
+          </div>
+          <div class="titles">
+            <div class="t1">Tighten the product blurb</div>
+            <div class="t2">
+              <span class="ready-dot"></span>
+              <span class="model-pill">Qwen2.5-7B · local</span>
+              <span>· ready</span>
+            </div>
+          </div>
+          <button class="min-btn" title="Minimize to bubble">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+
+        <!-- body -->
+        <div class="chat-body">
+          <!-- context chip -->
+          <div class="ctx-chip">
+            <span class="ic">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 2v6h6" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            </span>
+            <div>
+              <div class="label">Selected text</div>
+              <div class="text">"Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days."</div>
+            </div>
+          </div>
+
+          <!-- user message -->
+          <div class="msg user">
+            <div class="bubble-msg">Make this more concise, and double-check the 40% pricing claim.</div>
+          </div>
+
+          <!-- assistant turn -->
+          <div class="msg assistant">
+            <div class="a-head">
+              <span class="av">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 2l1.8 5.4a4 4 0 0 0 2.8 2.8L22 12l-5.4 1.8a4 4 0 0 0-2.8 2.8L12 22l-1.8-5.4a4 4 0 0 0-2.8-2.8L2 12l5.4-1.8a4 4 0 0 0 2.8-2.8L12 2z" fill="#fff"/></svg>
+              </span>
+              <span class="nm">PopDraft Agent</span>
+            </div>
+
+            <!-- thinking -->
+            <div class="thinking">
+              <svg class="chev" width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <svg class="spark" width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 3l1.4 4a2.5 2.5 0 0 0 1.6 1.6L19 10l-4 1.4a2.5 2.5 0 0 0-1.6 1.6L12 17l-1.4-4A2.5 2.5 0 0 0 9 11.4L5 10l4-1.4A2.5 2.5 0 0 0 10.6 7L12 3z" fill="currentColor"/></svg>
+              <span class="txt">Reasoning — checking the 40% claim before rewriting…</span>
+              <span class="dur">3.2s</span>
+            </div>
+
+            <!-- tool call -->
+            <div class="tool-card">
+              <div class="tc-head">
+                <span class="tic">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                </span>
+                <span class="call"><span class="fn">web_search</span>("enterprise SaaS pricing benchmark 2026")</span>
+                <span class="status">DONE</span>
+              </div>
+              <div class="tc-result">
+                <div class="snip">
+                  <span class="favi"></span>
+                  <div>
+                    <div class="rtitle">2026 SaaS Deployment &amp; Onboarding Benchmark Report</div>
+                    <div class="rurl">benchmarks.saasmetrics.io › reports › 2026</div>
+                    <div class="rdesc">Across 1,200 teams, automated pipelines cut median deployment time by <mark>38–42%</mark>, with onboarding averaging <mark>2.1 days</mark> — consistent with the stated 40% figure.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- answer -->
+            <div class="answer">
+              <p>Here's a tighter version that keeps your numbers intact:</p>
+              <div class="rewrite-block">
+                <div class="rb-head">
+                  <span class="rb-label">Concise rewrite</span>
+                  <button class="copy-mini on-block">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="11" height="11" rx="2.5" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                    Copy
+                  </button>
+                </div>
+                <div class="rb-text">"Ship faster with PopDraft. Teams cut deployment time by 40% on average and onboard in just a couple of days."</div>
+              </div>
+              <p>
+                I verified the 40% claim against a 2026 industry benchmark
+                <span class="verified">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  verified · 38–42%
+                </span> — it holds up, so it's safe to keep as written<span class="stream-cursor"></span>
+                <span class="streaming-tag"><span class="pulse"></span>streaming</span>
+              </p>
+            </div>
+
+            <!-- per-message copy toolbar -->
+            <div class="msg-toolbar">
+              <button class="copy-mini primary">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="11" height="11" rx="2.5" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                Copy message
+              </button>
+              <button class="icon-btn" title="Good response">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M7 10v11M2 12h5v9H2zM14 21H9.5l1-7 2.5-7a2 2 0 0 1 2 1.4l.6 2.6h4.4a2 2 0 0 1 2 2.3l-1 6A2 2 0 0 1 19 21h-5z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+              </button>
+              <button class="icon-btn" title="Regenerate">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M21 12a9 9 0 1 1-2.6-6.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M21 3v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- input -->
+        <div class="chat-input-wrap">
+          <div class="tool-chips">
+            <span class="tool-chip on">
+              <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18" stroke="currentColor" stroke-width="1.6"/></svg>
+              Web
+            </span>
+            <span class="tool-chip">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l1.6 4.4a3 3 0 0 0 2 2L20 10l-4.4 1.6a3 3 0 0 0-2 2L12 18l-1.6-4.4a3 3 0 0 0-2-2L4 10l4.4-1.6a3 3 0 0 0 2-2L12 2z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+              Actions
+            </span>
+          </div>
+          <div class="input-box">
+            <span class="ph">Ask anything, or paste more text…</span>
+            <button class="send-btn">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <span class="tag">C</span>
+        <span class="desc">Agent chat — thinking, a verified web_search, streamed concise rewrite.</span>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         SURFACE D — Model settings
+         ============================================================ -->
+    <div class="surface">
+      <div class="window">
+        <div class="settings">
+          <div class="s-title">Models</div>
+          <div class="s-sub">Paste any model name — we validate it the moment you stop typing.</div>
+
+          <label class="field-label">Local model</label>
+          <div class="model-input">
+            <span class="mi-ic">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M20 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 2 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 20 16z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M3.3 7L12 12l8.7-5M12 22V12" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            </span>
+            <span class="mi-text">Qwen2.5-7B-Instruct-GGUF<span class="cursor"></span></span>
+          </div>
+
+          <!-- VALID -->
+          <div class="valid-chip">
+            <span class="vc-ic">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <div class="vc-main">
+              <div class="vc-t1">Found on Hugging Face</div>
+              <div class="vc-t2">
+                <span class="meta">Q4_K_M</span>
+                <span class="dot-sep"></span>
+                <span class="meta">4.7 GB</span>
+                <span class="dot-sep"></span>
+                <span class="meta">32K context</span>
+              </div>
+            </div>
+            <button class="download-btn">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0l-4-4m4 4l4-4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 21h16" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
+              Download
+            </button>
+          </div>
+
+          <!-- INVALID example -->
+          <div class="invalid-example">
+            <span class="ie-mono">llama4-mega-72b-ultra</span>
+            <span class="invalid-chip">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+              Not found
+            </span>
+          </div>
+
+          <div class="divider"></div>
+
+          <label class="field-label">Cloud provider</label>
+          <div class="seg">
+            <span class="seg-item">Local</span>
+            <span class="seg-item">OpenAI</span>
+            <span class="seg-item active">Anthropic</span>
+            <span class="seg-item">Gemini</span>
+            <span class="seg-item">OpenRouter</span>
+          </div>
+
+          <div class="key-row">
+            <div class="key-input">
+              <span class="ki-ic">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M7 14a4 4 0 1 0-4-4 4 4 0 0 0 4 4z" stroke="currentColor" stroke-width="2"/><path d="M10 11l9 9M16 17l2-2M19 14l2-2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              <span class="ki-text">sk-ant-•••••••••••••••••••••••••••2f9</span>
+            </div>
+            <span class="key-valid">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Key valid
+            </span>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <span class="tag">D</span>
+        <span class="desc">Model settings — paste-to-validate, with valid &amp; invalid states.</span>
+      </div>
+    </div>
+
+    <div class="footer-credit">PopDraft · Soft Aurora Gradient concept · all four surfaces shown at 1280px</div>
+
+  </div>
+</div>
+</body>
+</html>

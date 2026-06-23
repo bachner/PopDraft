@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PopDraft — macOS Native Minimal</title>
+<style>
+  /* ============================================================
+     PopDraft — "macOS Native Minimal (HIG)" mock
+     Looks indistinguishable from a first-party Apple utility.
+     ============================================================ */
+
+  :root {
+    /* System grays */
+    --surface:        #FFFFFF;
+    --surface-raised: #FFFFFF;
+    --fill-1:         #F5F5F7;   /* window background / grouped table bg */
+    --fill-2:         #ECECEC;   /* control fills */
+    --fill-3:         #E3E3E6;
+    --sidebar:        #F0F0F2;
+
+    /* Separators / hairlines */
+    --sep:            rgba(0,0,0,0.10);
+    --sep-strong:     rgba(0,0,0,0.16);
+
+    /* Text */
+    --label:          #1D1D1F;   /* primary label */
+    --label-2:        rgba(60,60,67,0.60);  /* secondary label */
+    --label-3:        rgba(60,60,67,0.30);  /* tertiary label */
+    --label-quat:     rgba(60,60,67,0.18);
+
+    /* System accent (blue) */
+    --accent:         #0A84FF;
+    --accent-press:   #0060DF;
+    --accent-tint:    rgba(10,132,255,0.12);
+
+    /* Status */
+    --green:          #34C759;
+    --red:            #FF3B30;
+    --orange:         #FF9F0A;
+
+    /* Radii */
+    --r-window:       11px;
+    --r-card:         10px;
+    --r-control:      6px;
+    --r-popover:      9px;
+
+    --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --font-serif: ui-serif, "New York", Georgia, serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-family: var(--font-ui);
+    color: var(--label);
+  }
+
+  /* ---------- Faux macOS desktop ---------- */
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(140% 120% at 18% 8%, #BFD4E8 0%, #9FB9D6 34%, #8AA6C8 60%, #7E97BC 100%);
+    background-attachment: fixed;
+    padding-bottom: 60px;
+  }
+
+  /* Thin top menu bar */
+  .menubar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 0 14px;
+    background: rgba(255,255,255,0.42);
+    backdrop-filter: saturate(180%) blur(22px);
+    -webkit-backdrop-filter: saturate(180%) blur(22px);
+    border-bottom: 0.5px solid rgba(0,0,0,0.10);
+    font-size: 12.5px;
+    color: #1D1D1F;
+  }
+  .menubar .apple { font-size: 14px; line-height: 1; }
+  .menubar .mb-app { font-weight: 600; }
+  .menubar .mb-item { font-weight: 400; opacity: 0.92; }
+  .menubar .spacer { flex: 1; }
+  .menubar .mb-right {
+    display: flex; align-items: center; gap: 14px;
+    font-size: 12px; font-weight: 400;
+  }
+  .menubar .mb-right .glyph {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-weight: 500;
+  }
+  .menubar .clock { font-variant-numeric: tabular-nums; }
+
+  /* PopDraft menu-bar mark (sparkle) */
+  .pd-mark {
+    width: 15px; height: 15px; display: inline-block;
+    color: #1D1D1F;
+  }
+
+  /* ---------- Board layout ---------- */
+  .board {
+    width: 1280px;
+    margin: 0 auto;
+    padding: 40px 28px 0;
+  }
+  .board-title {
+    text-align: center;
+    margin-bottom: 30px;
+    color: #fff;
+  }
+  .board-title h1 {
+    font-size: 22px; font-weight: 600; letter-spacing: -0.3px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.28);
+  }
+  .board-title p {
+    font-size: 12.5px; margin-top: 4px;
+    color: rgba(255,255,255,0.84);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.22);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px 36px;
+    align-items: start;
+  }
+
+  .surface { display: flex; flex-direction: column; align-items: center; }
+  .surface-stage { width: 100%; display: flex; justify-content: center; }
+  .caption {
+    margin-top: 14px;
+    text-align: center;
+    color: rgba(255,255,255,0.92);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.25);
+  }
+  .caption .c-label { font-size: 12px; font-weight: 600; letter-spacing: 0.2px; }
+  .caption .c-sub { font-size: 11px; color: rgba(255,255,255,0.74); margin-top: 2px; }
+
+  /* ---------- Generic window chrome ---------- */
+  .window {
+    background: var(--surface);
+    border-radius: var(--r-window);
+    border: 0.5px solid rgba(0,0,0,0.14);
+    box-shadow:
+      0 0 0 0.5px rgba(0,0,0,0.04),
+      0 12px 34px rgba(0,0,0,0.22),
+      0 2px 8px rgba(0,0,0,0.12);
+    overflow: hidden;
+  }
+  .titlebar {
+    height: 38px;
+    display: flex;
+    align-items: center;
+    padding: 0 13px;
+    background: linear-gradient(#FBFBFC, #F3F3F5);
+    border-bottom: 0.5px solid var(--sep);
+    position: relative;
+  }
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; position: relative; }
+  .dot.red    { background: #FF5F57; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.10); }
+  .dot.yellow { background: #FEBC2E; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.10); }
+  .dot.green  { background: #28C840; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.10); }
+  .titlebar .title {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--label);
+    pointer-events: none;
+  }
+  .titlebar .title .subtitle {
+    font-weight: 400;
+    color: var(--label-2);
+  }
+  .titlebar .tb-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    z-index: 2;
+  }
+
+  /* Toolbar button (icon) */
+  .tbtn {
+    width: 26px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 5px;
+    color: var(--label-2);
+    background: transparent;
+    border: none;
+    cursor: default;
+  }
+  .tbtn:hover { background: rgba(0,0,0,0.06); }
+  .tbtn svg { width: 15px; height: 15px; }
+
+  /* ============================================================
+     SURFACE A — Minimized bubble (resting state)
+     ============================================================ */
+  .desktop-corner {
+    position: relative;
+    width: 460px;
+    height: 320px;
+    border-radius: var(--r-card);
+    overflow: hidden;
+    border: 0.5px solid rgba(0,0,0,0.12);
+    box-shadow:
+      0 12px 34px rgba(0,0,0,0.20),
+      0 2px 8px rgba(0,0,0,0.12);
+    background:
+      radial-gradient(120% 110% at 12% 10%, #C7D8EA 0%, #A5BFDB 40%, #8AA8CA 72%, #7A9AC0 100%);
+  }
+  /* faux dock hint at bottom */
+  .corner-dock {
+    position: absolute;
+    bottom: 8px; left: 50%; transform: translateX(-50%);
+    height: 38px;
+    padding: 0 8px;
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,0.30);
+    border: 0.5px solid rgba(255,255,255,0.45);
+    border-radius: 11px;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+  .corner-dock .dock-ico {
+    width: 26px; height: 26px; border-radius: 6px;
+    background: linear-gradient(160deg,#fff,#dfe6ee);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+  }
+  .corner-dock .dock-ico:nth-child(2){ background:linear-gradient(160deg,#7fd0ff,#2f8fe0);}
+  .corner-dock .dock-ico:nth-child(3){ background:linear-gradient(160deg,#ffd66e,#f0a93a);}
+  .corner-dock .dock-ico:nth-child(4){ background:linear-gradient(160deg,#a6e88a,#52b552);}
+
+  /* The bubble itself, pinned bottom-right */
+  .bubble-wrap {
+    position: absolute;
+    bottom: 56px;
+    right: 22px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+  }
+  /* hover/peek label */
+  .peek {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 26px;
+    padding: 0 10px 0 11px;
+    background: rgba(255,255,255,0.92);
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 13px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.16), 0 1px 3px rgba(0,0,0,0.10);
+    font-size: 11.5px;
+    color: var(--label);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+  .peek .ready-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 2px rgba(52,199,89,0.18);
+  }
+  .peek kbd {
+    font-family: var(--font-ui);
+    font-size: 11px;
+    color: var(--label-2);
+    background: var(--fill-2);
+    border: 0.5px solid var(--sep);
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin-left: 1px;
+  }
+
+  .bubble {
+    width: 64px; height: 64px;
+    border-radius: 50%;
+    background:
+      radial-gradient(120% 120% at 30% 22%, #4DA6FF 0%, #0A84FF 52%, #0066D6 100%);
+    box-shadow:
+      0 8px 24px rgba(10,90,200,0.40),
+      0 2px 6px rgba(0,0,0,0.22),
+      inset 0 1px 1px rgba(255,255,255,0.45),
+      inset 0 -3px 6px rgba(0,40,100,0.30);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    border: 0.5px solid rgba(255,255,255,0.30);
+  }
+  .bubble svg { width: 30px; height: 30px; color: #fff; filter: drop-shadow(0 1px 1px rgba(0,30,80,0.35)); }
+  /* status ring dot on bubble */
+  .bubble .badge {
+    position: absolute;
+    bottom: 1px; right: 1px;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--green);
+    border: 2.5px solid #fff;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.20);
+  }
+
+  /* ============================================================
+     SURFACE B — Action menu (NSMenu / popover)
+     ============================================================ */
+  .menu-popover {
+    width: 360px;
+    background: rgba(250,250,251,0.86);
+    backdrop-filter: saturate(180%) blur(28px);
+    -webkit-backdrop-filter: saturate(180%) blur(28px);
+    border-radius: var(--r-popover);
+    border: 0.5px solid rgba(0,0,0,0.10);
+    box-shadow:
+      0 0 0 0.5px rgba(0,0,0,0.05),
+      0 14px 40px rgba(0,0,0,0.26),
+      0 2px 8px rgba(0,0,0,0.14);
+    overflow: hidden;
+    padding: 6px;
+    position: relative;
+  }
+  /* selected-text quote at top */
+  .menu-quote {
+    margin: 2px 4px 6px;
+    padding: 8px 10px;
+    background: rgba(0,0,0,0.035);
+    border-radius: 6px;
+    font-size: 11.5px;
+    color: var(--label-2);
+    line-height: 1.35;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .menu-quote .q-bar {
+    width: 2.5px; align-self: stretch; border-radius: 2px;
+    background: var(--label-quat); flex: none;
+  }
+  .menu-quote .q-text {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-style: normal;
+  }
+  .menu-sep {
+    height: 0.5px; background: var(--sep);
+    margin: 5px 8px;
+  }
+  .menu-row {
+    display: flex; align-items: center; gap: 11px;
+    height: 30px;
+    padding: 0 9px;
+    border-radius: 5px;
+    font-size: 13px;
+    color: var(--label);
+    cursor: default;
+    position: relative;
+  }
+  .menu-row .m-ico {
+    width: 17px; height: 17px; flex: none;
+    color: var(--label-2);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .menu-row .m-ico svg { width: 16px; height: 16px; }
+  .menu-row .m-name { flex: 1; }
+  .menu-row .m-key {
+    font-size: 12px; color: var(--label-3);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.5px;
+  }
+  /* highlighted (selected) row — standard blue */
+  .menu-row.selected {
+    background: var(--accent);
+    color: #fff;
+  }
+  .menu-row.selected .m-ico { color: rgba(255,255,255,0.92); }
+  .menu-row.selected .m-key { color: rgba(255,255,255,0.78); }
+  /* primary "Ask Agent" — first, gets a subtle leading accent when not selected */
+  .menu-row.primary .m-name { font-weight: 590; }
+  .menu-row .m-badge {
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.3px;
+    padding: 1.5px 6px;
+    border-radius: 5px;
+    background: var(--accent-tint);
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .menu-row.selected .m-badge {
+    background: rgba(255,255,255,0.22);
+    color: #fff;
+  }
+  /* footer copy button */
+  .menu-footer {
+    margin: 6px 4px 2px;
+    padding-top: 7px;
+    border-top: 0.5px solid var(--sep);
+    display: flex;
+    justify-content: flex-end;
+  }
+  .copy-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 24px;
+    padding: 0 11px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--label);
+    background: linear-gradient(#FFFFFF,#F6F6F8);
+    border: 0.5px solid rgba(0,0,0,0.14);
+    box-shadow: 0 1px 1.5px rgba(0,0,0,0.06);
+    cursor: default;
+  }
+  .copy-btn svg { width: 13px; height: 13px; color: var(--label-2); }
+
+  /* ============================================================
+     SURFACE C — Agent chat (Claude-style)
+     ============================================================ */
+  .chat-window { width: 100%; max-width: 600px; }
+  .chat-toolbar {
+    height: 44px;
+    display: flex; align-items: center;
+    padding: 0 13px;
+    background: linear-gradient(#FBFBFC,#F4F4F6);
+    border-bottom: 0.5px solid var(--sep);
+    position: relative;
+    gap: 12px;
+  }
+  .chat-toolbar .traffic { z-index: 2; }
+  .chat-title-block {
+    position: absolute; left: 0; right: 0;
+    display: flex; flex-direction: column; align-items: center;
+    pointer-events: none;
+  }
+  .chat-title-block .ct-title { font-size: 13px; font-weight: 600; }
+  .chat-title-block .ct-model {
+    font-size: 11px; color: var(--label-2);
+    display: flex; align-items: center; gap: 5px; margin-top: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chat-title-block .model-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 2px rgba(52,199,89,0.16);
+  }
+  .chat-toolbar .tb-actions { z-index: 2; }
+
+  .chat-scroll {
+    background: var(--surface);
+    padding: 16px 18px 12px;
+    max-height: 612px;
+    overflow: hidden;
+  }
+
+  /* context chip (pasted selected text) */
+  .context-chip {
+    display: flex; gap: 9px;
+    padding: 9px 11px;
+    background: var(--fill-1);
+    border: 0.5px solid var(--sep);
+    border-radius: 8px;
+    margin-bottom: 18px;
+  }
+  .context-chip .cc-bar { width: 3px; border-radius: 2px; background: var(--accent); flex: none; }
+  .context-chip .cc-body { min-width: 0; }
+  .context-chip .cc-head {
+    font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--label-2); margin-bottom: 3px;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .context-chip .cc-head svg { width: 11px; height: 11px; }
+  .context-chip .cc-text {
+    font-size: 12.5px; color: var(--label); line-height: 1.4;
+  }
+
+  /* user message */
+  .msg { margin-bottom: 18px; }
+  .msg-user { display: flex; justify-content: flex-end; }
+  .bubble-user {
+    max-width: 78%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px; line-height: 1.42;
+    padding: 8px 12px;
+    border-radius: 14px 14px 4px 14px;
+    box-shadow: 0 1px 2px rgba(10,90,200,0.22);
+  }
+
+  /* assistant turn */
+  .msg-assistant { display: flex; gap: 11px; }
+  .assistant-avatar {
+    width: 26px; height: 26px; border-radius: 7px; flex: none;
+    background: radial-gradient(120% 120% at 30% 22%, #4DA6FF 0%, #0A84FF 60%, #0066D6 100%);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.4), 0 1px 2px rgba(0,0,0,0.16);
+  }
+  .assistant-avatar svg { width: 15px; height: 15px; color: #fff; }
+  .assistant-body { flex: 1; min-width: 0; }
+
+  /* collapsible thinking line */
+  .thinking {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12px; color: var(--label-2);
+    padding: 5px 9px;
+    background: var(--fill-1);
+    border: 0.5px solid var(--sep);
+    border-radius: 7px;
+    width: fit-content;
+    margin-bottom: 10px;
+    cursor: default;
+  }
+  .thinking .chev { width: 11px; height: 11px; color: var(--label-3); transition: transform .15s; }
+  .thinking .think-ico { width: 13px; height: 13px; color: var(--label-2); }
+  .thinking .think-time { color: var(--label-3); font-variant-numeric: tabular-nums; }
+
+  /* tool call affordance */
+  .tool-call {
+    border: 0.5px solid var(--sep);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 12px;
+    background: var(--surface);
+  }
+  .tool-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px;
+    background: var(--fill-1);
+    border-bottom: 0.5px solid var(--sep);
+    font-size: 12px;
+  }
+  .tool-head .t-ico { width: 14px; height: 14px; color: var(--accent); flex:none; }
+  .tool-head .t-fn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--label);
+  }
+  .tool-head .t-fn .t-arg { color: var(--accent); }
+  .tool-head .t-status {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--green); font-weight: 500;
+  }
+  .tool-head .t-status svg { width: 12px; height: 12px; }
+  .tool-result {
+    padding: 9px 11px;
+    font-size: 12px;
+    color: var(--label-2);
+    line-height: 1.45;
+  }
+  .tool-result .tr-src {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--label-3); margin-top: 6px;
+  }
+  .tool-result .tr-src .favico {
+    width: 12px; height: 12px; border-radius: 3px;
+    background: linear-gradient(140deg,#ff8a3d,#f05a28);
+    flex: none;
+  }
+  .tool-result b { color: var(--label); font-weight: 600; }
+
+  /* assistant streamed answer text */
+  .answer {
+    font-size: 13px; line-height: 1.5; color: var(--label);
+    position: relative;
+  }
+  .answer p { margin-bottom: 9px; }
+  .answer p:last-child { margin-bottom: 0; }
+  .answer .verify {
+    display: inline-flex; align-items: center; gap: 4px;
+    color: var(--green); font-weight: 500;
+  }
+  .answer .verify svg { width: 12px; height: 12px; }
+
+  /* quote/code block with copy button */
+  .rewrite-block {
+    margin: 4px 0 10px;
+    border: 0.5px solid var(--sep);
+    border-radius: 8px;
+    background: var(--fill-1);
+    overflow: hidden;
+  }
+  .rewrite-head {
+    display: flex; align-items: center;
+    padding: 6px 8px 6px 11px;
+    border-bottom: 0.5px solid var(--sep);
+    font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--label-2);
+  }
+  .rewrite-body {
+    padding: 10px 12px;
+    font-family: var(--font-serif);
+    font-size: 13.5px; line-height: 1.5; color: var(--label);
+  }
+  .block-copy {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 5px;
+    height: 20px; padding: 0 8px;
+    border-radius: 5px;
+    font-size: 11px; font-weight: 500; letter-spacing: 0;
+    text-transform: none;
+    color: var(--label-2);
+    background: var(--surface);
+    border: 0.5px solid var(--sep);
+    cursor: default;
+  }
+  .block-copy svg { width: 11px; height: 11px; }
+
+  /* streaming cursor */
+  .cursor {
+    display: inline-block;
+    width: 7px; height: 15px;
+    background: var(--accent);
+    border-radius: 1px;
+    vertical-align: text-bottom;
+    margin-left: 1px;
+    animation: blink 1s steps(2,start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+
+  /* per-message action bar (copy) */
+  .msg-actions {
+    display: flex; align-items: center; gap: 2px;
+    margin-top: 9px;
+  }
+  .msg-act-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    height: 24px; padding: 0 8px;
+    border-radius: 6px;
+    font-size: 11.5px; color: var(--label-2);
+    background: transparent; border: 0.5px solid transparent;
+    cursor: default;
+  }
+  .msg-act-btn:hover { background: var(--fill-1); border-color: var(--sep); }
+  .msg-act-btn svg { width: 13px; height: 13px; }
+  .msg-act-btn.is-copy { color: var(--accent); }
+  .msg-act-btn.is-copy svg { color: var(--accent); }
+
+  /* chat input */
+  .chat-input-area {
+    border-top: 0.5px solid var(--sep);
+    background: var(--fill-1);
+    padding: 11px 14px 13px;
+  }
+  .chat-input {
+    background: var(--surface);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 10px;
+    box-shadow: 0 0 0 3px var(--accent-tint), 0 1px 2px rgba(0,0,0,0.04);
+    padding: 9px 10px 8px;
+  }
+  .chat-input .ci-placeholder {
+    font-size: 13px; color: var(--label-3);
+    min-height: 19px;
+  }
+  .chat-input-bottom {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 9px;
+  }
+  .tool-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    height: 24px; padding: 0 9px;
+    border-radius: 12px;
+    font-size: 11.5px; color: var(--label-2);
+    background: var(--fill-2);
+    border: 0.5px solid var(--sep);
+    cursor: default;
+  }
+  .tool-chip svg { width: 12px; height: 12px; }
+  .tool-chip.on {
+    background: var(--accent-tint);
+    color: var(--accent);
+    border-color: rgba(10,132,255,0.22);
+  }
+  .tool-chip.on svg { color: var(--accent); }
+  .ci-send {
+    margin-left: auto;
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 1px 2px rgba(10,90,200,0.30);
+    cursor: default;
+  }
+  .ci-send svg { width: 15px; height: 15px; color: #fff; }
+
+  /* ============================================================
+     SURFACE D — Model settings (System Settings pane)
+     ============================================================ */
+  .settings-window { width: 100%; max-width: 560px; }
+  .settings-body {
+    background: var(--fill-1);
+    padding: 20px 22px 24px;
+  }
+  .settings-h {
+    font-size: 17px; font-weight: 600; letter-spacing: -0.2px;
+    margin-bottom: 3px;
+  }
+  .settings-sub {
+    font-size: 12px; color: var(--label-2);
+    margin-bottom: 20px; line-height: 1.4;
+  }
+
+  /* grouped list section */
+  .group-label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--label-2);
+    margin: 0 4px 7px;
+  }
+  .group {
+    background: var(--surface);
+    border: 0.5px solid var(--sep);
+    border-radius: 9px;
+    overflow: hidden;
+    box-shadow: 0 1px 1px rgba(0,0,0,0.03);
+    margin-bottom: 20px;
+  }
+  .row {
+    display: flex; align-items: center;
+    padding: 11px 14px;
+    min-height: 44px;
+    gap: 12px;
+  }
+  .row + .row { border-top: 0.5px solid var(--sep); }
+  .row .row-label { font-size: 13px; color: var(--label); flex: none; }
+  .row .row-label .sub { display:block; font-size: 11px; color: var(--label-2); margin-top:1px; font-weight:400;}
+  .row .row-ctl { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+
+  /* text field (model name) */
+  .field {
+    flex: 1;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 13px;
+    min-width: 0;
+  }
+  .field.focused {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-tint);
+  }
+  .field .f-mono { font-family: var(--font-mono); font-size: 12.5px; color: var(--label); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .field .f-icon { width: 14px; height: 14px; color: var(--label-3); flex:none;}
+  .field .caret { width: 1px; height: 15px; background: var(--accent); animation: blink 1s steps(2,start) infinite; }
+
+  /* validation chips */
+  .vchip {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 22px; padding: 0 9px;
+    border-radius: 11px;
+    font-size: 11.5px; font-weight: 500;
+    white-space: nowrap;
+  }
+  .vchip svg { width: 12px; height: 12px; flex:none; }
+  .vchip.valid {
+    background: rgba(52,199,89,0.14);
+    color: #1d8b3a;
+  }
+  .vchip.valid .meta { color: rgba(29,139,58,0.66); font-weight: 400; }
+  .vchip.invalid {
+    background: rgba(255,59,48,0.12);
+    color: #c0271f;
+  }
+
+  .download-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 24px; padding: 0 12px;
+    border-radius: 6px;
+    font-size: 12.5px; font-weight: 500;
+    color: #fff;
+    background: linear-gradient(var(--accent), #0A78EC);
+    border: 0.5px solid rgba(0,0,0,0.06);
+    box-shadow: 0 1px 1.5px rgba(10,90,200,0.28);
+    cursor: default;
+  }
+  .download-btn svg { width: 13px; height: 13px; }
+
+  /* the validation result row (full width under field) */
+  .validate-row {
+    display: flex; align-items: center;
+    padding: 9px 14px;
+    gap: 10px;
+    background: rgba(52,199,89,0.05);
+    border-top: 0.5px solid var(--sep);
+  }
+  .validate-row.invalid-row {
+    background: rgba(255,59,48,0.045);
+  }
+  .validate-row .vr-spacer { flex: 1; }
+
+  /* segmented control (provider) */
+  .segmented {
+    display: inline-flex;
+    background: var(--fill-2);
+    border-radius: 7px;
+    padding: 2px;
+    border: 0.5px solid var(--sep);
+  }
+  .segmented .seg {
+    font-size: 12px; font-weight: 500;
+    color: var(--label);
+    padding: 4px 11px;
+    border-radius: 5px;
+    cursor: default;
+    line-height: 1.2;
+  }
+  .segmented .seg.active {
+    background: var(--surface);
+    box-shadow: 0 0.5px 1px rgba(0,0,0,0.10), 0 0 0 0.5px rgba(0,0,0,0.05);
+    color: var(--label);
+  }
+  .segmented .seg:not(.active):hover { color: var(--label); }
+
+  /* api key field */
+  .key-field {
+    flex: 1; display:flex; align-items:center; gap:8px;
+    background: var(--surface);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 13px;
+  }
+  .key-field .k-dots {
+    flex:1; letter-spacing: 2px; color: var(--label); font-size: 13px;
+    font-family: var(--font-mono);
+    overflow: hidden;
+  }
+  .key-field .k-icon { width:14px; height:14px; color: var(--label-3); }
+
+  .footnote {
+    font-size: 11px; color: var(--label-2);
+    margin: -10px 4px 0; line-height: 1.4;
+  }
+
+</style>
+</head>
+<body>
+
+  <!-- ===== Top menu bar ===== -->
+  <div class="menubar">
+    <span class="apple">&#63743;</span>
+    <span class="mb-app">PopDraft</span>
+    <span class="mb-item">File</span>
+    <span class="mb-item">Edit</span>
+    <span class="mb-item">Actions</span>
+    <span class="mb-item">Window</span>
+    <span class="mb-item">Help</span>
+    <span class="spacer"></span>
+    <span class="mb-right">
+      <span class="glyph">
+        <svg class="pd-mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 2.6l1.7 4.5a4 4 0 0 0 2.4 2.4L20.6 11l-4.5 1.7a4 4 0 0 0-2.4 2.4L12 19.6l-1.7-4.5a4 4 0 0 0-2.4-2.4L3.4 11l4.5-1.7a4 4 0 0 0 2.4-2.4L12 2.6z"/>
+          <path d="M18.6 15.5l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7.7-1.9z" opacity="0.85"/>
+        </svg>
+      </span>
+      <svg width="15" height="13" viewBox="0 0 24 20" fill="currentColor"><path d="M2 4h16v9H7l-3 3v-3H2z" opacity="0"/><path d="M11 2C6 2 2 5.4 2 9.6c0 2.3 1.2 4.3 3.1 5.7-.1 1-.6 2.1-1.4 2.9 1.4-.1 2.8-.6 4-1.5.7.2 1.5.3 2.3.3 5 0 9-3.4 9-7.6S16 2 11 2z"/></svg>
+      <svg width="16" height="13" viewBox="0 0 24 16" fill="currentColor"><path d="M2 3a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V3z"/><path d="M20 5l3-2v8l-3-2z"/></svg>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3a4 4 0 0 0-4 4v4a4 4 0 0 0 8 0V7a4 4 0 0 0-4-4z"/><path d="M5 11a7 7 0 0 0 14 0h-2a5 5 0 0 1-10 0H5z"/><rect x="11" y="18" width="2" height="3"/></svg>
+      <span class="clock">Tue 9:41 AM</span>
+    </span>
+  </div>
+
+  <div class="board">
+    <div class="board-title">
+      <h1>PopDraft</h1>
+      <p>macOS Native Minimal — designed to feel like a built-in system feature</p>
+    </div>
+
+    <div class="grid">
+
+      <!-- ================= SURFACE A ================= -->
+      <div class="surface">
+        <div class="surface-stage">
+          <div class="desktop-corner">
+            <!-- faux dock -->
+            <div class="corner-dock">
+              <div class="dock-ico"></div>
+              <div class="dock-ico"></div>
+              <div class="dock-ico"></div>
+              <div class="dock-ico"></div>
+            </div>
+
+            <!-- resting bubble, bottom-right -->
+            <div class="bubble-wrap">
+              <div class="peek">
+                <span class="ready-dot"></span>
+                Qwen2.5-7B ready · <kbd>⌥ Space</kbd> to ask
+              </div>
+              <div class="bubble">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M12 2.6l1.7 4.5a4 4 0 0 0 2.4 2.4L20.6 11l-4.5 1.7a4 4 0 0 0-2.4 2.4L12 19.6l-1.7-4.5a4 4 0 0 0-2.4-2.4L3.4 11l4.5-1.7a4 4 0 0 0 2.4-2.4L12 2.6z"/>
+                  <path d="M18.4 15l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7.7-1.9z" opacity="0.9"/>
+                </svg>
+                <span class="badge"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="caption">
+          <div class="c-label">A · Minimized Bubble</div>
+          <div class="c-sub">Resting in the corner — local model ready, hover to peek</div>
+        </div>
+      </div>
+
+      <!-- ================= SURFACE B ================= -->
+      <div class="surface">
+        <div class="surface-stage">
+          <div class="menu-popover">
+            <!-- selected text quote -->
+            <div class="menu-quote">
+              <span class="q-bar"></span>
+              <span class="q-text">“Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40%…”</span>
+            </div>
+
+            <!-- Ask Agent — primary, selected -->
+            <div class="menu-row primary selected">
+              <span class="m-ico">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.6l1.6 4.2a4 4 0 0 0 2.3 2.3L20.6 11l-4.1 1.6a4 4 0 0 0-2.3 2.3L12 19.6l-1.6-4.1a4 4 0 0 0-2.3-2.3L3.4 11l4.1-1.6a4 4 0 0 0 2.3-2.3L12 2.6z"/></svg>
+              </span>
+              <span class="m-name">Ask Agent</span>
+              <span class="m-badge">Default</span>
+              <span class="m-key">⌥ Space</span>
+            </div>
+
+            <div class="menu-sep"></div>
+
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg></span>
+              <span class="m-name">Grammar Check</span>
+              <span class="m-key">⌃⌥G</span>
+            </div>
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h11M4 17h7"/></svg></span>
+              <span class="m-name">Articulate</span>
+              <span class="m-key">⌃⌥A</span>
+            </div>
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17l-5-5 5-5M21 12H4"/></svg></span>
+              <span class="m-name">Craft a Reply</span>
+              <span class="m-key">⌃⌥C</span>
+            </div>
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.8.4-1 .9-1 1.7"/><circle cx="12" cy="17" r="0.6" fill="currentColor"/></svg></span>
+              <span class="m-name">Explain Simply</span>
+            </div>
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg></span>
+              <span class="m-name">Continue Writing</span>
+            </div>
+            <div class="menu-row">
+              <span class="m-ico"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 9v6h3l5 4V5L7 9H4z"/><path d="M16 8.5a4 4 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <span class="m-name">Read Aloud</span>
+              <span class="m-key">⌃⌥S</span>
+            </div>
+
+            <!-- footer copy -->
+            <div class="menu-footer">
+              <span class="copy-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                Copy
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="caption">
+          <div class="c-label">B · Action Menu</div>
+          <div class="c-sub">Native popover — “Ask Agent” is the new default, shown selected</div>
+        </div>
+      </div>
+
+      <!-- ================= SURFACE C ================= -->
+      <div class="surface">
+        <div class="surface-stage">
+          <div class="window chat-window">
+            <!-- toolbar -->
+            <div class="chat-toolbar">
+              <div class="traffic">
+                <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+              </div>
+              <div class="chat-title-block">
+                <span class="ct-title">Tighten product blurb</span>
+                <span class="ct-model"><span class="model-dot"></span>Qwen2.5-7B · local</span>
+              </div>
+              <div class="tb-actions">
+                <button class="tbtn" title="Minimize to bubble">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9H5V5"/><path d="M5 5l5 5"/><path d="M15 15h4v4"/><path d="M19 19l-5-5"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- conversation -->
+            <div class="chat-scroll">
+              <!-- context chip -->
+              <div class="context-chip">
+                <span class="cc-bar"></span>
+                <div class="cc-body">
+                  <div class="cc-head">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h12M4 17h8"/></svg>
+                    Selected text
+                  </div>
+                  <div class="cc-text">“Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days.”</div>
+                </div>
+              </div>
+
+              <!-- user message -->
+              <div class="msg msg-user">
+                <div class="bubble-user">Make this more concise, and double-check the 40% pricing claim.</div>
+              </div>
+
+              <!-- assistant turn -->
+              <div class="msg msg-assistant">
+                <div class="assistant-avatar">
+                  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.6l1.6 4.2a4 4 0 0 0 2.3 2.3L20.6 11l-4.1 1.6a4 4 0 0 0-2.3 2.3L12 19.6l-1.6-4.1a4 4 0 0 0-2.3-2.3L3.4 11l4.1-1.6a4 4 0 0 0 2.3-2.3L12 2.6z"/></svg>
+                </div>
+                <div class="assistant-body">
+                  <!-- thinking -->
+                  <div class="thinking">
+                    <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+                    <svg class="think-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a6 6 0 0 0-3 11.2V17h6v-2.8A6 6 0 0 0 12 3z"/><path d="M9 20h6M10 22h4"/></svg>
+                    Reasoning
+                    <span class="think-time">· 4s</span>
+                  </div>
+
+                  <!-- tool call -->
+                  <div class="tool-call">
+                    <div class="tool-head">
+                      <svg class="t-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4" stroke-linecap="round"/></svg>
+                      <span class="t-fn">web_search(<span class="t-arg">"enterprise SaaS pricing benchmark 2026"</span>)</span>
+                      <span class="t-status">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+                        Done
+                      </span>
+                    </div>
+                    <div class="tool-result">
+                      Industry benchmarks confirm <b>35–42% median reduction</b> in deployment lead time for teams adopting CI/CD platforms (2026 cohort). The 40% figure sits within range and is defensible.
+                      <div class="tr-src">
+                        <span class="favico"></span>
+                        saas-benchmarks.io · State of DevOps 2026 — Deployment Velocity
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- streamed answer -->
+                  <div class="answer">
+                    <p><span class="verify"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>Verified:</span> the 40% figure falls inside the 2026 industry benchmark (35–42%), so it's safe to keep. Here's the tightened version:</p>
+
+                    <div class="rewrite-block">
+                      <div class="rewrite-head">
+                        Concise rewrite
+                        <span class="block-copy">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                          Copy
+                        </span>
+                      </div>
+                      <div class="rewrite-body">Ship faster with PopDraft. Teams cut deployment time by 40% on average and onboard in days, not weeks.</div>
+                    </div>
+
+                    <p>I trimmed the hedging (“usually,” “just a couple of”) and led with the benefit. Want a punchier one-liner for a headline<span class="cursor"></span></p>
+                  </div>
+
+                  <!-- per-message actions -->
+                  <div class="msg-actions">
+                    <span class="msg-act-btn is-copy">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                      Copy
+                    </span>
+                    <span class="msg-act-btn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M3.5 9a9 9 0 1 1-.5 5"/></svg>
+                      Retry
+                    </span>
+                    <span class="msg-act-btn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v10M7 10l4.5-7c.9 0 1.5.7 1.5 1.6V8h5.3c1.2 0 2.1 1.1 1.8 2.3l-1.7 7c-.2.9-1 1.5-1.9 1.5H7"/></svg>
+                      Good
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- input -->
+            <div class="chat-input-area">
+              <div class="chat-input">
+                <div class="ci-placeholder">Ask anything, or paste more text…</div>
+                <div class="chat-input-bottom">
+                  <span class="tool-chip on">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 4 5.6 4 9s-1.5 6.5-4 9c-2.5-2.5-4-5.6-4-9s1.5-6.5 4-9z"/></svg>
+                    Web
+                  </span>
+                  <span class="tool-chip">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2 4 4 .6-3 2.9.7 4.3L12 11.8 8.6 13.8l.7-4.3-3-2.9 4-.6 1.7-4z"/><path d="M5 19l3-2M19 19l-3-2"/></svg>
+                    Actions
+                  </span>
+                  <span class="ci-send">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="caption">
+          <div class="c-label">C · Agent Chat</div>
+          <div class="c-sub">Streaming reply with expandable thinking, a tool call, and per-message copy</div>
+        </div>
+      </div>
+
+      <!-- ================= SURFACE D ================= -->
+      <div class="surface">
+        <div class="surface-stage">
+          <div class="window settings-window">
+            <!-- titlebar -->
+            <div class="titlebar">
+              <div class="traffic">
+                <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+              </div>
+              <div class="title">Models<span class="subtitle"> · Settings</span></div>
+            </div>
+
+            <div class="settings-body">
+              <div class="settings-h">Models</div>
+              <div class="settings-sub">Paste any model name. PopDraft validates it instantly — local downloads from Hugging Face, or cloud models against your API key.</div>
+
+              <!-- LOCAL MODEL group -->
+              <div class="group-label">Local Model</div>
+              <div class="group">
+                <div class="row">
+                  <span class="row-label">Model</span>
+                  <div class="row-ctl" style="flex:1;">
+                    <div class="field focused">
+                      <svg class="f-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7L12 12l8.7-5M12 22V12"/></svg>
+                      <span class="f-mono">Qwen2.5-7B-Instruct-GGUF</span>
+                      <span class="caret"></span>
+                    </div>
+                  </div>
+                </div>
+                <!-- valid result row -->
+                <div class="validate-row">
+                  <span class="vchip valid">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+                    Found on Hugging Face <span class="meta">· Q4_K_M · 4.7&nbsp;GB</span>
+                  </span>
+                  <span class="vr-spacer"></span>
+                  <span class="download-btn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg>
+                    Download
+                  </span>
+                </div>
+                <!-- invalid example row -->
+                <div class="row">
+                  <span class="row-label" style="color:var(--label-2);">Example</span>
+                  <div class="row-ctl" style="flex:1;">
+                    <div class="field">
+                      <svg class="f-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+                      <span class="f-mono" style="color:var(--label-2);">Llama-9000-Ultra-GGUF</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="validate-row invalid-row">
+                  <span class="vchip invalid">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                    Not found on Hugging Face
+                  </span>
+                </div>
+              </div>
+
+              <!-- CLOUD PROVIDER group -->
+              <div class="group-label">Cloud Provider</div>
+              <div class="group">
+                <div class="row">
+                  <span class="row-label">Provider</span>
+                  <div class="row-ctl">
+                    <div class="segmented">
+                      <span class="seg">Local</span>
+                      <span class="seg">OpenAI</span>
+                      <span class="seg active">Anthropic</span>
+                      <span class="seg">Gemini</span>
+                      <span class="seg">OpenRouter</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="row">
+                  <span class="row-label">API Key</span>
+                  <div class="row-ctl" style="flex:1;">
+                    <div class="key-field">
+                      <svg class="k-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+                      <span class="k-dots">sk-ant-•••••••••••••••••••••••3f8a</span>
+                    </div>
+                    <span class="vchip valid">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+                      Key valid
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div class="footnote">Keys are stored in the macOS Keychain and never leave your Mac except to the provider you select.</div>
+            </div>
+          </div>
+        </div>
+        <div class="caption">
+          <div class="c-label">D · Model Settings</div>
+          <div class="c-sub">System Settings–style pane with paste-to-validate and provider segments</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</body>
+</html>
