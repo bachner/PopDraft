@@ -69,6 +69,15 @@ final class Box: @unchecked Sendable {
     var value: Int { lock.lock(); defer { lock.unlock() }; return n }
 }
 
+/// A thread-safe log of `ToolProgressEvent`s for the PR8 progress-hook test (the
+/// loop may fire the hook from concurrent tool tasks).
+final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [ToolProgressEvent] = []
+    func append(_ e: ToolProgressEvent) { lock.lock(); defer { lock.unlock() }; events.append(e) }
+    func snapshot() -> [ToolProgressEvent] { lock.lock(); defer { lock.unlock() }; return events }
+}
+
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
@@ -354,6 +363,49 @@ func runTests() async {
         check(outcome.finalText == "Just an answer.", "final answer returned")
         check(outcome.session.messages.last?.role == "assistant", "last message is the assistant answer")
         check(!outcome.session.messages.contains { $0.role == "tool" }, "no tool messages")
+    }
+
+    // ------------------------------------------------------------------------
+    section("PR8: optional onProgress hook emits started→finished per tool call")
+    do {
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 6)
+        // Two parallel calls in turn 1, then a final answer.
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [
+                ParsedToolCall(id: "a", name: "echo", rawArguments: "{\"q\":\"1\"}"),
+                ParsedToolCall(id: "b", name: "echo", rawArguments: "{\"q\":\"2\"}"),
+            ]),
+            AssistantTurn(content: "done"),
+        ])
+        // Thread-safe event collector (the loop may fire from concurrent tasks).
+        let events = EventLog()
+        let outcome = try! await loop.run(
+            session: newSession(user: "go"), registry: registry, call: turns.call,
+            onProgress: { ev in events.append(ev) })
+
+        let log = events.snapshot()
+        let started = log.filter { if case .started = $0.phase { return true }; return false }
+        let finished = log.filter { if case .finished = $0.phase { return true }; return false }
+        check(started.count == 2, "two started events (one per call), got \(started.count)")
+        check(finished.count == 2, "two finished events (one per call), got \(finished.count)")
+        check(Set(started.map { $0.callKey }) == ["a", "b"], "started events keyed to both call ids")
+        check(finished.allSatisfy { if case .finished(_, let isErr) = $0.phase { return !isErr }; return false },
+              "both finished events report success (isError == false)")
+        check(outcome.finalText == "done", "loop still returns the final answer with the hook attached")
+
+        // The same loop run WITHOUT the hook must behave identically (the existing
+        // tests already cover this; assert message parity here for safety).
+        let turns2 = TurnScript([
+            AssistantTurn(toolCalls: [
+                ParsedToolCall(id: "a", name: "echo", rawArguments: "{\"q\":\"1\"}"),
+                ParsedToolCall(id: "b", name: "echo", rawArguments: "{\"q\":\"2\"}"),
+            ]),
+            AssistantTurn(content: "done"),
+        ])
+        let plain = try! await loop.run(session: newSession(user: "go"), registry: registry, call: turns2.call)
+        check(plain.session.messages.count == outcome.session.messages.count,
+              "message count identical with and without the progress hook")
     }
 
     // ------------------------------------------------------------------------

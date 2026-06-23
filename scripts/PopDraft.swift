@@ -2060,6 +2060,10 @@ enum PopupState {
     case ttsPlaying(isPaused: Bool)
     case result(String, thinking: String?)
     case error(String)
+    /// PR8: the full Claude-style agent chat. The conversation state lives in the
+    /// shared `AgentChatViewModel` (passed to `ChatView`), so this case is just a
+    /// marker telling `PopupView` which surface to render in the fixed-size panel.
+    case chat
 }
 
 // MARK: - Popup View
@@ -2081,6 +2085,8 @@ struct PopupView: View {
     let onTTSResume: () -> Void
     let onOpenAccessibilitySettings: () -> Void
     let onRestartLlamaServer: () -> Void
+    /// PR8: present when `state == .chat`. Drives the full agent ChatView.
+    var chatViewModel: AgentChatViewModel? = nil
 
     // Computed filtered actions - recomputes when searchText changes
     private var actions: [Action] {
@@ -2107,12 +2113,24 @@ struct PopupView: View {
                 resultView(text: text, thinking: thinking)
             case .error(let message):
                 errorView(message: message)
+            case .chat:
+                // The chat owns its own fixed-size panel + internal ScrollView, so
+                // it deliberately bypasses the 320-wide auto-resize layout below.
+                if let vm = chatViewModel {
+                    ChatView(viewModel: vm, onMinimize: onDismiss)
+                } else {
+                    // Defensive: should never happen (the controller always sets a
+                    // view model before switching to .chat).
+                    Color.clear.frame(width: 720, height: 560)
+                }
             }
         }
-        .frame(width: 320)
-        .background(VisualEffectView(material: .popover, blendingMode: .behindWindow))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .shadow(color: .black.opacity(0.2), radius: 10, x: 0, y: 5)
+        .frame(width: stateKey == "chat" ? nil : 320)
+        .background(stateKey == "chat"
+            ? AnyView(Color.clear)
+            : AnyView(VisualEffectView(material: .popover, blendingMode: .behindWindow)))
+        .clipShape(RoundedRectangle(cornerRadius: stateKey == "chat" ? 0 : 10))
+        .shadow(color: .black.opacity(stateKey == "chat" ? 0 : 0.2), radius: 10, x: 0, y: 5)
         .onChange(of: stateKey) { _, newKey in
             if newKey == "customPrompt" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -2132,6 +2150,7 @@ struct PopupView: View {
         case .ttsPlaying: return "ttsPlaying"
         case .result: return "result"
         case .error: return "error"
+        case .chat: return "chat"
         }
     }
 
@@ -2611,6 +2630,1219 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+// MARK: - Chat UI: Liquid Glass palette (PR8)
+
+/// Shared color tokens mirroring `design-mocks/mock-1-liquid-glass.html` so the
+/// SwiftUI chat matches the approved mock. System-blue accent (#0A84FF), an ink
+/// ramp, and a green "ready" dot. All dynamic where it matters so dark mode reads
+/// well too.
+enum ChatPalette {
+    static let blue = Color(red: 0x0A / 255, green: 0x84 / 255, blue: 0xFF / 255)
+    static let green = Color(red: 0x30 / 255, green: 0xD1 / 255, blue: 0x58 / 255)
+    static let blueSoft = blue.opacity(0.14)
+
+    /// Primary ink (adapts to light/dark via the system label color).
+    static let ink = Color(nsColor: .labelColor)
+    static let ink2 = Color(nsColor: .secondaryLabelColor)
+    static let ink3 = Color(nsColor: .tertiaryLabelColor)
+    static let hairline = Color(nsColor: .separatorColor)
+
+    /// A faint translucent fill for cards layered on the glass.
+    static let cardFill = Color(nsColor: .controlBackgroundColor).opacity(0.55)
+    static let cardStroke = Color(nsColor: .separatorColor).opacity(0.6)
+}
+
+// MARK: - Chat UI: live tool-call card state (PR8)
+
+/// The live state of one tool call as rendered by `ToolCallCard`. Fed by the
+/// `AgentLoop` progress hook: a `.started` event creates a `.running` card; a
+/// `.finished` event flips it to `.done`/`.error` with a compact, tool-specific
+/// preview decoded from the result string.
+struct ToolCallState: Identifiable, Equatable {
+    enum Status: Equatable { case running, done, error }
+
+    let id: String          // == the loop's callKey (stable, matches tool message id)
+    var name: String        // tool name, e.g. "web_search"
+    var argsSummary: String // a short human summary of the arguments
+    var rawArguments: String
+    var status: Status
+    /// A compact, decoded preview of the result (search rows, read title/snippet,
+    /// screenshot path, …). nil while running.
+    var preview: ToolResultPreview?
+
+    static func == (lhs: ToolCallState, rhs: ToolCallState) -> Bool {
+        lhs.id == rhs.id && lhs.name == rhs.name && lhs.argsSummary == rhs.argsSummary
+            && lhs.status == rhs.status && lhs.preview == rhs.preview
+    }
+}
+
+/// A decoded, render-ready view of a tool result (built off the result string).
+enum ToolResultPreview: Equatable {
+    case search([SearchResult])
+    case read(title: String, snippet: String)
+    case screenshot(path: String)
+    case extract(title: String, chunks: [String])
+    case open(title: String, url: String)
+    case text(String)      // generic / unknown tool → a short snippet
+    case error(String)
+}
+
+// MARK: - Chat UI: ViewModel (PR8)
+
+/// Drives one agent chat session for `ChatView`. Holds the displayable message
+/// list and the live tool-call cards, runs `PopDraftAgent`, streams assistant
+/// text via the text-delta callback, and surfaces per-call tool progress through
+/// the injected `ToolProgressHook`. `@MainActor` so all `@Published` mutations
+/// are main-thread safe; the agent runs in a detached `Task`.
+@MainActor
+final class AgentChatViewModel: ObservableObject {
+    /// The persisted conversation (system/user/assistant/tool turns).
+    @Published private(set) var session: ChatSession
+    /// Display-only messages (user + assistant), in order. Tool/system turns are
+    /// folded into the owning assistant turn's cards, not shown as bubbles.
+    @Published private(set) var visibleMessages: [ChatMessage] = []
+    /// Live tool cards for the assistant turn currently generating (and, after it
+    /// finishes, attached to that assistant message by id).
+    @Published private(set) var liveToolCards: [ToolCallState] = []
+    /// Streaming text for the in-progress assistant turn (empty when idle).
+    @Published private(set) var streamingText: String = ""
+    /// True while the agent loop is running (drives the caret + disables input).
+    @Published private(set) var isGenerating: Bool = false
+    /// User-facing model label for the header (e.g. "Qwen2.5-7B · local").
+    @Published var modelLabel: String
+    /// Whether web tools are enabled (drives the "Web" chip + the ready dot).
+    @Published var webEnabled: Bool
+    /// The draft text in the input bar.
+    @Published var draft: String = ""
+    /// Tool cards keyed by the assistant message id they belong to (so a finished
+    /// turn keeps its cards rendered above its answer).
+    @Published private(set) var cardsByMessage: [String: [ToolCallState]] = [:]
+
+    private let store: SessionStore
+    private var runTask: Task<Void, Never>?
+    /// Monotonic generation id. Bumped on every `run()`/`cancel()` so that a
+    /// late-arriving streaming/progress event from a SUPERSEDED run is dropped
+    /// (the `onDelta`/`onProgress` sinks fire on unstructured Tasks whose order
+    /// vs. the completion is not guaranteed).
+    private var generation: Int = 0
+
+    init(session: ChatSession, store: SessionStore) {
+        self.session = session
+        self.store = store
+        let cfg = AppConfig.load(dir: LLMConfig.configDir)
+        self.webEnabled = cfg.agentSettings.enableWebSearch
+        self.modelLabel = AgentChatViewModel.makeModelLabel()
+        rebuildVisible()
+    }
+
+    /// A compact "Model · provider" label for the header.
+    static func makeModelLabel() -> String {
+        let cfg = LLMConfig.load()
+        let provider = cfg.provider
+        let suffix: String
+        switch provider {
+        case .llamacpp: suffix = "local"
+        case .ollama: suffix = "ollama"
+        case .openai: suffix = "OpenAI"
+        case .claude: suffix = "Claude"
+        }
+        return "\(LLMClient.shared.currentModel) · \(suffix)"
+    }
+
+    /// Recompute `visibleMessages` + per-message cards from `session.messages`.
+    ///
+    /// One agent turn can be MULTIPLE messages on the wire: an assistant message
+    /// carrying only `tool_calls` (empty content), then `role:"tool"` results,
+    /// then a final assistant answer. We fold the tool cards of empty tool-only
+    /// turns onto the next rendered bubble so they appear ABOVE that turn's answer
+    /// (as in the mock) — never as an orphaned label-only bubble.
+    private func rebuildVisible() {
+        var visible: [ChatMessage] = []
+        var cards: [String: [ToolCallState]] = [:]
+        // Cards from tool-only turns waiting to attach to the next bubble.
+        var carried: [ToolCallState] = []
+        // Cards for the most-recent assistant message that DID get a bubble, so a
+        // trailing tool message (resolving a card) can update them in place.
+        var activeBubbleId: String?
+
+        func cardsFrom(_ m: ChatMessage) -> [ToolCallState] {
+            guard let calls = m.toolCalls, !calls.isEmpty else { return [] }
+            return calls.enumerated().map { (i, c) in
+                let key = c.id.isEmpty ? "call_\(i)" : c.id
+                return ToolCallState(
+                    id: key, name: c.name,
+                    argsSummary: ToolArgFormatter.summary(name: c.name, arguments: c.arguments),
+                    rawArguments: c.arguments, status: .running, preview: nil)
+            }
+        }
+        func resolveCard(_ toolCallId: String, content: String, isError: Bool) {
+            if let i = carried.firstIndex(where: { $0.id == toolCallId }) {
+                carried[i].status = isError ? .error : .done
+                carried[i].preview = ToolResultDecoder.decode(name: carried[i].name, content: content, isError: isError)
+            } else if let bid = activeBubbleId, var bucket = cards[bid],
+                      let i = bucket.firstIndex(where: { $0.id == toolCallId }) {
+                bucket[i].status = isError ? .error : .done
+                bucket[i].preview = ToolResultDecoder.decode(name: bucket[i].name, content: content, isError: isError)
+                cards[bid] = bucket
+            }
+        }
+
+        for m in session.messages {
+            switch m.role {
+            case "user":
+                visible.append(m)
+                carried = []
+                activeBubbleId = nil
+            case "assistant":
+                let myCards = cardsFrom(m)
+                let hasContent = !m.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if hasContent {
+                    visible.append(m)
+                    cards[m.id] = carried + myCards
+                    activeBubbleId = m.id
+                    carried = []
+                } else {
+                    // Tool-only turn: carry its cards to the next rendered bubble.
+                    carried.append(contentsOf: myCards)
+                    // The cards stay "active" so trailing tool messages resolve them.
+                    activeBubbleId = nil
+                }
+            case "tool":
+                resolveCard(m.toolCallId ?? "", content: m.content, isError: m.isError == true)
+            default:
+                break
+            }
+        }
+        // Any cards still carried (a turn ended without a final answer bubble):
+        // attach them to a synthetic trailing assistant bubble so they're visible.
+        // Use a STABLE id derived from the carried card ids so the bubble keeps its
+        // SwiftUI identity across rebuilds (no view churn / lost scroll).
+        if !carried.isEmpty {
+            let stableId = "cards:" + carried.map { $0.id }.joined(separator: ",")
+            visible.append(ChatMessage(id: stableId, role: "assistant", content: ""))
+            cards[stableId] = carried
+        }
+        self.visibleMessages = visible
+        self.cardsByMessage = cards
+    }
+
+    /// Submit a new user turn (from the input bar) and run the agent.
+    func send(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isGenerating else { return }
+        draft = ""
+        let now = Date().timeIntervalSince1970
+        session.messages.append(ChatMessage(role: "user", content: trimmed, createdAt: now))
+        session.updatedAt = now
+        rebuildVisible()
+        run()
+    }
+
+    /// Run the agent loop against the current session, streaming text + tool
+    /// progress into the published state.
+    func run() {
+        guard !isGenerating else { return }
+        generation += 1
+        let gen = generation
+        isGenerating = true
+        streamingText = ""
+        liveToolCards = []
+
+        let snapshot = session
+        let appConfig = AppConfig.load(dir: LLMConfig.configDir)
+
+        // @Sendable sinks: capture self weakly ONCE (not via the enclosing Task)
+        // so they stay strict-concurrency clean. Each event hops to the MainActor
+        // and is dropped if a newer run/cancel has superseded this `gen`.
+        let onDelta: @Sendable (String) -> Void = { [weak self] text in
+            Task { @MainActor [weak self] in
+                guard let self = self, self.generation == gen else { return }
+                self.streamingText = text
+            }
+        }
+        let onProgress: ToolProgressHook = { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self = self, self.generation == gen else { return }
+                self.apply(progress: event)
+            }
+        }
+
+        runTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            defer { if self.generation == gen { self.runTask = nil } }
+            do {
+                let outcome = try await PopDraftAgent.run(
+                    session: snapshot, config: appConfig,
+                    onTextDelta: onDelta, onProgress: onProgress)
+                guard self.generation == gen else { return }  // superseded → drop
+                var saved = outcome.session
+                saved.refreshTitle()
+                self.session = saved
+                self.finishGenerating()
+            } catch is CancellationError {
+                guard self.generation == gen else { return }
+                self.finishGenerating()
+            } catch {
+                guard self.generation == gen else { return }
+                // Surface the failure as an assistant error message so the user
+                // sees what went wrong (and the chat stays continuable).
+                let msg = "I hit an error: \(error.localizedDescription)"
+                self.session.messages.append(ChatMessage(
+                    role: "assistant", content: msg, isError: true))
+                self.session.updatedAt = Date().timeIntervalSince1970
+                self.finishGenerating()
+            }
+        }
+    }
+
+    /// Clear all transient generating state and rebuild the visible transcript.
+    private func finishGenerating() {
+        streamingText = ""
+        liveToolCards = []
+        isGenerating = false
+        rebuildVisible()
+    }
+
+    /// Apply one tool-progress event to the live cards.
+    private func apply(progress event: ToolProgressEvent) {
+        switch event.phase {
+        case .started:
+            // New running card (or refresh an existing one by key).
+            if let idx = liveToolCards.firstIndex(where: { $0.id == event.callKey }) {
+                liveToolCards[idx].status = .running
+            } else {
+                liveToolCards.append(ToolCallState(
+                    id: event.callKey, name: event.name,
+                    argsSummary: ToolArgFormatter.summary(name: event.name, arguments: event.arguments),
+                    rawArguments: event.arguments, status: .running, preview: nil))
+            }
+        case .finished(let content, let isError):
+            // Resolve the FIRST still-running card with this key (handles a model
+            // that emits the same id for parallel calls — each finished event
+            // resolves one running card rather than re-resolving a done one).
+            let idx = liveToolCards.firstIndex(where: { $0.id == event.callKey && $0.status == .running })
+                ?? liveToolCards.firstIndex(where: { $0.id == event.callKey })
+            if let idx = idx {
+                liveToolCards[idx].status = isError ? .error : .done
+                liveToolCards[idx].preview = ToolResultDecoder.decode(
+                    name: event.name, content: content, isError: isError)
+            }
+        }
+    }
+
+    /// Cancel any in-flight run (used on dismiss). Bumps `generation` so any
+    /// already-queued streaming/progress events are dropped, and clears the
+    /// transient generating state.
+    func cancel() {
+        generation += 1
+        runTask?.cancel()
+        runTask = nil
+        isGenerating = false
+        streamingText = ""
+        liveToolCards = []
+    }
+
+    /// The latest assistant answer text (for whole-answer copy).
+    var latestAnswer: String {
+        session.messages.last(where: { $0.role == "assistant" })?.content ?? ""
+    }
+
+    /// Persist the session now (idempotent — store.save overwrites by id).
+    @discardableResult
+    func persist() -> Bool {
+        guard session.hasMeaningfulExchange else { return false }
+        var s = session
+        s.refreshTitle()
+        session = s
+        return store.save(s)
+    }
+
+    /// Deterministically seed the live streaming + tool-card state for offscreen
+    /// rendering / the PR10 `--ui-screenshot` harness (no model call). Lets a
+    /// render driver show the streaming caret + running cards without a network
+    /// round-trip. Not used on the interactive path.
+    func seedRenderState(streamingText: String, generating: Bool, liveCards: [ToolCallState]) {
+        self.streamingText = streamingText
+        self.isGenerating = generating
+        self.liveToolCards = liveCards
+    }
+}
+
+// MARK: - Chat UI: tool argument formatting + result decoding (PR8)
+
+/// Builds the short "(args)" summary shown next to a tool name on a card.
+enum ToolArgFormatter {
+    static func summary(name: String, arguments: String) -> String {
+        let obj = (try? ToolArgs.parse(arguments)) ?? [:]
+        switch name {
+        case "web_search":
+            if let q = obj["query"] as? String { return "\"\(q)\"" }
+        case "web_open", "web_read", "web_screenshot", "web_extract":
+            if let u = obj["url"] as? String { return shortURL(u) }
+        case "summarize_text", "extract_text":
+            if let t = obj["text"] as? String { return "\(t.prefix(40))…" }
+        default:
+            break
+        }
+        // Fallback: first string value, or a compact key list.
+        if let first = obj.values.compactMap({ $0 as? String }).first, !first.isEmpty {
+            return "\(first.prefix(48))"
+        }
+        let keys = obj.keys.sorted().joined(separator: ", ")
+        return keys.isEmpty ? "" : keys
+    }
+
+    static func shortURL(_ s: String) -> String {
+        guard let u = URL(string: s), let host = u.host else { return s }
+        let path = u.path
+        return path.isEmpty || path == "/" ? host : host + path
+    }
+}
+
+/// Decodes a tool's result string into a compact, render-ready `ToolResultPreview`.
+enum ToolResultDecoder {
+    static func decode(name: String, content: String, isError: Bool) -> ToolResultPreview {
+        if isError {
+            return .error(String(content.prefix(200)))
+        }
+        let data = content.data(using: .utf8)
+        switch name {
+        case "web_search":
+            if let d = data, let arr = try? JSONDecoder().decode([SearchResult].self, from: d) {
+                return .search(Array(arr.prefix(5)))
+            }
+        case "web_read":
+            // web_read returns Markdown with a "# Title\nURL: ..." header.
+            let (title, snippet) = parseReadMarkdown(content)
+            return .read(title: title, snippet: snippet)
+        case "web_screenshot":
+            if let d = data, let shot = try? JSONDecoder().decode(ShotResult.self, from: d) {
+                return .screenshot(path: shot.path)
+            }
+        case "web_extract":
+            if let d = data, let ex = try? JSONDecoder().decode(ExtractResult.self, from: d) {
+                return .extract(title: ex.title, chunks: ex.chunks.prefix(3).map { $0.text })
+            }
+        case "web_open":
+            if let d = data, let op = try? JSONDecoder().decode(OpenResult.self, from: d) {
+                return .open(title: op.title, url: op.finalURL)
+            }
+        default:
+            break
+        }
+        // Generic: a short snippet of the (possibly JSON) content.
+        let snippet = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .text(String(snippet.prefix(220)))
+    }
+
+    /// Pull a title + leading snippet out of `web_read`'s Markdown.
+    private static func parseReadMarkdown(_ md: String) -> (String, String) {
+        var title = "Page"
+        let lines = md.split(separator: "\n", omittingEmptySubsequences: false)
+        var consumedHeader = false
+        var body: [String] = []
+        for line in lines {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            if !consumedHeader {
+                if s.hasPrefix("# ") { title = String(s.dropFirst(2)); continue }
+                if s.hasPrefix("URL:") || s.hasPrefix("By:") || s.hasPrefix("(truncated") || s.isEmpty {
+                    continue
+                }
+                consumedHeader = true
+            }
+            if !s.isEmpty { body.append(s) }
+            if body.joined(separator: " ").count > 200 { break }
+        }
+        let snippet = body.joined(separator: " ")
+        return (title, String(snippet.prefix(220)))
+    }
+}
+
+// MARK: - Chat UI: Markdown rendering (PR8)
+
+/// Splits assistant Markdown into ordered blocks for rendering: fenced code
+/// blocks get a `CodeBlockView` (with their own copy button + monospaced body),
+/// everything else is rendered as inline Markdown via `AttributedString`.
+/// The `index` is the block's ordinal position, used as a collision-free
+/// `Identifiable.id` (two identical code blocks must keep distinct ForEach ids).
+enum MarkdownBlock: Identifiable {
+    case prose(index: Int, String)
+    case code(index: Int, language: String?, code: String)
+    var id: Int {
+        switch self {
+        case .prose(let index, _): return index
+        case .code(let index, _, _): return index
+        }
+    }
+}
+
+enum MarkdownParser {
+    /// Parse text into a sequence of prose / fenced-code blocks. Fences are
+    /// ```lang … ``` (the closing fence may be missing on a streaming partial).
+    static func blocks(_ text: String) -> [MarkdownBlock] {
+        var out: [MarkdownBlock] = []
+        var prose: [String] = []
+        var code: [String] = []
+        var inCode = false
+        var lang: String? = nil
+
+        func flushProse() {
+            let joined = prose.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty { out.append(.prose(index: out.count, joined)) }
+            prose = []
+        }
+        func flushCode() {
+            out.append(.code(index: out.count, language: lang, code: code.joined(separator: "\n")))
+            code = []
+            lang = nil
+        }
+
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                if inCode {
+                    flushCode()
+                    inCode = false
+                } else {
+                    flushProse()
+                    inCode = true
+                    let l = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                    lang = l.isEmpty ? nil : l
+                }
+                continue
+            }
+            if inCode { code.append(line) } else { prose.append(line) }
+        }
+        if inCode { flushCode() } else { flushProse() }
+        return out
+    }
+
+    /// Render an inline-Markdown prose block as an AttributedString (headings,
+    /// bold/italic, lists, links, inline code). Falls back to plain text if the
+    /// Markdown can't be parsed. Headings/list bullets are pre-processed since
+    /// `AttributedString(markdown:)` doesn't render block structure.
+    static func attributed(_ prose: String) -> AttributedString {
+        var result = AttributedString()
+        let lines = prose.components(separatedBy: "\n")
+        for (i, raw) in lines.enumerated() {
+            if i > 0 { result.append(AttributedString("\n")) }
+            let line = raw
+            // Heading.
+            if let h = headingLevel(line) {
+                let textPart = String(line.drop(while: { $0 == "#" })).trimmingCharacters(in: .whitespaces)
+                var a = inlineAttributed(textPart)
+                let size: CGFloat = h == 1 ? 17 : (h == 2 ? 15 : 14)
+                a.font = .system(size: size, weight: .semibold)
+                result.append(a)
+                continue
+            }
+            // List item.
+            let listTrim = line.trimmingCharacters(in: .whitespaces)
+            if listTrim.hasPrefix("- ") || listTrim.hasPrefix("* ") {
+                var a = AttributedString("•  ")
+                a.foregroundColor = ChatPalette.ink2
+                result.append(a)
+                result.append(inlineAttributed(String(listTrim.dropFirst(2))))
+                continue
+            }
+            if let m = numberedItem(listTrim) {
+                var a = AttributedString("\(m.number).  ")
+                a.foregroundColor = ChatPalette.ink2
+                result.append(a)
+                result.append(inlineAttributed(m.body))
+                continue
+            }
+            result.append(inlineAttributed(line))
+        }
+        return result
+    }
+
+    private static func headingLevel(_ line: String) -> Int? {
+        guard line.hasPrefix("#") else { return nil }
+        let hashes = line.prefix(while: { $0 == "#" }).count
+        guard hashes >= 1, hashes <= 6, line.dropFirst(hashes).first == " " else { return nil }
+        return hashes
+    }
+
+    private static func numberedItem(_ line: String) -> (number: Int, body: String)? {
+        guard let dot = line.firstIndex(of: "."), line.startIndex != dot else { return nil }
+        let numPart = line[line.startIndex..<dot]
+        guard let n = Int(numPart) else { return nil }
+        let after = line[line.index(after: dot)...]
+        guard after.hasPrefix(" ") else { return nil }
+        return (n, String(after.dropFirst()))
+    }
+
+    /// Parse inline Markdown (bold/italic/links/inline-code) into an
+    /// AttributedString. Graceful fallback to plain text.
+    private static func inlineAttributed(_ text: String) -> AttributedString {
+        let opts = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        if let a = try? AttributedString(markdown: text, options: opts) {
+            return a
+        }
+        return AttributedString(text)
+    }
+}
+
+// MARK: - Chat UI: code block view (PR8)
+
+/// A fenced code block with a language chip + its own copy button + monospaced
+/// body, styled to match the Liquid-Glass mock.
+struct CodeBlockView: View {
+    let language: String?
+    let code: String
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text(language?.uppercased() ?? "CODE")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(ChatPalette.ink3)
+                Spacer()
+                Button(action: copy) {
+                    HStack(spacing: 3) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(copied ? "Copied" : "Copy")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(copied ? ChatPalette.green : ChatPalette.ink2)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+
+            Divider().opacity(0.4)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundColor(ChatPalette.ink)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.65))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(ChatPalette.cardStroke, lineWidth: 0.5))
+    }
+
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
+    }
+}
+
+// MARK: - Chat UI: thinking disclosure (PR8)
+
+/// A collapsible "Reasoning…" section shown only when an assistant message
+/// carries `thinking`. Matches the mock's sparkle + chevron + muted body.
+struct ThinkingDisclosure: View {
+    let thinking: String
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(ChatPalette.ink3)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Image(systemName: "sparkle")
+                        .font(.system(size: 10))
+                        .foregroundColor(ChatPalette.blue)
+                    Text(expanded ? "Reasoning" : "Reasoning — show thinking")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(ChatPalette.ink2)
+                    Spacer()
+                }
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                Text(thinking)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(ChatPalette.ink2)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+                    .padding(.leading, 21)
+                    .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(ChatPalette.blueSoft.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+// MARK: - Chat UI: tool-call card (PR8)
+
+/// A compact card for one tool call: name + args summary + a status indicator
+/// (spinner → check / ✗), with tool-specialized result rendering.
+struct ToolCallCard: View {
+    let card: ToolCallState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(ChatPalette.blue)
+                Text(card.name)
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .foregroundColor(ChatPalette.ink)
+                if !card.argsSummary.isEmpty {
+                    Text(card.argsSummary)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(ChatPalette.ink3)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 6)
+                statusBadge
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+
+            if let preview = card.preview, card.status != .running {
+                Divider().opacity(0.35)
+                previewView(preview)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+            }
+        }
+        .background(ChatPalette.cardFill)
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).stroke(ChatPalette.cardStroke, lineWidth: 0.5))
+    }
+
+    private var icon: String {
+        switch card.name {
+        case "web_search": return "magnifyingglass"
+        case "web_read", "web_open": return "doc.text"
+        case "web_screenshot": return "camera"
+        case "web_extract": return "text.viewfinder"
+        case "summarize_text": return "text.alignleft"
+        case "extract_text": return "text.magnifyingglass"
+        default: return "wrench.and.screwdriver"
+        }
+    }
+
+    @ViewBuilder private var statusBadge: some View {
+        switch card.status {
+        case .running:
+            ProgressView()
+                .scaleEffect(0.5)
+                .frame(width: 14, height: 14)
+        case .done:
+            HStack(spacing: 3) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .bold))
+                Text(resultCount).font(.system(size: 10, weight: .medium))
+            }
+            .foregroundColor(ChatPalette.green)
+        case .error:
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.red)
+        }
+    }
+
+    private var resultCount: String {
+        if case .search(let arr)? = card.preview { return "\(arr.count)" }
+        return "done"
+    }
+
+    @ViewBuilder private func previewView(_ preview: ToolResultPreview) -> some View {
+        switch preview {
+        case .search(let results):
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(results.enumerated()), id: \.offset) { _, r in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(r.title)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(ChatPalette.ink)
+                            .lineLimit(1)
+                        Text(r.snippet)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(ChatPalette.ink2)
+                            .lineLimit(2)
+                        Text(host(r.url))
+                            .font(.system(size: 9.5))
+                            .foregroundColor(ChatPalette.blue)
+                    }
+                }
+            }
+        case .read(let title, let snippet):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 11, weight: .semibold)).foregroundColor(ChatPalette.ink).lineLimit(1)
+                Text(snippet).font(.system(size: 10.5)).foregroundColor(ChatPalette.ink2).lineLimit(3)
+            }
+        case .extract(let title, let chunks):
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 11, weight: .semibold)).foregroundColor(ChatPalette.ink).lineLimit(1)
+                ForEach(Array(chunks.enumerated()), id: \.offset) { _, c in
+                    Text(c).font(.system(size: 10.5)).foregroundColor(ChatPalette.ink2).lineLimit(2)
+                }
+            }
+        case .open(let title, let url):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 11, weight: .semibold)).foregroundColor(ChatPalette.ink).lineLimit(1)
+                Text(host(url)).font(.system(size: 9.5)).foregroundColor(ChatPalette.blue)
+            }
+        case .screenshot(let path):
+            screenshotThumb(path)
+        case .text(let s):
+            Text(s).font(.system(size: 10.5)).foregroundColor(ChatPalette.ink2).lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .error(let s):
+            Text(s).font(.system(size: 10.5)).foregroundColor(.red).lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func screenshotThumb(_ path: String) -> some View {
+        if let img = NSImage(contentsOfFile: path) {
+            Image(nsImage: img)
+                .resizable()
+                .interpolation(.medium)
+                .scaledToFit()
+                .frame(maxHeight: 120)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(ChatPalette.cardStroke, lineWidth: 0.5))
+        } else {
+            HStack(spacing: 5) {
+                Image(systemName: "photo").font(.system(size: 11)).foregroundColor(ChatPalette.ink3)
+                Text((path as NSString).lastPathComponent)
+                    .font(.system(size: 10.5)).foregroundColor(ChatPalette.ink2).lineLimit(1)
+            }
+        }
+    }
+
+    private func host(_ s: String) -> String {
+        URL(string: s)?.host ?? s
+    }
+}
+
+// MARK: - Chat UI: message bubble (PR8)
+
+/// One conversation turn. User turns get a blue-tinted right-aligned bubble;
+/// assistant turns render author-labeled Markdown (with code blocks), an optional
+/// Thinking disclosure, the turn's tool cards, and a per-message copy button.
+struct MessageBubble: View {
+    let message: ChatMessage
+    /// Tool cards belonging to THIS assistant turn (finished) — rendered above the answer.
+    let toolCards: [ToolCallState]
+
+    private var isUser: Bool { message.role == "user" }
+
+    var body: some View {
+        if isUser {
+            userBubble
+        } else {
+            assistantBubble
+        }
+    }
+
+    // MARK: User
+
+    private var userBubble: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Text(message.content)
+                .font(.system(size: 13))
+                .foregroundColor(ChatPalette.ink)
+                .textSelection(.enabled)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(ChatPalette.blueSoft)
+                .clipShape(RoundedRectangle(cornerRadius: 13))
+                .frame(maxWidth: 440, alignment: .trailing)
+            copyButton(text: message.content)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    // MARK: Assistant
+
+    private var assistantBubble: some View {
+        HStack(alignment: .top, spacing: 9) {
+            avatar
+            VStack(alignment: .leading, spacing: 8) {
+                Text("PopDraft")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(ChatPalette.ink2)
+
+                if let thinking = message.thinking, !thinking.isEmpty {
+                    ThinkingDisclosure(thinking: thinking)
+                }
+
+                ForEach(toolCards) { card in
+                    ToolCallCard(card: card)
+                }
+
+                if message.isError == true {
+                    Text(message.content)
+                        .font(.system(size: 13))
+                        .foregroundColor(.red)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if !message.content.isEmpty {
+                    renderedMarkdown(message.content)
+                }
+
+                if !message.content.isEmpty {
+                    copyButton(text: message.content)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var avatar: some View {
+        Group {
+            if let orb = AppAssets.bubbleOrb {
+                Image(nsImage: orb).resizable().scaledToFit()
+            } else {
+                Circle().fill(
+                    LinearGradient(colors: [ChatPalette.blue, Color(red: 0.78, green: 0.61, blue: 1.0)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .overlay(Image(systemName: "sparkle").font(.system(size: 9)).foregroundColor(.white))
+            }
+        }
+        .frame(width: 22, height: 22)
+        .clipShape(Circle())
+    }
+
+    @ViewBuilder private func renderedMarkdown(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(MarkdownParser.blocks(text)) { block in
+                switch block {
+                case .prose(_, let p):
+                    Text(MarkdownParser.attributed(p))
+                        .font(.system(size: 13))
+                        .foregroundColor(ChatPalette.ink)
+                        .textSelection(.enabled)
+                        .tint(ChatPalette.blue)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .code(_, let lang, let code):
+                    CodeBlockView(language: lang, code: code)
+                }
+            }
+        }
+    }
+
+    private func copyButton(text: String) -> some View {
+        MessageCopyButton(text: text)
+    }
+}
+
+/// A small per-message copy button with a brief "Copied" confirmation.
+struct MessageCopyButton: View {
+    let text: String
+    @State private var copied = false
+    var body: some View {
+        Button(action: {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
+        }) {
+            HStack(spacing: 3) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(copied ? "Copied" : "Copy")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundColor(copied ? ChatPalette.green : ChatPalette.ink3)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// The blinking streaming caret shown on the in-progress assistant line.
+struct StreamingCaret: View {
+    @State private var on = true
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(ChatPalette.blue)
+            .frame(width: 7, height: 14)
+            .opacity(on ? 1 : 0.2)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    on.toggle()
+                }
+            }
+    }
+}
+
+// MARK: - Chat UI: ChatView (PR8)
+
+/// The full Claude-style agent chat surface (Liquid Glass). A header (title +
+/// model indicator + minimize), a scrolling transcript of `MessageBubble`s with
+/// live tool cards + streaming caret, and a bottom input bar with a send button,
+/// tool chips, and a streaming hint. Fixed-size panel + internal ScrollView (no
+/// `fittingSize` auto-resize).
+struct ChatView: View {
+    @ObservedObject var viewModel: AgentChatViewModel
+    let onMinimize: () -> Void
+    @FocusState private var inputFocused: Bool
+
+    static let panelWidth: CGFloat = 720
+    static let panelHeight: CGFloat = 560
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider().opacity(0.4)
+            transcript
+            Divider().opacity(0.4)
+            inputBar
+        }
+        .frame(width: Self.panelWidth, height: Self.panelHeight)
+        .background(VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Group {
+                if let orb = AppAssets.bubbleOrb {
+                    Image(nsImage: orb).resizable().scaledToFit()
+                } else {
+                    Circle().fill(LinearGradient(
+                        colors: [ChatPalette.blue, Color(red: 0.78, green: 0.61, blue: 1.0)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                }
+            }
+            .frame(width: 22, height: 22)
+            .clipShape(Circle())
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(viewModel.session.title.isEmpty ? "Agent chat" : viewModel.session.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(ChatPalette.ink)
+                    .lineLimit(1)
+                Text("Agent session · saved on Copy")
+                    .font(.system(size: 10))
+                    .foregroundColor(ChatPalette.ink3)
+            }
+
+            Spacer()
+
+            HStack(spacing: 5) {
+                Circle().fill(ChatPalette.green).frame(width: 7, height: 7)
+                Text(viewModel.modelLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(ChatPalette.ink2)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(ChatPalette.cardFill)
+            .clipShape(Capsule())
+
+            Button(action: minimize) {
+                Image(systemName: "minus")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(ChatPalette.ink2)
+                    .frame(width: 26, height: 26)
+                    .background(ChatPalette.cardFill)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Minimize to bubble")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    // MARK: Transcript
+
+    private var transcript: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let sel = viewModel.session.selectedText, !sel.isEmpty {
+                        contextChip(sel)
+                    }
+                    ForEach(viewModel.visibleMessages, id: \.id) { msg in
+                        MessageBubble(
+                            message: msg,
+                            toolCards: viewModel.cardsByMessage[msg.id] ?? [])
+                        .id(msg.id)
+                    }
+                    // The still-generating turn (streaming text + running tool
+                    // cards + caret) renders as its own trailing block.
+                    if viewModel.isGenerating {
+                        generatingBlock
+                            .id("__generating__")
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .onChange(of: viewModel.visibleMessages.count) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: viewModel.streamingText) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: viewModel.liveToolCards.count) { _, _ in scrollToBottom(proxy) }
+        }
+    }
+
+    /// The live "agent is working" block: spinner over the running tool cards and
+    /// the streaming partial answer with a caret.
+    private var generatingBlock: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Circle().fill(LinearGradient(
+                colors: [ChatPalette.blue, Color(red: 0.78, green: 0.61, blue: 1.0)],
+                startPoint: .topLeading, endPoint: .bottomTrailing))
+                .frame(width: 22, height: 22)
+                .overlay(Image(systemName: "sparkle").font(.system(size: 9)).foregroundColor(.white))
+            VStack(alignment: .leading, spacing: 8) {
+                Text("PopDraft")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(ChatPalette.ink2)
+                ForEach(viewModel.liveToolCards) { card in
+                    ToolCallCard(card: card)
+                }
+                if viewModel.streamingText.isEmpty {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.5).frame(width: 14, height: 14)
+                        Text(viewModel.liveToolCards.contains { $0.status == .running }
+                             ? "Running tools…" : "Thinking…")
+                            .font(.system(size: 12))
+                            .foregroundColor(ChatPalette.ink3)
+                    }
+                } else {
+                    HStack(alignment: .bottom, spacing: 2) {
+                        Text(viewModel.streamingText)
+                            .font(.system(size: 13))
+                            .foregroundColor(ChatPalette.ink)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        StreamingCaret()
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func contextChip(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            RoundedRectangle(cornerRadius: 2).fill(ChatPalette.blue).frame(width: 3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Selected text")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(ChatPalette.blue)
+                Text(text)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(ChatPalette.ink2)
+                    .lineLimit(3)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ChatPalette.blueSoft.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.15)) {
+                if viewModel.isGenerating {
+                    proxy.scrollTo("__generating__", anchor: .bottom)
+                } else if let last = viewModel.visibleMessages.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    // MARK: Input bar
+
+    private var inputBar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                TextField("Ask anything, or paste more text…", text: $viewModel.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .lineLimit(1...5)
+                    .focused($inputFocused)
+                    .onSubmit(submit)
+                    .disabled(viewModel.isGenerating)
+
+                Button(action: submit) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 30, height: 30)
+                        .background(canSend ? ChatPalette.blue : ChatPalette.blue.opacity(0.35))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(ChatPalette.cardFill)
+            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .overlay(RoundedRectangle(cornerRadius: 13).stroke(ChatPalette.cardStroke, lineWidth: 0.5))
+
+            HStack(spacing: 8) {
+                toolChip("globe", "Web", on: viewModel.webEnabled)
+                toolChip("wand.and.stars", "Actions", on: false)
+                Spacer()
+                Text(viewModel.isGenerating ? "Streaming…" : "Enter to send")
+                    .font(.system(size: 10))
+                    .foregroundColor(ChatPalette.ink3)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private func toolChip(_ icon: String, _ label: String, on: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 10))
+            Text(label).font(.system(size: 11, weight: .medium))
+        }
+        .foregroundColor(on ? ChatPalette.blue : ChatPalette.ink3)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(on ? ChatPalette.blueSoft : ChatPalette.cardFill)
+        .clipShape(Capsule())
+    }
+
+    private var canSend: Bool {
+        !viewModel.isGenerating &&
+        !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submit() {
+        guard canSend else { return }
+        viewModel.send(viewModel.draft)
+    }
+
+    private func minimize() {
+        viewModel.cancel()
+        onMinimize()
+    }
+}
+
 // MARK: - Corner Bubble (PR4)
 
 /// The persistent orb that lives in a screen corner. Renders the bundled brand
@@ -2925,6 +4157,13 @@ class PopupWindowController: NSWindowController {
         dir: NSString(string: "~/.popdraft").expandingTildeInPath
     )
 
+    /// PR8: the live chat view model. Set whenever the popup is in `.chat` state;
+    /// nil otherwise. Drives `ChatView`.
+    private var chatViewModel: AgentChatViewModel?
+    /// PR8: the session's message count when the chat was presented, so a reopened
+    /// session that the user didn't continue isn't needlessly re-saved on dismiss.
+    private var presentedMessageCount: Int?
+
     /// Called right before the popup is shown at the cursor — used to minimize
     /// the corner bubble (PR4). The popup itself stays bubble-agnostic.
     var onWillShow: (() -> Void)?
@@ -2992,7 +4231,8 @@ class PopupWindowController: NSWindowController {
             onTTSPause: { [weak self] in self?.pauseTTS() },
             onTTSResume: { [weak self] in self?.resumeTTS() },
             onOpenAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() },
-            onRestartLlamaServer: { [weak self] in self?.restartLlamaServer() }
+            onRestartLlamaServer: { [weak self] in self?.restartLlamaServer() },
+            chatViewModel: chatViewModel
         )
 
         if hostingView == nil {
@@ -3001,6 +4241,11 @@ class PopupWindowController: NSWindowController {
         } else {
             hostingView?.rootView = view
         }
+
+        // PR8: the chat uses a FIXED-size panel with its own internal ScrollView —
+        // the `fittingSize` auto-resize hack below fights a growing transcript, so
+        // skip it entirely in chat mode (the size is set once in `enterChat`).
+        if case .chat = state { return }
 
         // Defer resize to next run loop so SwiftUI can finish layout
         DispatchQueue.main.async { [weak self] in
@@ -3101,21 +4346,31 @@ class PopupWindowController: NSWindowController {
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
 
-        // Reset state. When the bubble is enabled and no text is selected, drop
-        // straight into the custom-prompt entry state (a sensible default until
-        // the agent-chat routing lands in a later PR). With the bubble DISABLED,
-        // keep today's exact behavior (always the action list). With text
-        // selected, it's always the action list.
+        // Reset state.
         searchText = ""
         selectedIndex = 0
-        let bubbleEnabled = LLMConfig.load().bubble.enabled
-        state = (bubbleEnabled && clipboardText.isEmpty) ? .customPrompt : .actionList
         customPromptText = ""
         resultText = ""
         // PR5: start a fresh invocation — drop any previously recorded session so a
         // stale exchange isn't re-saved on this dismiss.
         currentSession = nil
         didSaveCurrentSession = false
+        chatViewModel = nil
+        presentedMessageCount = nil
+
+        // PR8: with the bubble enabled and NO text selected, the hotkey opens the
+        // agent chat directly (empty, awaiting the user's first message). With the
+        // bubble disabled, keep today's behavior (action list). With text selected,
+        // it's always the action list (the user picks an action → chat).
+        let bubbleEnabled = LLMConfig.load().bubble.enabled
+        if bubbleEnabled && clipboardText.isEmpty {
+            enterChat(seedUser: "", selectedText: nil, autoRun: false)
+            window?.makeKeyAndOrderFront(nil)
+            startKeyboardMonitoring()
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        state = .actionList
         updateView()
 
         // Position near mouse
@@ -3181,6 +4436,9 @@ class PopupWindowController: NSWindowController {
         // PR5: start a fresh invocation (see showAtMouseLocation).
         currentSession = nil
         didSaveCurrentSession = false
+        // PR8: drop any stale chat VM before this invocation.
+        chatViewModel = nil
+        presentedMessageCount = nil
 
         // Position near mouse
         let mouseLocation = NSEvent.mouseLocation
@@ -3223,6 +4481,8 @@ class PopupWindowController: NSWindowController {
     }
 
     func dismiss() {
+        // PR8: stop any in-flight agent run before tearing down.
+        chatViewModel?.cancel()
         // PR5: persist the session on minimize/dismiss too (idempotent with copy —
         // a session already flushed by copyResult won't be written twice, and an
         // empty/aborted session is skipped by hasMeaningfulExchange).
@@ -3269,6 +4529,17 @@ class PopupWindowController: NSWindowController {
             }
 
             let actions = ActionManager.shared.filteredActions(searchText: self.searchText)
+
+            // PR8: in chat mode the SwiftUI TextField owns the keyboard — let every
+            // key through (arrows, Return for submit/newline, Space) and only
+            // intercept Escape to minimize the chat to the bubble.
+            if case .chat = self.state {
+                if event.keyCode == 53 { // Escape
+                    self.dismiss()
+                    return nil
+                }
+                return event
+            }
 
             switch event.keyCode {
             case 53: // Escape
@@ -3462,115 +4733,96 @@ class PopupWindowController: NSWindowController {
             }
 
         case .llm:
-            let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
-            // Capture the exact text/prompt this exchange ran on as immutable
-            // `let`s so the result closure stays Sendable-safe under strict
-            // concurrency (never reach back into mutable `self.*` for these).
-            let actionPrompt = action.prompt
+            // PR8: any non-Copy LLM action now opens the full chat, seeded with the
+            // action applied to the selection. The agent loop produces the first
+            // assistant turn (continuable), instead of the old single-shot result.
             let capturedText = clipboardText
-            let startTime = Date()
-            LLMClient.shared.generate(
-                prompt: fullPrompt,
-                onProgress: { [weak self] progress in
-                    guard let self = self else { return }
-                    switch progress {
-                    case .thinking:
-                        self.state = .streaming(text: "", isThinking: true)
-                    case .generating(let text):
-                        self.state = .streaming(text: text, isThinking: false)
-                    }
-                    self.updateView()
-                }
-            ) { [weak self] result in
-                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
-                DispatchQueue.main.async {
-                    switch result {
-                    case .success(let response):
-                        Logger.shared.info("LLM response received (\(elapsed), \(response.text.count) chars)")
-                        self?.resultText = response.text
-                        self?.recordExchange(userPrompt: actionPrompt, selectedText: capturedText, assistant: response.text, thinking: response.thinking)
-                        self?.state = .result(response.text, thinking: response.thinking)
-                    case .failure(let error):
-                        Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
-                        self?.state = .error(error.localizedDescription)
-                    }
-                    self?.updateView()
-                }
-            }
+            let seed = capturedText.isEmpty
+                ? action.prompt
+                : "\(action.prompt)\n\nText:\n\(capturedText)"
+            enterChat(
+                seedUser: seed,
+                selectedText: capturedText.isEmpty ? nil : capturedText,
+                autoRun: true)
 
         case .agent:
             runAgent(action: action)
         }
     }
 
-    // MARK: - Agent (PR7)
+    // MARK: - Agent chat (PR7 → PR8)
 
-    /// Run the tool-calling agent loop for an `.agent` action. Seeds a fresh
-    /// `ChatSession` (system + user, with the selected text as context), runs
-    /// `PopDraftAgent` (which iterates the model + tools), and shows the final
-    /// answer in the EXISTING result view. The single-shot path is untouched.
+    /// Open the full Claude-style ChatView (PR8) for an `.agent` action. Seeds a
+    /// fresh `ChatSession` (system + user, with the selection as context), enters
+    /// chat mode (fixed-size panel), and kicks off the agent loop — its result
+    /// becomes the first assistant turn, and the user can keep chatting.
     private func runAgent(action: Action) {
         let capturedText = clipboardText
         let userRequest = action.prompt
-        // Build the seeding user message: the request plus the selection as context.
         let userContent = capturedText.isEmpty
             ? userRequest
             : "\(userRequest)\n\nSelected text:\n\(capturedText)"
+        enterChat(
+            seedUser: userContent,
+            selectedText: capturedText.isEmpty ? nil : capturedText,
+            autoRun: true)
+    }
+
+    /// Build a fresh chat session, switch into `.chat` state, resize the window to
+    /// the fixed chat panel, and (optionally) start generating. Shared by the
+    /// "Ask Agent" action, any non-Copy action routed to chat, and the
+    /// empty-selection hotkey.
+    private func enterChat(seedUser: String, selectedText: String?, autoRun: Bool) {
         let now = Date().timeIntervalSince1970
-        let session = ChatSession(
+        var messages: [ChatMessage] = [
+            ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
+        ]
+        if !seedUser.isEmpty {
+            messages.append(ChatMessage(role: "user", content: seedUser, createdAt: now))
+        }
+        var session = ChatSession(
             createdAt: now, updatedAt: now,
             model: LLMClient.shared.currentModel,
-            selectedText: capturedText.isEmpty ? nil : capturedText,
-            messages: [
-                ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
-                ChatMessage(role: "user", content: userContent, createdAt: now),
-            ])
-        let appConfig = AppConfig.load(dir: LLMConfig.configDir)
-        let startTime = Date()
+            selectedText: selectedText,
+            messages: messages)
+        session.refreshTitle()
+        presentChat(for: session, autoRun: autoRun)
+    }
 
-        state = .processing
+    /// Present `ChatView` for an existing/seeded session and size the panel.
+    private func presentChat(for session: ChatSession, autoRun: Bool) {
+        let vm = AgentChatViewModel(session: session, store: sessionStore)
+        chatViewModel = vm
+        // The chat's own save point: the controller persists on copy/minimize.
+        currentSession = session
+        didSaveCurrentSession = false
+        // Record the starting size so an UNCHANGED reopened session isn't re-saved.
+        presentedMessageCount = session.messages.count
+        state = .chat
+        sizeWindowForChat()
         updateView()
+        if autoRun { vm.run() }
+    }
 
-        // A standalone @Sendable text-delta sink that captures `self` weakly
-        // ONCE (not via an enclosing Task), so it stays strict-concurrency clean.
-        let onDelta: @Sendable (String) -> Void = { [weak self] text in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.state = .streaming(text: text, isThinking: false)
-                self.updateView()
-            }
+    /// Resize + recenter the window to the fixed chat panel, clamped to screen.
+    private func sizeWindowForChat() {
+        guard let window = window else { return }
+        let size = NSSize(width: ChatView.panelWidth, height: ChatView.panelHeight)
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
+        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        var origin = NSPoint(
+            x: mouseLocation.x - size.width / 2,
+            y: mouseLocation.y - size.height - 10)
+        if origin.x < screenFrame.minX + 10 { origin.x = screenFrame.minX + 10 }
+        if origin.x + size.width > screenFrame.maxX - 10 { origin.x = screenFrame.maxX - size.width - 10 }
+        if origin.y < screenFrame.minY + 10 {
+            origin.y = screenFrame.midY - size.height / 2
         }
-
-        Task { @MainActor [weak self] in
-            do {
-                let outcome = try await PopDraftAgent.run(
-                    session: session,
-                    config: appConfig,
-                    onTextDelta: onDelta)
-                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
-                let toolTurns = outcome.session.messages.filter { $0.role == "tool" }.count
-                Logger.shared.info("Agent finished (\(elapsed), \(outcome.iterations) iters, \(toolTurns) tool calls)")
-                guard let self = self else { return }
-                let answer = outcome.finalText.isEmpty
-                    ? "(The agent stopped without a final answer.)"
-                    : outcome.finalText
-                self.resultText = answer
-                // Persist the full agent session (with tool turns) for reopening.
-                var saved = outcome.session
-                saved.refreshTitle()
-                self.currentSession = saved
-                self.didSaveCurrentSession = false
-                let lastThinking = outcome.session.messages.last(where: { $0.role == "assistant" })?.thinking
-                self.state = .result(answer, thinking: lastThinking)
-                self.updateView()
-            } catch {
-                let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
-                Logger.shared.error("Agent failed (\(elapsed)): \(error.localizedDescription)")
-                guard let self = self else { return }
-                self.state = .error(error.localizedDescription)
-                self.updateView()
-            }
+        if origin.y + size.height > screenFrame.maxY - 10 {
+            origin.y = screenFrame.maxY - size.height - 10
         }
+        window.setFrame(NSRect(origin: origin, size: size), display: true)
     }
 
     // MARK: - Session recording (PR5)
@@ -3602,12 +4854,30 @@ class PopupWindowController: NSWindowController {
     }
 
     /// Persist the current session if it carries a meaningful exchange and hasn't
-    /// already been saved. Safe to call from both copy and dismiss.
+    /// already been saved. Safe to call from both copy and dismiss. In chat mode
+    /// (PR8) the live `AgentChatViewModel.session` is the source of truth (it has
+    /// the full multi-turn transcript), so prefer it.
     private func flushSessionIfMeaningful() {
-        guard !didSaveCurrentSession, let session = currentSession, session.hasMeaningfulExchange else { return }
-        if sessionStore.save(session) {
+        guard !didSaveCurrentSession else { return }
+        let session = chatViewModel?.session ?? currentSession
+        guard let session = session, session.hasMeaningfulExchange else { return }
+        // Don't pollute Recent with a chat whose only assistant turn is an error
+        // (e.g. the server was down) — there's nothing useful to reopen.
+        let hasNonErrorAnswer = session.messages.contains {
+            $0.role == "assistant" && $0.isError != true
+                && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard hasNonErrorAnswer else { return }
+        // Skip a redundant rewrite of an unmodified reopened session (same message
+        // count as when presented) — avoids needless disk writes + title churn.
+        if let presented = presentedMessageCount, session.messages.count == presented {
+            return
+        }
+        var s = session
+        s.refreshTitle()
+        if sessionStore.save(s) {
             didSaveCurrentSession = true
-            Logger.shared.info("Saved session \(session.id) (\"\(session.title)\")")
+            Logger.shared.info("Saved session \(s.id) (\"\(s.title)\")")
         }
     }
 
@@ -3615,41 +4885,22 @@ class PopupWindowController: NSWindowController {
     /// in the existing result view (PR5 — no chat UI yet). Crash-safe: a missing
     /// session is a no-op.
     func reopenSession(id: String) {
-        guard let session = sessionStore.load(id: id),
-              let lastAssistant = session.messages.last(where: { $0.role == "assistant" }) else {
+        guard let session = sessionStore.load(id: id) else {
             Logger.shared.error("Could not reopen session \(id)")
             return
         }
-        // The reopened session is already on disk; don't re-save it on dismiss.
-        currentSession = session
-        didSaveCurrentSession = true
-
+        // PR8: reopen as a full, continuable chat (not the old single-message
+        // result view). An unchanged session won't be re-saved on dismiss
+        // (`presentedMessageCount` guard); a new turn grows it and re-saves.
+        onWillShow?()
+        // Remember the app to refocus on dismiss (reopen skips captureSelectedText,
+        // which is where `previousApp` is normally set).
+        previousApp = NSWorkspace.shared.frontmostApplication
         clipboardText = session.selectedText ?? ""
-        resultText = lastAssistant.content
         searchText = ""
         customPromptText = ""
         selectedIndex = 0
-        state = .result(lastAssistant.content, thinking: lastAssistant.thinking)
-        updateView()
-        positionAtMouseAndShow()
-    }
-
-    /// Shared "place the panel near the cursor and show it" helper (mirrors the
-    /// clamping done by `showAtMouseLocation`), used when reopening a session.
-    private func positionAtMouseAndShow() {
-        let mouseLocation = NSEvent.mouseLocation
-        var frame = window?.frame ?? .zero
-        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
-        let screenFrame = screen?.visibleFrame ?? .zero
-        frame.origin = NSPoint(x: mouseLocation.x - frame.width / 2, y: mouseLocation.y - frame.height - 10)
-        if frame.minX < screenFrame.minX { frame.origin.x = screenFrame.minX + 10 }
-        if frame.maxX > screenFrame.maxX { frame.origin.x = screenFrame.maxX - frame.width - 10 }
-        if frame.minY < screenFrame.minY {
-            frame.origin.y = mouseLocation.y + 20
-            if frame.maxY > screenFrame.maxY { frame.origin.y = screenFrame.maxY - frame.height - 10 }
-        }
-        onWillShow?()
-        window?.setFrame(frame, display: true)
+        presentChat(for: session, autoRun: false)
         window?.makeKeyAndOrderFront(nil)
         startKeyboardMonitoring()
         NSApp.activate(ignoringOtherApps: true)
@@ -8798,7 +10049,8 @@ struct PopDraftAgent {
     static func run(
         session: ChatSession,
         config: AppConfig,
-        onTextDelta: (@Sendable (String) -> Void)? = nil
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        onProgress: ToolProgressHook? = nil
     ) async throws -> AgentLoop.Outcome {
         let registry = await buildRegistry(config: config)
         // Tool concurrency cap == renderer pool size (web tools are the heavy ones).
@@ -8813,7 +10065,8 @@ struct PopDraftAgent {
                 messages: messages, tools: tools.isEmpty ? nil : tools,
                 stream: false, onTextDelta: onTextDelta)
         }
-        return try await loop.run(session: session, registry: registry, call: modelCall)
+        return try await loop.run(
+            session: session, registry: registry, call: modelCall, onProgress: onProgress)
     }
 }
 
