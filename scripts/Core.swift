@@ -148,6 +148,18 @@ struct AppConfig: Codable, Equatable {
     var webSearch: WebSearchConfig
     var bubble: BubbleSettings
 
+    // --- PR6: homemade WebEngine knobs ---
+    /// Max concurrent offscreen WKWebViews. Clamped to 1...6. Default 2 (vetted posture).
+    var webMaxRenderers: Int
+    /// Per-job navigation timeout in milliseconds (load + settle). Default 15000.
+    var webNavTimeoutMs: Int
+    /// Bounded "settle" wait after `readyState=="complete"`, in ms. Default 600.
+    var webSettleMs: Int
+    /// Hard character cap for read()/extract() Markdown output. Default 12000.
+    var webReadMaxChars: Int
+    /// Max response size accepted by the engine, in bytes. Default 8 MB.
+    var webMaxBytes: Int
+
     // MARK: Defaults
 
     init(
@@ -174,7 +186,12 @@ struct AppConfig: Codable, Equatable {
         providerKeys: [String: String] = [:],
         agentSettings: AgentSettings = AgentSettings(),
         webSearch: WebSearchConfig = WebSearchConfig(),
-        bubble: BubbleSettings = BubbleSettings()
+        bubble: BubbleSettings = BubbleSettings(),
+        webMaxRenderers: Int = 2,
+        webNavTimeoutMs: Int = 15000,
+        webSettleMs: Int = 600,
+        webReadMaxChars: Int = 12000,
+        webMaxBytes: Int = 8 * 1024 * 1024
     ) {
         self.version = version
         self.provider = provider
@@ -200,6 +217,11 @@ struct AppConfig: Codable, Equatable {
         self.agentSettings = agentSettings
         self.webSearch = webSearch
         self.bubble = bubble
+        self.webMaxRenderers = webMaxRenderers
+        self.webNavTimeoutMs = webNavTimeoutMs
+        self.webSettleMs = webSettleMs
+        self.webReadMaxChars = webReadMaxChars
+        self.webMaxBytes = webMaxBytes
     }
 
     // MARK: Backward-compatible decoding
@@ -232,7 +254,19 @@ struct AppConfig: Codable, Equatable {
         agentSettings = try c.decodeIfPresent(AgentSettings.self, forKey: .agentSettings) ?? d.agentSettings
         webSearch = try c.decodeIfPresent(WebSearchConfig.self, forKey: .webSearch) ?? d.webSearch
         bubble = try c.decodeIfPresent(BubbleSettings.self, forKey: .bubble) ?? d.bubble
+        // PR6 web-engine knobs: clamp/sanitize so out-of-range disk values can't break the pool.
+        webMaxRenderers = WebTuning.clampRenderers(try c.decodeIfPresent(Int.self, forKey: .webMaxRenderers) ?? d.webMaxRenderers)
+        webNavTimeoutMs = max(1000, try c.decodeIfPresent(Int.self, forKey: .webNavTimeoutMs) ?? d.webNavTimeoutMs)
+        webSettleMs = max(0, try c.decodeIfPresent(Int.self, forKey: .webSettleMs) ?? d.webSettleMs)
+        webReadMaxChars = max(500, try c.decodeIfPresent(Int.self, forKey: .webReadMaxChars) ?? d.webReadMaxChars)
+        webMaxBytes = max(64 * 1024, try c.decodeIfPresent(Int.self, forKey: .webMaxBytes) ?? d.webMaxBytes)
     }
+}
+
+/// Shared tuning helpers for the web engine (pure; unit-tested).
+enum WebTuning {
+    /// Clamp the renderer-pool size to the vetted 1...6 band.
+    static func clampRenderers(_ n: Int) -> Int { min(6, max(1, n)) }
 }
 
 // MARK: - Persistence
@@ -1021,4 +1055,691 @@ struct SessionStore {
     func delete(id: String) -> Bool {
         return (try? FileManager.default.removeItem(atPath: path(for: id))) != nil
     }
+}
+
+// =====================================================================
+// MARK: - PR6: Web Engine (pure logic)
+//
+// Everything below is Foundation-only (NO WebKit / AppKit) so it is unit-
+// tested by `tests/test-webengine-core.swift` with no network and no GUI.
+// The WebKit-backed orchestration (RendererPool, WebEngine, screenshots)
+// lives in PopDraft.swift and calls into these helpers.
+// =====================================================================
+
+// MARK: Public value types (shared by Core + PopDraft + tests)
+
+/// One web search hit.
+struct SearchResult: Codable, Equatable {
+    var title: String
+    var url: String
+    var snippet: String
+
+    init(title: String, url: String, snippet: String) {
+        self.title = title
+        self.url = url
+        self.snippet = snippet
+    }
+}
+
+/// A search request. `maxResults` is advisory; providers may return fewer.
+struct SearchQuery: Equatable {
+    var query: String
+    var maxResults: Int
+
+    init(query: String, maxResults: Int = 8) {
+        self.query = query
+        self.maxResults = maxResults
+    }
+}
+
+/// Result of `WebEngine.open` — a light "did it load, what is it" probe.
+struct OpenResult: Codable, Equatable {
+    var finalURL: String
+    var status: Int
+    var title: String
+    var preview: String      // first ~500 chars of cleaned text
+}
+
+/// Result of `WebEngine.read` — sanitized article Markdown.
+struct ReadResult: Codable, Equatable {
+    var finalURL: String
+    var status: Int
+    var title: String
+    var byline: String?
+    var siteName: String?
+    var markdown: String
+    var charCount: Int
+    var truncated: Bool
+}
+
+/// Result of `WebEngine.screenshot` — a PNG written to disk.
+struct ShotResult: Codable, Equatable {
+    var finalURL: String
+    var path: String
+    var width: Int
+    var height: Int
+    var fullPage: Bool
+}
+
+/// One relevant chunk returned by `WebEngine.extract`.
+struct ExtractChunk: Codable, Equatable {
+    var text: String
+    var score: Double
+}
+
+/// Result of `WebEngine.extract` — top relevant chunks for an instruction.
+struct ExtractResult: Codable, Equatable {
+    var finalURL: String
+    var title: String
+    var instruction: String
+    var chunks: [ExtractChunk]
+}
+
+/// Errors surfaced by the web engine. `String`-bearing cases carry detail for tools.
+enum WebEngineError: Error, Equatable, CustomStringConvertible {
+    case blockedScheme(String)
+    case blockedHost(String)          // SSRF: resolved to a private/loopback/metadata IP
+    case invalidURL(String)
+    case navigationFailed(String)
+    case timeout
+    case tooLarge(Int)                // exceeded webMaxBytes
+    case renderProcessCrashed
+    case noContent
+    case searchFailed(String)
+
+    var description: String {
+        switch self {
+        case .blockedScheme(let s): return "Blocked URL scheme: \(s)"
+        case .blockedHost(let h): return "Blocked host (SSRF / private address): \(h)"
+        case .invalidURL(let u): return "Invalid URL: \(u)"
+        case .navigationFailed(let m): return "Navigation failed: \(m)"
+        case .timeout: return "Navigation timed out"
+        case .tooLarge(let n): return "Response too large: \(n) bytes"
+        case .renderProcessCrashed: return "Web content process crashed"
+        case .noContent: return "No readable content found"
+        case .searchFailed(let m): return "Search failed: \(m)"
+        }
+    }
+}
+
+// MARK: - SafetyGuard (SSRF + scheme allowlist)
+
+/// SSRF / scheme defenses. Everything that takes only a hostname/IP/scheme string
+/// is pure and unit-tested; the DNS-resolving entry point (`isSafe(url:)`) is a
+/// thin wrapper used by the engine before any navigation and on every redirect.
+enum SafetyGuard {
+
+    /// Schemes the engine is willing to navigate to. `about:blank` is allowed
+    /// separately (see `isSchemeAllowed`). Everything else (file/ftp/data/...) is rejected.
+    static let allowedSchemes: Set<String> = ["http", "https"]
+
+    /// TEST-ONLY loopback escape hatch. The GUI test suite serves fixtures on a
+    /// random loopback port; those URLs would normally be blocked as SSRF. When
+    /// the env var `PD_WEB_ALLOW_LOOPBACK_PORT=<port>` is set (only ever set by
+    /// `tests/run-tests.sh`), `http://127.0.0.1:<port>` is permitted. This is
+    /// read from the environment so the shipping app — which never sets it —
+    /// keeps full SSRF protection. Returns the allowed port, or nil.
+    static func allowedLoopbackTestPort() -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment["PD_WEB_ALLOW_LOOPBACK_PORT"],
+              let p = Int(raw), p > 0 else { return nil }
+        return p
+    }
+
+    /// True when a host:port is the explicitly-allowlisted loopback test target.
+    static func isTestLoopback(host: String, port: Int?) -> Bool {
+        guard let allowed = allowedLoopbackTestPort(), let port = port, port == allowed else { return false }
+        let h = host.lowercased()
+        return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
+    }
+
+    /// Whether a URL's scheme is allowed. Special-cases `about:blank` (used to
+    /// reset a recycled webview) while blocking every other `about:` target,
+    /// and blocks `file:`, `ftp:`, `data:`, `javascript:`, etc.
+    static func isSchemeAllowed(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        if scheme == "about" {
+            // Only about:blank is permitted.
+            return url.absoluteString.lowercased() == "about:blank"
+        }
+        return allowedSchemes.contains(scheme)
+    }
+
+    /// Classify a literal IP string (v4 or v6). Returns true if the address is
+    /// one we must refuse to fetch: loopback, RFC1918, link-local, ULA, the
+    /// unspecified address, or the cloud metadata endpoint.
+    static func isBlockedIP(_ ip: String) -> Bool {
+        let s = ip.trimmingCharacters(in: .whitespaces).lowercased()
+        if s.isEmpty { return true }
+        // Strip a zone id (e.g. "fe80::1%en0") and brackets.
+        let noZone = s.split(separator: "%").first.map(String.init) ?? s
+        let bare = noZone.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+
+        if let v4 = parseIPv4(bare) {
+            return isBlockedIPv4(v4)
+        }
+        if let v6 = parseIPv6(bare) {
+            return isBlockedIPv6(v6)
+        }
+        // Unparseable as an IP — treat as not-an-IP (host-name path handles it).
+        return false
+    }
+
+    /// Parse a dotted-quad IPv4 into 4 octets, or nil.
+    static func parseIPv4(_ s: String) -> [Int]? {
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var octets: [Int] = []
+        for p in parts {
+            guard !p.isEmpty, p.allSatisfy({ $0.isNumber }), let n = Int(p), n >= 0, n <= 255 else { return nil }
+            octets.append(n)
+        }
+        return octets
+    }
+
+    /// True for blocked IPv4 ranges.
+    static func isBlockedIPv4(_ o: [Int]) -> Bool {
+        guard o.count == 4 else { return true }
+        // 0.0.0.0/8 (incl. the unspecified 0.0.0.0)
+        if o[0] == 0 { return true }
+        // 127.0.0.0/8 loopback
+        if o[0] == 127 { return true }
+        // 10.0.0.0/8 RFC1918
+        if o[0] == 10 { return true }
+        // 172.16.0.0/12 RFC1918
+        if o[0] == 172 && (o[1] >= 16 && o[1] <= 31) { return true }
+        // 192.168.0.0/16 RFC1918
+        if o[0] == 192 && o[1] == 168 { return true }
+        // 169.254.0.0/16 link-local (incl. 169.254.169.254 cloud metadata)
+        if o[0] == 169 && o[1] == 254 { return true }
+        // 100.64.0.0/10 CGNAT (shared address space)
+        if o[0] == 100 && (o[1] >= 64 && o[1] <= 127) { return true }
+        return false
+    }
+
+    /// Parse an IPv6 string into 8 16-bit groups (supports `::` compression and
+    /// a trailing embedded IPv4). Returns nil if not a valid IPv6 literal.
+    static func parseIPv6(_ s: String) -> [Int]? {
+        if !s.contains(":") { return nil }
+        var str = s
+        // Handle embedded IPv4 tail (e.g. ::ffff:1.2.3.4).
+        if let lastColon = str.lastIndex(of: ":"), str[str.index(after: lastColon)...].contains(".") {
+            let tail = String(str[str.index(after: lastColon)...])
+            guard let v4 = parseIPv4(tail) else { return nil }
+            let hi = (v4[0] << 8) | v4[1]
+            let lo = (v4[2] << 8) | v4[3]
+            str = String(str[..<str.index(after: lastColon)])
+                + String(format: "%x:%x", hi, lo)
+        }
+
+        let halves = str.components(separatedBy: "::")
+        if halves.count > 2 { return nil }
+
+        func groups(_ part: String) -> [Int]? {
+            if part.isEmpty { return [] }
+            var out: [Int] = []
+            for g in part.split(separator: ":", omittingEmptySubsequences: false) {
+                guard !g.isEmpty, g.count <= 4,
+                      let v = Int(g, radix: 16), v >= 0, v <= 0xFFFF else { return nil }
+                out.append(v)
+            }
+            return out
+        }
+
+        if halves.count == 2 {
+            guard let head = groups(halves[0]), let tail = groups(halves[1]) else { return nil }
+            let fill = 8 - head.count - tail.count
+            guard fill >= 0 else { return nil }
+            return head + Array(repeating: 0, count: fill) + tail
+        } else {
+            guard let all = groups(halves[0]), all.count == 8 else { return nil }
+            return all
+        }
+    }
+
+    /// True for blocked IPv6 ranges.
+    static func isBlockedIPv6(_ g: [Int]) -> Bool {
+        guard g.count == 8 else { return true }
+        // :: unspecified
+        if g.allSatisfy({ $0 == 0 }) { return true }
+        // ::1 loopback
+        if g[0...6].allSatisfy({ $0 == 0 }) && g[7] == 1 { return true }
+        // fe80::/10 link-local
+        if (g[0] & 0xFFC0) == 0xFE80 { return true }
+        // fc00::/7 unique-local (fc.. / fd..)
+        if (g[0] & 0xFE00) == 0xFC00 { return true }
+        // ::ffff:a.b.c.d  IPv4-mapped — re-check the embedded v4.
+        if g[0] == 0, g[1] == 0, g[2] == 0, g[3] == 0, g[4] == 0, g[5] == 0xFFFF {
+            let o = [(g[6] >> 8) & 0xFF, g[6] & 0xFF, (g[7] >> 8) & 0xFF, g[7] & 0xFF]
+            return isBlockedIPv4(o)
+        }
+        return false
+    }
+
+    /// A literal-host check that does NOT resolve DNS: if the host is already an
+    /// IP literal, classify it; if it's a name that is obviously local
+    /// (`localhost`, `*.local`, `*.internal`), block it too. Names that need DNS
+    /// are deferred to the resolving caller (`isSafe`).
+    static func isLiteralHostBlocked(_ host: String) -> Bool {
+        let h = host.trimmingCharacters(in: CharacterSet(charactersIn: "[] ")).lowercased()
+        if h.isEmpty { return true }
+        if h == "localhost" || h.hasSuffix(".localhost") { return true }
+        if h.hasSuffix(".local") || h.hasSuffix(".internal") { return true }
+        // If it parses as an IP literal, classify it.
+        if parseIPv4(h) != nil || parseIPv6(h) != nil {
+            return isBlockedIP(h)
+        }
+        return false
+    }
+}
+
+// MARK: - URL cleaning (tracking-param stripping)
+
+enum URLCleaner {
+    /// Query params we strip from links before returning them (analytics noise).
+    static let trackingParams: Set<String> = [
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_reader", "utm_name", "utm_social", "utm_brand",
+        "gclid", "fbclid", "dclid", "gclsrc", "msclkid", "yclid",
+        "mc_cid", "mc_eid", "igshid", "vero_id", "vero_conv",
+        "_hsenc", "_hsmi", "mkt_tok", "ref", "ref_src", "ref_url",
+        "spm", "scm", "_openstat", "wt_mc", "trk", "trkCampaign",
+    ]
+
+    /// Remove tracking query params from a URL string. Preserves order of the
+    /// remaining params, drops a trailing "?" when nothing is left, and leaves
+    /// non-http(s) / unparseable strings unchanged.
+    static func strip(_ urlString: String) -> String {
+        guard var comps = URLComponents(string: urlString) else { return urlString }
+        guard let items = comps.queryItems, !items.isEmpty else { return urlString }
+        let kept = items.filter { !trackingParams.contains($0.name.lowercased()) }
+        comps.queryItems = kept.isEmpty ? nil : kept
+        // Avoid a dangling "?".
+        if kept.isEmpty { comps.query = nil }
+        return comps.string ?? urlString
+    }
+}
+
+// MARK: - DuckDuckGo "lite" / "html" result parsing
+
+enum DDGParser {
+    /// Decode DDG's `uddg` redirect param into the real destination URL.
+    /// DDG links look like `/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=...`.
+    /// Returns nil if there's no usable `uddg`.
+    static func decodeRedirect(_ href: String) -> String? {
+        // Build absolute so URLComponents can parse a root-relative href.
+        let abs = href.hasPrefix("http") ? href : "https://duckduckgo.com" + (href.hasPrefix("/") ? href : "/" + href)
+        guard let comps = URLComponents(string: abs),
+              let items = comps.queryItems,
+              let uddg = items.first(where: { $0.name == "uddg" })?.value,
+              !uddg.isEmpty else {
+            return nil
+        }
+        // URLComponents already percent-decodes the value.
+        return uddg
+    }
+
+    /// Parse the HTML body of the DDG **lite** endpoint into results.
+    /// The lite page is a flat table: result rows have an `<a ... class="result-link">`
+    /// (the title+link) followed by a snippet cell with `class="result-snippet"`.
+    /// We parse defensively with regex (no HTML lib) and tolerate format drift.
+    static func parseLite(_ html: String, maxResults: Int = 10) -> [SearchResult] {
+        var results: [SearchResult] = []
+        // Anchors that carry the result link. On lite, these are class="result-link";
+        // we also accept any anchor whose href is a /l/?uddg= redirect.
+        let anchorPattern = "<a[^>]*href=\"([^\"]*)\"[^>]*>(.*?)</a>"
+        guard let re = try? NSRegularExpression(pattern: anchorPattern, options: [.dotMatchesLineSeparators, .caseInsensitive]) else {
+            return []
+        }
+        let ns = html as NSString
+        let matches = re.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length))
+
+        // Build a list of (url, title, anchorStart, anchorEnd) for redirect anchors.
+        var anchors: [(url: String, title: String, start: Int, end: Int)] = []
+        for m in matches {
+            guard m.numberOfRanges >= 3 else { continue }
+            let href = ns.substring(with: m.range(at: 1))
+            // Only result links carry a uddg redirect.
+            guard let real = decodeRedirect(href) else { continue }
+            let rawTitle = ns.substring(with: m.range(at: 2))
+            let title = stripTags(rawTitle)
+            guard !title.isEmpty else { continue }
+            anchors.append((url: URLCleaner.strip(real), title: title,
+                            start: m.range.location, end: m.range.location + m.range.length))
+        }
+
+        // For each result anchor, grab a result-snippet block — but ONLY one that
+        // falls strictly BEFORE the next result anchor, so a result with no
+        // snippet of its own can't borrow the following result's snippet.
+        let snippetPattern = "class=\"result-snippet\"[^>]*>(.*?)</td>"
+        let snippetRe = try? NSRegularExpression(pattern: snippetPattern, options: [.dotMatchesLineSeparators, .caseInsensitive])
+
+        var snippetRanges: [(text: String, start: Int)] = []
+        if let snippetRe = snippetRe {
+            for m in snippetRe.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges >= 2 {
+                let raw = ns.substring(with: m.range(at: 1))
+                snippetRanges.append((text: stripTags(raw), start: m.range.location))
+            }
+        }
+
+        for (i, a) in anchors.enumerated() {
+            // Upper bound = start of the next anchor (or end-of-document).
+            let nextStart = (i + 1 < anchors.count) ? anchors[i + 1].start : ns.length
+            let snippet = snippetRanges.first(where: { $0.start >= a.end && $0.start < nextStart })?.text ?? ""
+            // Dedupe by exact URL within this page.
+            if results.contains(where: { $0.url == a.url }) { continue }
+            results.append(SearchResult(title: a.title, url: a.url, snippet: snippet))
+            if results.count >= maxResults { break }
+        }
+        return results
+    }
+
+    /// Strip HTML tags + decode a small set of entities, collapse whitespace.
+    static func stripTags(_ s: String) -> String {
+        var out = s
+        if let re = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            out = re.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "")
+        }
+        out = decodeEntities(out)
+        let collapsed = out.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" }).joined(separator: " ")
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Decode the handful of HTML entities DDG actually emits.
+    static func decodeEntities(_ s: String) -> String {
+        var out = s
+        let map: [(String, String)] = [
+            ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+            ("&quot;", "\""), ("&#39;", "'"), ("&#x27;", "'"),
+            ("&nbsp;", " "), ("&hellip;", "…"), ("&mdash;", "—"), ("&ndash;", "–"),
+        ]
+        for (k, v) in map { out = out.replacingOccurrences(of: k, with: v) }
+        return out
+    }
+}
+
+// MARK: - Markdown truncation / sanitization
+
+enum MarkdownSanitizer {
+    /// Collapse 3+ blank lines to 2; trim trailing spaces on every line.
+    static func collapseWhitespace(_ md: String) -> String {
+        var lines = md.components(separatedBy: "\n").map { line -> String in
+            // rstrip
+            var l = line
+            while let last = l.last, last == " " || last == "\t" { l.removeLast() }
+            return l
+        }
+        // Collapse runs of >2 blank lines.
+        var out: [String] = []
+        var blankRun = 0
+        for l in lines {
+            if l.isEmpty {
+                blankRun += 1
+                if blankRun <= 2 { out.append(l) }
+            } else {
+                blankRun = 0
+                out.append(l)
+            }
+        }
+        lines = out
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Truncate Markdown to at most `maxChars`, preferring a paragraph boundary
+    /// (a blank line) at or before the limit; falls back to a sentence then a
+    /// hard cut. Returns (text, truncated).
+    static func truncate(_ md: String, maxChars: Int) -> (String, Bool) {
+        if md.count <= maxChars { return (md, false) }
+        let prefix = String(md.prefix(maxChars))
+
+        // 1) Prefer the last paragraph break ("\n\n") inside the prefix.
+        if let r = prefix.range(of: "\n\n", options: .backwards) {
+            let cut = String(prefix[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            // Only accept if we keep a reasonable chunk (avoid truncating to almost nothing).
+            if cut.count >= maxChars / 2 {
+                return (cut + "\n\n…", true)
+            }
+        }
+        // 2) Fall back to the last sentence end.
+        let sentenceEnders = CharacterSet(charactersIn: ".!?")
+        if let idx = prefix.unicodeScalars.lastIndex(where: { sentenceEnders.contains($0) }) {
+            let endStr = prefix.unicodeScalars[...idx]
+            let cut = String(String.UnicodeScalarView(endStr)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if cut.count >= maxChars / 2 {
+                return (cut + " …", true)
+            }
+        }
+        // 3) Hard cut at the last space, else exact.
+        if let space = prefix.range(of: " ", options: .backwards) {
+            return (String(prefix[..<space.lowerBound]) + " …", true)
+        }
+        return (prefix + "…", true)
+    }
+}
+
+// MARK: - Size-cap logic
+
+enum SizeGuard {
+    /// True when `received` bytes exceed the configured cap. Pure so the engine's
+    /// streaming/`Content-Length` checks share one rule.
+    static func exceeds(received: Int, max: Int) -> Bool {
+        return received > max
+    }
+
+    /// Given an optional `Content-Length`, decide whether to reject up-front.
+    static func rejectByContentLength(_ contentLength: Int?, max: Int) -> Bool {
+        guard let len = contentLength else { return false }
+        return len > max
+    }
+}
+
+// MARK: - Keyword / BM25-ish chunk ranking (for extract)
+
+enum ChunkRanker {
+    /// Split Markdown into reasonably sized chunks on paragraph boundaries,
+    /// merging tiny ones so each chunk is roughly `targetChars` long.
+    static func chunk(_ markdown: String, targetChars: Int = 700) -> [String] {
+        let paras = markdown.components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var chunks: [String] = []
+        var cur = ""
+        for p in paras {
+            if cur.isEmpty {
+                cur = p
+            } else if cur.count + p.count + 2 <= targetChars {
+                cur += "\n\n" + p
+            } else {
+                chunks.append(cur)
+                cur = p
+            }
+        }
+        if !cur.isEmpty { chunks.append(cur) }
+        return chunks
+    }
+
+    /// Common English stopwords filtered out before ranking so a query word like
+    /// "are" / "in" / "what" can't make an off-topic chunk score highly.
+    static let stopwords: Set<String> = [
+        "the", "an", "and", "or", "but", "of", "to", "in", "on", "at", "by",
+        "for", "with", "as", "is", "are", "was", "were", "be", "been", "being",
+        "it", "its", "this", "that", "these", "those", "you", "he", "she",
+        "we", "they", "them", "his", "her", "their", "what", "which", "who",
+        "whom", "how", "when", "where", "why", "do", "does", "did", "can", "could",
+        "would", "should", "will", "shall", "may", "might", "must", "have", "has",
+        "had", "not", "no", "yes", "from", "into", "about", "than", "then", "so",
+        "if", "there", "here", "out", "up", "down", "over", "under", "some", "any",
+        "all", "each", "more", "most", "other", "such", "only", "own", "same",
+    ]
+
+    /// Lowercase, split on non-alphanumerics into tokens >= 2 chars, dropping
+    /// stopwords so ranking keys on content words.
+    static func tokenize(_ s: String) -> [String] {
+        let lower = s.lowercased()
+        var token = ""
+        var tokens: [String] = []
+        func flush() {
+            if token.count >= 2 && !stopwords.contains(token) { tokens.append(token) }
+            token = ""
+        }
+        for ch in lower.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(ch) {
+                token.unicodeScalars.append(ch)
+            } else {
+                flush()
+            }
+        }
+        flush()
+        return tokens
+    }
+
+    /// Rank `chunks` by BM25 against the `instruction` query. Returns the top
+    /// `limit` as (chunk, score) sorted by score desc. Deterministic.
+    static func rank(chunks: [String], instruction: String, limit: Int = 5) -> [ExtractChunk] {
+        guard !chunks.isEmpty else { return [] }
+        let queryTerms = Array(Set(tokenize(instruction)))
+        // No usable query → return the leading chunks (still useful context).
+        if queryTerms.isEmpty {
+            return chunks.prefix(limit).map { ExtractChunk(text: $0, score: 0) }
+        }
+
+        let docs = chunks.map { tokenize($0) }
+        let n = Double(docs.count)
+        let avgLen = docs.reduce(0.0) { $0 + Double($1.count) } / n
+
+        // Document frequency per query term.
+        var df: [String: Int] = [:]
+        for term in queryTerms {
+            var count = 0
+            for d in docs where d.contains(term) { count += 1 }
+            df[term] = count
+        }
+
+        let k1 = 1.5, b = 0.75
+        var scored: [(idx: Int, score: Double)] = []
+        for (i, d) in docs.enumerated() {
+            // Term frequencies in this doc.
+            var tf: [String: Int] = [:]
+            for t in d { tf[t, default: 0] += 1 }
+            let dl = Double(d.count)
+            var score = 0.0
+            for term in queryTerms {
+                let f = Double(tf[term] ?? 0)
+                if f == 0 { continue }
+                let nq = Double(df[term] ?? 0)
+                // BM25 idf (with +1 to stay positive).
+                let idf = log(1 + (n - nq + 0.5) / (nq + 0.5))
+                let denom = f + k1 * (1 - b + b * (dl / max(avgLen, 1)))
+                score += idf * (f * (k1 + 1)) / denom
+            }
+            scored.append((i, score))
+        }
+        // Sort by score desc, tie-break by original order (stable).
+        let ordered = scored.enumerated().sorted {
+            if $0.element.score != $1.element.score { return $0.element.score > $1.element.score }
+            return $0.offset < $1.offset
+        }
+        return ordered.prefix(limit)
+            .filter { $0.element.score > 0 }
+            .map { ExtractChunk(text: chunks[$0.element.idx], score: $0.element.score) }
+    }
+}
+
+// MARK: - OpenAI-style tool JSON-Schema constants (for PR7 to register)
+
+/// JSON-Schema tool specs in the OpenAI function-tool shape. These are plain
+/// strings (validated as JSON in tests) so PR7 can register them verbatim with
+/// any OpenAI-compatible `tools` array. Kept in Core.swift so tests can assert
+/// they parse without pulling in WebKit.
+enum WebToolSchemas {
+    static let webSearch = """
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the web and return a list of results (title, url, snippet). Use for finding pages relevant to a question before reading them.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "description": "The search query." },
+            "max_results": { "type": "integer", "description": "Maximum number of results to return (1-10).", "default": 8 }
+          },
+          "required": ["query"]
+        }
+      }
+    }
+    """
+
+    static let webOpen = """
+    {
+      "type": "function",
+      "function": {
+        "name": "web_open",
+        "description": "Open a URL and return its final URL, HTTP status, title, and a short text preview. Lightweight check that a page loads.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute http(s) URL to open." }
+          },
+          "required": ["url"]
+        }
+      }
+    }
+    """
+
+    static let webRead = """
+    {
+      "type": "function",
+      "function": {
+        "name": "web_read",
+        "description": "Open a URL and return its main article content as clean Markdown (Readability-extracted, sanitized, char-capped). Use to actually read a page.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute http(s) URL to read." },
+            "max_chars": { "type": "integer", "description": "Hard cap on returned characters.", "default": 12000 }
+          },
+          "required": ["url"]
+        }
+      }
+    }
+    """
+
+    static let webScreenshot = """
+    {
+      "type": "function",
+      "function": {
+        "name": "web_screenshot",
+        "description": "Render a URL and save a PNG screenshot to disk. Returns the file path and image dimensions.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute http(s) URL to screenshot." },
+            "full_page": { "type": "boolean", "description": "Capture the full scrollable page instead of just the viewport.", "default": false }
+          },
+          "required": ["url"]
+        }
+      }
+    }
+    """
+
+    static let webExtract = """
+    {
+      "type": "function",
+      "function": {
+        "name": "web_extract",
+        "description": "Read a URL and return the chunks of its content most relevant to an instruction (keyword/BM25 ranked). Use to pull a specific answer out of a long page.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute http(s) URL to extract from." },
+            "instruction": { "type": "string", "description": "What to look for / the question to answer from the page." }
+          },
+          "required": ["url", "instruction"]
+        }
+      }
+    }
+    """
+
+    /// All schemas, in registration order.
+    static let all: [String] = [webSearch, webOpen, webRead, webScreenshot, webExtract]
 }

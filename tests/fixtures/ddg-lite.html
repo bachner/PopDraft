@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>example at DuckDuckGo</title></head>
+<body>
+<form>
+  <input name="q" type="text" value="example query" />
+</form>
+<table>
+  <tr>
+    <td valign="top">1.&nbsp;</td>
+    <td>
+      <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.example.com%2Farticle%3Futm_source%3Dddg%26id%3D42&amp;rut=abcdef" class="result-link">Example Domain &amp; More</a>
+    </td>
+  </tr>
+  <tr>
+    <td>&nbsp;&nbsp;&nbsp;</td>
+    <td class="result-snippet">This domain is for use in illustrative examples in documents. You may use this domain &hellip;</td>
+  </tr>
+  <tr>
+    <td valign="top">2.&nbsp;</td>
+    <td>
+      <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FExample&amp;rut=999" class="result-link">Example - Wikipedia</a>
+    </td>
+  </tr>
+  <tr>
+    <td>&nbsp;&nbsp;&nbsp;</td>
+    <td class="result-snippet">An <b>example</b> is something selected to represent a group or set, often a typical case.</td>
+  </tr>
+  <tr>
+    <td valign="top">3.&nbsp;</td>
+    <td>
+      <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.iana.org%2Fhelp%2Fexample-domains&amp;rut=111" class="result-link">IANA Example Domains</a>
+    </td>
+  </tr>
+  <tr>
+    <td>&nbsp;&nbsp;&nbsp;</td>
+    <td class="result-snippet">As described in RFC 2606 and RFC 6761, a number of domains such as example.com are reserved.</td>
+  </tr>
+  <!-- An ad / non-result anchor that must NOT be parsed as a result (no uddg) -->
+  <tr>
+    <td><a href="https://duckduckgo.com/settings" class="settings-link">Settings</a></td>
+  </tr>
+  <!-- A duplicate of result #1 to exercise per-page dedupe -->
+  <tr>
+    <td valign="top">4.&nbsp;</td>
+    <td>
+      <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.example.com%2Farticle%3Fid%3D42&amp;rut=dup" class="result-link">Example Domain (dup)</a>
+    </td>
+  </tr>
+</table>
+</body>
+</html>
