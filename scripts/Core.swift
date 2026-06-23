@@ -860,6 +860,11 @@ struct ChatMessage: Codable, Equatable {
     var toolCalls: [ChatToolCall]?
     var toolCallId: String?
     var thinking: String?
+    /// Set on a `role:"tool"` message when the tool failed (timeout / throw /
+    /// unknown / invalid args). Carried through so providers that distinguish
+    /// errored tool results (e.g. Anthropic's `is_error`) can flag them, and the
+    /// PR8 chat UI can render error tool cards. nil/false on success.
+    var isError: Bool?
     var createdAt: Double   // epoch seconds
 
     init(
@@ -869,6 +874,7 @@ struct ChatMessage: Codable, Equatable {
         toolCalls: [ChatToolCall]? = nil,
         toolCallId: String? = nil,
         thinking: String? = nil,
+        isError: Bool? = nil,
         createdAt: Double = Date().timeIntervalSince1970
     ) {
         self.id = id
@@ -877,6 +883,7 @@ struct ChatMessage: Codable, Equatable {
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.thinking = thinking
+        self.isError = isError
         self.createdAt = createdAt
     }
 
@@ -888,6 +895,7 @@ struct ChatMessage: Codable, Equatable {
         toolCalls = try c.decodeIfPresent([ChatToolCall].self, forKey: .toolCalls)
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         thinking = try c.decodeIfPresent(String.self, forKey: .thinking)
+        isError = try c.decodeIfPresent(Bool.self, forKey: .isError)
         createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? 0
     }
 }
@@ -1771,11 +1779,11 @@ enum WebToolSchemas {
 /// An immutable, `Sendable` wrapper around a `[String: Any]` JSON object.
 ///
 /// Swift's `[String: Any]` is not `Sendable`, so it can't cross an actor or be
-/// captured in a `@Sendable` closure under `-strict-concurrency=complete` (a hard
-/// error in the Swift 6 language mode the CI compiles with). We only ever pass
-/// JSON we just produced and never mutate after construction, so wrapping it as
-/// an immutable snapshot is sound — hence `@unchecked Sendable`. Callers read the
-/// dictionary back through `.dictionary`.
+/// captured in a `@Sendable` closure under `-strict-concurrency=complete` (where
+/// it surfaces as a warning that the Swift 6 language mode escalates to an
+/// error). We only ever pass JSON we just produced and never mutate after
+/// construction, so wrapping it as an immutable snapshot is sound — hence
+/// `@unchecked Sendable`. Callers read the dictionary back through `.dictionary`.
 struct JSONObject: @unchecked Sendable {
     let dictionary: [String: Any]
     init(_ dictionary: [String: Any]) { self.dictionary = dictionary }
@@ -2269,7 +2277,9 @@ enum JSONSchema {
 ///      run each call (in parallel via `ToolRunner`), append one `role:"tool"`
 ///      message per `tool_call_id`, and loop,
 ///   3. else: append the final assistant message and return.
-/// Bounded by `maxIterations`.
+/// Bounded by `maxIterations` model calls — i.e. at most `maxIterations - 1`
+/// tool-feedback rounds before a forced stop (the last call gets no chance to
+/// act on tool output).
 struct AgentLoop {
     /// The injected model call: (messages, toolsJSON) -> one assistant turn.
     /// `toolsJSON` arrives `Sendable`-boxed; unwrap with `unboxTools(_:)`.
@@ -2327,13 +2337,20 @@ struct AgentLoop {
 
             // Schema-validate each call. Invalid ones get an isError tool message
             // (the model can retry) and are NOT dispatched to the runner.
-            var toRun: [ParsedToolCall] = []
-            var preErrors: [ToolResult] = []
-            for pc in turn.toolCalls {
-                let tool = await registry.tool(named: pc.name)
-                guard let tool = tool else {
+            //
+            // Re-assembly is POSITIONAL (by the index of `turn.toolCalls`), NOT
+            // by tool_call_id: a model can emit duplicate or blank ids for
+            // parallel calls (a known llama.cpp quirk), and keying results by id
+            // would silently lose one result and duplicate another. `results[i]`
+            // always belongs to `turn.toolCalls[i]`. `toRunIndexed` carries each
+            // valid call's original index so the runner's output (which preserves
+            // input order) can be slotted back into the right slot.
+            var results: [ToolResult?] = Array(repeating: nil, count: turn.toolCalls.count)
+            var toRunIndexed: [(index: Int, call: ParsedToolCall)] = []
+            for (i, pc) in turn.toolCalls.enumerated() {
+                guard let tool = await registry.tool(named: pc.name) else {
                     // Unknown tool: let the runner produce the canonical unknown-tool error.
-                    toRun.append(pc)
+                    toRunIndexed.append((i, pc))
                     continue
                 }
                 // Parse + validate arguments here so invalid args short-circuit.
@@ -2341,36 +2358,41 @@ struct AgentLoop {
                 do {
                     parsed = try ToolArgs.parse(pc.rawArguments)
                 } catch {
-                    preErrors.append(ToolResult(
+                    results[i] = ToolResult(
                         toolCallId: pc.id, name: pc.name,
-                        content: "Error parsing arguments: \(error)", isError: true))
+                        content: "Error parsing arguments: \(error)", isError: true)
                     continue
                 }
                 if let err = JSONSchema.validate(parsed, schema: tool.spec.parametersSchema) {
-                    preErrors.append(ToolResult(
+                    results[i] = ToolResult(
                         toolCallId: pc.id, name: pc.name,
-                        content: "Error: invalid arguments — \(err)", isError: true))
+                        content: "Error: invalid arguments — \(err)", isError: true)
                     continue
                 }
-                toRun.append(pc)
+                toRunIndexed.append((i, pc))
             }
 
-            // Run the valid calls in parallel.
-            let ranResults = await runner.run(toRun, registry: registry)
+            // Run the valid calls in parallel. `ToolRunner.run` returns results in
+            // the SAME order as its input, so the k-th output maps to
+            // `toRunIndexed[k]` — slot each back into its ORIGINAL position.
+            let ranResults = await runner.run(toRunIndexed.map { $0.call }, registry: registry)
+            for (k, r) in ranResults.enumerated() where k < toRunIndexed.count {
+                results[toRunIndexed[k].index] = r
+            }
 
-            // Merge pre-errors + ran results back into INPUT order by tool_call_id.
-            var byId: [String: ToolResult] = [:]
-            for r in preErrors { byId[r.toolCallId] = r }
-            for r in ranResults { byId[r.toolCallId] = r }
-
-            for pc in turn.toolCalls {
-                let result = byId[pc.id] ?? ToolResult(
+            // Emit exactly one role:"tool" message per original call, in order.
+            // Normalize a blank id to a positional one so the wire stays
+            // consistent even if the model collided / blanked ids.
+            for (i, pc) in turn.toolCalls.enumerated() {
+                let result = results[i] ?? ToolResult(
                     toolCallId: pc.id, name: pc.name,
                     content: "Error: no result produced", isError: true)
+                let toolCallId = pc.id.isEmpty ? "call_\(i)" : pc.id
                 working.messages.append(ChatMessage(
                     role: "tool",
                     content: result.content,
-                    toolCallId: result.toolCallId))
+                    toolCallId: toolCallId,
+                    isError: result.isError ? true : nil))
             }
 
             // Keep the partial assistant text (if any) as the latest answer.

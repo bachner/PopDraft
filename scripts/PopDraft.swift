@@ -1209,7 +1209,11 @@ class LLMClient {
             for (i, tc) in toolCalls.enumerated() {
                 guard let fn = tc["function"] as? [String: Any],
                       let name = fn["name"] as? String else { continue }
-                let id = (tc["id"] as? String) ?? "call_\(i)"
+                // Normalize a blank id to a positional one: llama.cpp sometimes
+                // emits `"id":""` for parallel tool calls, and an empty id is
+                // worthless (and collides across calls). The `?? "call_\(i)"`
+                // alone only fires when the key is ABSENT, so coalesce "" too.
+                let id = (tc["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "call_\(i)"
                 // `arguments` may be a JSON string OR an object — pass raw; the
                 // loop's ToolArgs.parse tolerates both.
                 let rawArgs = fn["arguments"]
@@ -1267,12 +1271,15 @@ class LLMClient {
                 anthropicMessages.append(["role": "assistant", "content": blocks])
             case "tool":
                 // Anthropic carries tool results as a user message with a
-                // tool_result block keyed to the tool_use id.
-                let block: [String: Any] = [
+                // tool_result block keyed to the tool_use id. Flag failures with
+                // `is_error` so Claude knows the tool errored (OpenAI conveys this
+                // as plain text, so only the Anthropic shape needs the flag).
+                var block: [String: Any] = [
                     "type": "tool_result",
                     "tool_use_id": m.toolCallId ?? "",
                     "content": m.content,
                 ]
+                if m.isError == true { block["is_error"] = true }
                 anthropicMessages.append(["role": "user", "content": [block]])
             default:
                 break

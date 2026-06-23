@@ -145,6 +145,72 @@ func runTests() async {
     }
 
     // ------------------------------------------------------------------------
+    section("parallel calls with BLANK (\"\") ids → neither result lost/duplicated")
+    do {
+        // A known llama.cpp quirk: parallel tool calls all carry id "". If the
+        // loop re-assembled by id, the empty key would collide — one result
+        // lost, the other duplicated. Positional re-assembly must keep both,
+        // in input order, and emit distinct non-empty tool_call_ids.
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 4)
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [
+                ParsedToolCall(id: "", name: "echo", rawArguments: "{\"v\":\"first\"}"),
+                ParsedToolCall(id: "", name: "echo", rawArguments: "{\"v\":\"second\"}"),
+            ]),
+            AssistantTurn(content: "merged"),
+        ])
+        let outcome = try! await loop.run(session: newSession(user: "go"), registry: registry, call: turns.call)
+        let toolMsgs = outcome.session.messages.filter { $0.role == "tool" }
+        check(toolMsgs.count == 2, "both blank-id calls produced a tool message (none lost)")
+        check(toolMsgs[0].content == "ok[echo]:v=first", "first result in slot 0 (not duplicated/overwritten)")
+        check(toolMsgs[1].content == "ok[echo]:v=second", "second result in slot 1 (not lost)")
+        let ids = toolMsgs.map { $0.toolCallId ?? "" }
+        check(ids.allSatisfy { !$0.isEmpty }, "blank ids normalized to non-empty wire ids")
+        check(Set(ids).count == 2, "the two emitted tool_call_ids are distinct")
+        check(outcome.finalText == "merged", "loop continues to a final answer")
+    }
+
+    // ------------------------------------------------------------------------
+    section("parallel calls sharing the SAME non-empty id → neither lost/duplicated")
+    do {
+        // Same collision risk with a duplicated non-empty id.
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 4)
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [
+                ParsedToolCall(id: "dup", name: "echo", rawArguments: "{\"v\":\"alpha\"}"),
+                ParsedToolCall(id: "dup", name: "echo", rawArguments: "{\"v\":\"beta\"}"),
+            ]),
+            AssistantTurn(content: "ok"),
+        ])
+        let outcome = try! await loop.run(session: newSession(user: "go"), registry: registry, call: turns.call)
+        let toolMsgs = outcome.session.messages.filter { $0.role == "tool" }
+        check(toolMsgs.count == 2, "both same-id calls produced a tool message")
+        check(toolMsgs[0].content == "ok[echo]:v=alpha", "first (alpha) preserved in order")
+        check(toolMsgs[1].content == "ok[echo]:v=beta", "second (beta) preserved in order — not duplicated")
+    }
+
+    // ------------------------------------------------------------------------
+    section("errored tool message carries isError = true")
+    do {
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 4)
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [
+                ParsedToolCall(id: "ok1", name: "echo", rawArguments: "{\"v\":\"yes\"}"),
+                ParsedToolCall(id: "bad", name: "missing_tool", rawArguments: "{}"),
+            ]),
+            AssistantTurn(content: "done"),
+        ])
+        let outcome = try! await loop.run(session: newSession(user: "go"), registry: registry, call: turns.call)
+        let toolMsgs = outcome.session.messages.filter { $0.role == "tool" }
+        check(toolMsgs.count == 2, "two tool messages")
+        check(toolMsgs[0].isError != true, "successful tool message is not flagged isError")
+        check(toolMsgs[1].isError == true, "errored (unknown) tool message flagged isError == true")
+    }
+
+    // ------------------------------------------------------------------------
     section("arguments: object form decodes (not just JSON string)")
     do {
         let registry = await makeRegistry([EchoArgsTool(name: "echo")])
