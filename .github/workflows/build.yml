@@ -14,6 +14,8 @@ permissions:
 jobs:
   build:
     runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -105,10 +107,154 @@ jobs:
           name: PopDraft-${{ steps.version.outputs.version }}
           path: build/*.dmg
 
+  e2e-install-test:
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PopDraft-${{ needs.build.outputs.version }}
+
+      - name: Mount DMG and install app
+        run: |
+          DMG_FILE=$(ls *.dmg)
+          echo "Testing DMG: $DMG_FILE"
+
+          # Mount the DMG
+          MOUNT_OUTPUT=$(hdiutil attach "$DMG_FILE")
+          MOUNT_DIR=$(echo "$MOUNT_OUTPUT" | tail -1 | awk -F'\t' '{print $NF}')
+          echo "Mounted at: $MOUNT_DIR"
+
+          # Copy app to /Applications (mimicking what .install.command does)
+          APP_SRC="$MOUNT_DIR/PopDraft.app"
+          APP_DEST="/Applications/PopDraft.app"
+          rm -rf "$APP_DEST"
+          cp -R "$APP_SRC" "$APP_DEST"
+          xattr -cr "$APP_DEST" 2>/dev/null || true
+          echo "[OK] PopDraft.app copied to /Applications"
+
+          # Unmount DMG
+          hdiutil detach "$MOUNT_DIR" || hdiutil detach "$MOUNT_DIR" -force
+
+      - name: Run install.sh (TTS setup)
+        run: |
+          # This is what the DMG .install.command now does after copying
+          INSTALL_SCRIPT="/Applications/PopDraft.app/Contents/Resources/install.sh"
+          test -f "$INSTALL_SCRIPT"
+          echo "[OK] install.sh found in app bundle"
+          bash "$INSTALL_SCRIPT"
+
+      - name: Verify installation
+        run: |
+          # App exists
+          test -d "/Applications/PopDraft.app"
+          echo "[OK] PopDraft.app installed"
+
+          # TTS script exists
+          test -f "$HOME/.popdraft/llm-tts-server.py"
+          echo "[OK] TTS server script present"
+
+          # Venv exists with correct Python (3.10-3.12)
+          VENV_PYTHON="$HOME/.popdraft/tts-venv/bin/python3"
+          test -f "$VENV_PYTHON"
+          PY_VERSION=$("$VENV_PYTHON" --version)
+          echo "[OK] Python venv exists: $PY_VERSION"
+
+          # Verify Python version is in acceptable range
+          PY_MINOR=$("$VENV_PYTHON" -c "import sys; print(sys.version_info.minor)")
+          if [ "$PY_MINOR" -lt 10 ] || [ "$PY_MINOR" -gt 12 ]; then
+            echo "[FAIL] Python version not in 3.10-3.12 range: $PY_VERSION"
+            exit 1
+          fi
+          echo "[OK] Python version in range (3.10-3.12)"
+
+          # kokoro importable
+          "$VENV_PYTHON" -c "import kokoro; print(f'kokoro {kokoro.__version__}')"
+          echo "[OK] kokoro import verified"
+
+          # Config file exists
+          test -f "$HOME/.popdraft/config.json"
+          echo "[OK] Config file present"
+
+      - name: Test TTS server
+        run: |
+          VENV_PYTHON="$HOME/.popdraft/tts-venv/bin/python3"
+
+          # Start TTS server
+          "$VENV_PYTHON" "$HOME/.popdraft/llm-tts-server.py" &
+          TTS_PID=$!
+          echo "TTS server started (PID: $TTS_PID)"
+
+          # Wait for health (model download on first run can be slow)
+          HEALTHY=false
+          for i in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:7865/health > /dev/null 2>&1; then
+              echo "[OK] TTS server healthy after ${i}s"
+              HEALTHY=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+            echo "[FAIL] TTS server did not become healthy in 120s"
+            cat "$HOME/.popdraft/tts-server.log" 2>/dev/null || true
+            kill $TTS_PID 2>/dev/null
+            exit 1
+          fi
+
+          # Test /voices
+          VOICE_COUNT=$(curl -sf http://127.0.0.1:7865/voices | python3 -c "import json,sys; v=json.load(sys.stdin); print(sum(len(l['voices']) for l in v.values()))")
+          echo "[OK] $VOICE_COUNT voices available"
+
+          # Test /speak with play=0 (generate audio file, don't play)
+          AUDIO_PATH=$(curl -sf "http://127.0.0.1:7865/speak?text=hello+world&play=0")
+          test -f "$AUDIO_PATH"
+          FILE_SIZE=$(stat -f%z "$AUDIO_PATH")
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "[FAIL] Audio file too small: $FILE_SIZE bytes"
+            exit 1
+          fi
+          echo "[OK] TTS generated audio: $FILE_SIZE bytes"
+
+          # Test /status
+          STATUS=$(curl -sf http://127.0.0.1:7865/status)
+          echo "[OK] Server status: $STATUS"
+
+          # Cleanup
+          kill $TTS_PID 2>/dev/null || true
+          wait $TTS_PID 2>/dev/null || true
+          echo "[OK] TTS server stopped"
+
+      - name: Test app launch
+        run: |
+          open -a PopDraft
+          sleep 5
+          if pgrep -f "PopDraft.app/Contents/MacOS/PopDraft" > /dev/null; then
+            echo "[OK] PopDraft app is running"
+            pkill -f "PopDraft.app/Contents/MacOS/PopDraft" || true
+          else
+            echo "[FAIL] PopDraft app did not start"
+            exit 1
+          fi
+
+  release:
+    needs: [build, e2e-install-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PopDraft-${{ needs.build.outputs.version }}
+
       - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
-          files: build/*.dmg
+          files: "*.dmg"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

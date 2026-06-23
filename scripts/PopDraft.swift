@@ -4632,6 +4632,8 @@ class TTSServerManager {
         }
     }
 
+    private let logPath = NSString(string: "~/.popdraft/tts-server.log").expandingTildeInPath
+
     private func startServer() {
         let expandedPath = NSString(string: serverScript).expandingTildeInPath
 
@@ -4644,16 +4646,33 @@ class TTSServerManager {
         let venvPython = NSString(string: "~/.popdraft/tts-venv/bin/python3").expandingTildeInPath
         let pythonPath = FileManager.default.fileExists(atPath: venvPython) ? venvPython : "/usr/bin/python3"
 
+        // Log server output to file for debugging instead of discarding
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        let logHandle = FileHandle(forWritingAtPath: logPath)
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: pythonPath)
         process.arguments = [expandedPath]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.standardOutput = logHandle ?? FileHandle.nullDevice
+        process.standardError = logHandle ?? FileHandle.nullDevice
 
         do {
             try process.run()
             serverProcess = process
             print("TTS server started with \(pythonPath) (PID: \(process.processIdentifier))")
+
+            // Verify server health after giving it time to start
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self = self else { return }
+                TTSClient.shared.checkHealth { isHealthy in
+                    if !isHealthy {
+                        print("TTS server failed to become healthy. Check log: \(self.logPath)")
+                        if let proc = self.serverProcess, !proc.isRunning {
+                            print("TTS server process exited with code: \(proc.terminationStatus)")
+                        }
+                    }
+                }
+            }
         } catch {
             print("Failed to start TTS server: \(error)")
         }
