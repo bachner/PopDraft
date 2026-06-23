@@ -3527,7 +3527,7 @@ class PopupWindowController: NSWindowController {
         // A standalone @Sendable text-delta sink that captures `self` weakly
         // ONCE (not via an enclosing Task), so it stays strict-concurrency clean.
         let onDelta: @Sendable (String) -> Void = { [weak self] text in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 self.state = .streaming(text: text, isThinking: false)
                 self.updateView()
