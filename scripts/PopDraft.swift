@@ -2625,6 +2625,17 @@ class PopupWindowController: NSWindowController {
     private var ttsStatusTimer: Timer?
     private var previousApp: NSRunningApplication?
 
+    /// PR5: every invocation that produces a result is recorded into a persisted
+    /// session (the captured selection + the user/assistant exchange). The session
+    /// is built when a result arrives and flushed to disk on copy / meaningful
+    /// dismiss. `nil` between invocations and whenever there's nothing worth saving.
+    private var currentSession: ChatSession?
+    /// Guards against double-saving the same session (copy then dismiss).
+    private var didSaveCurrentSession = false
+    private let sessionStore = SessionStore(
+        dir: NSString(string: "~/.popdraft").expandingTildeInPath
+    )
+
     /// Called right before the popup is shown at the cursor — used to minimize
     /// the corner bubble (PR4). The popup itself stays bubble-agnostic.
     var onWillShow: (() -> Void)?
@@ -2812,6 +2823,10 @@ class PopupWindowController: NSWindowController {
         state = (bubbleEnabled && clipboardText.isEmpty) ? .customPrompt : .actionList
         customPromptText = ""
         resultText = ""
+        // PR5: start a fresh invocation — drop any previously recorded session so a
+        // stale exchange isn't re-saved on this dismiss.
+        currentSession = nil
+        didSaveCurrentSession = false
         updateView()
 
         // Position near mouse
@@ -2874,6 +2889,9 @@ class PopupWindowController: NSWindowController {
         selectedIndex = 0
         customPromptText = ""
         resultText = ""
+        // PR5: start a fresh invocation (see showAtMouseLocation).
+        currentSession = nil
+        didSaveCurrentSession = false
 
         // Position near mouse
         let mouseLocation = NSEvent.mouseLocation
@@ -2916,6 +2934,11 @@ class PopupWindowController: NSWindowController {
     }
 
     func dismiss() {
+        // PR5: persist the session on minimize/dismiss too (idempotent with copy —
+        // a session already flushed by copyResult won't be written twice, and an
+        // empty/aborted session is skipped by hasMeaningfulExchange).
+        flushSessionIfMeaningful()
+
         stopTTSStatusPolling()
         stopKeyboardMonitoring()
         window?.orderOut(nil)
@@ -3130,6 +3153,7 @@ class PopupWindowController: NSWindowController {
                         if process.terminationStatus == 0 {
                             Logger.shared.info("Command completed, output: \(stdout.count) chars")
                             self.resultText = stdout
+                            self.recordExchange(userPrompt: commandTemplate, selectedText: self.clipboardText, assistant: stdout, thinking: nil)
                             self.state = .result(stdout, thinking: nil)
                         } else {
                             let errorMsg = stderr.isEmpty ? "Command exited with code \(process.terminationStatus)" : stderr
@@ -3150,6 +3174,11 @@ class PopupWindowController: NSWindowController {
 
         case .llm:
             let fullPrompt = "\(action.prompt)\n\nText:\n\(clipboardText)"
+            // Capture the exact text/prompt this exchange ran on as immutable
+            // `let`s so the result closure stays Sendable-safe under strict
+            // concurrency (never reach back into mutable `self.*` for these).
+            let actionPrompt = action.prompt
+            let capturedText = clipboardText
             let startTime = Date()
             LLMClient.shared.generate(
                 prompt: fullPrompt,
@@ -3170,6 +3199,7 @@ class PopupWindowController: NSWindowController {
                     case .success(let response):
                         Logger.shared.info("LLM response received (\(elapsed), \(response.text.count) chars)")
                         self?.resultText = response.text
+                        self?.recordExchange(userPrompt: actionPrompt, selectedText: capturedText, assistant: response.text, thinking: response.thinking)
                         self?.state = .result(response.text, thinking: response.thinking)
                     case .failure(let error):
                         Logger.shared.error("LLM failed (\(elapsed)): \(error.localizedDescription)")
@@ -3181,9 +3211,94 @@ class PopupWindowController: NSWindowController {
         }
     }
 
+    // MARK: - Session recording (PR5)
+
+    /// Record one completed exchange into `currentSession`. The single-shot
+    /// generation path is untouched — this just snapshots what happened so it can
+    /// be persisted on copy/minimize and reopened later.
+    ///
+    ///  - `userPrompt`: the action prompt or the custom prompt the user ran.
+    ///  - `selectedText`: the captured text the action ran on (nil for promptless).
+    ///  - `assistant`: the produced result.
+    ///  - `thinking`: optional captured reasoning.
+    private func recordExchange(userPrompt: String, selectedText: String?, assistant: String, thinking: String?) {
+        // A fresh session per invocation (single-shot today; multi-turn arrives
+        // with the chat UI in PR8).
+        let now = Date().timeIntervalSince1970
+        let userMessage = ChatMessage(role: "user", content: userPrompt, createdAt: now)
+        let assistantMessage = ChatMessage(role: "assistant", content: assistant, thinking: thinking, createdAt: now)
+        var session = ChatSession(
+            createdAt: now,
+            updatedAt: now,
+            model: LLMClient.shared.currentModel,
+            selectedText: selectedText,
+            messages: [userMessage, assistantMessage]
+        )
+        session.refreshTitle()
+        currentSession = session
+        didSaveCurrentSession = false
+    }
+
+    /// Persist the current session if it carries a meaningful exchange and hasn't
+    /// already been saved. Safe to call from both copy and dismiss.
+    private func flushSessionIfMeaningful() {
+        guard !didSaveCurrentSession, let session = currentSession, session.hasMeaningfulExchange else { return }
+        if sessionStore.save(session) {
+            didSaveCurrentSession = true
+            Logger.shared.info("Saved session \(session.id) (\"\(session.title)\")")
+        }
+    }
+
+    /// Reopen a previously saved session by id, showing its last assistant message
+    /// in the existing result view (PR5 — no chat UI yet). Crash-safe: a missing
+    /// session is a no-op.
+    func reopenSession(id: String) {
+        guard let session = sessionStore.load(id: id),
+              let lastAssistant = session.messages.last(where: { $0.role == "assistant" }) else {
+            Logger.shared.error("Could not reopen session \(id)")
+            return
+        }
+        // The reopened session is already on disk; don't re-save it on dismiss.
+        currentSession = session
+        didSaveCurrentSession = true
+
+        clipboardText = session.selectedText ?? ""
+        resultText = lastAssistant.content
+        searchText = ""
+        customPromptText = ""
+        selectedIndex = 0
+        state = .result(lastAssistant.content, thinking: lastAssistant.thinking)
+        updateView()
+        positionAtMouseAndShow()
+    }
+
+    /// Shared "place the panel near the cursor and show it" helper (mirrors the
+    /// clamping done by `showAtMouseLocation`), used when reopening a session.
+    private func positionAtMouseAndShow() {
+        let mouseLocation = NSEvent.mouseLocation
+        var frame = window?.frame ?? .zero
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
+        let screenFrame = screen?.visibleFrame ?? .zero
+        frame.origin = NSPoint(x: mouseLocation.x - frame.width / 2, y: mouseLocation.y - frame.height - 10)
+        if frame.minX < screenFrame.minX { frame.origin.x = screenFrame.minX + 10 }
+        if frame.maxX > screenFrame.maxX { frame.origin.x = screenFrame.maxX - frame.width - 10 }
+        if frame.minY < screenFrame.minY {
+            frame.origin.y = mouseLocation.y + 20
+            if frame.maxY > screenFrame.maxY { frame.origin.y = screenFrame.maxY - frame.height - 10 }
+        }
+        onWillShow?()
+        window?.setFrame(frame, display: true)
+        window?.makeKeyAndOrderFront(nil)
+        startKeyboardMonitoring()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     private func copyResult() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(resultText, forType: .string)
+
+        // PR5: persist the session on copy (before dismiss restores focus).
+        flushSessionIfMeaningful()
 
         // Show brief feedback then dismiss
         showNotification(title: "PopDraft", message: "Copied to clipboard")
@@ -6593,7 +6708,7 @@ class HotkeyManager {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem?
     var popupController: PopupWindowController?
     var bubbleController: BubbleWindowController?
@@ -6601,6 +6716,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
     var serverStatusMenuItem: NSMenuItem?
+
+    /// PR5: "Recent" submenu listing recently saved sessions. Rebuilt lazily each
+    /// time the menu is about to open (so newly saved sessions appear).
+    private var recentMenuItem: NSMenuItem?
+    private let sessionStore = SessionStore(
+        dir: NSString(string: "~/.popdraft").expandingTildeInPath
+    )
 
     private var isOnboardingComplete: Bool {
         let path = NSString(string: "~/.popdraft/onboarding_complete").expandingTildeInPath
@@ -6647,7 +6769,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
+        menu.delegate = self  // rebuild the Recent submenu each time the menu opens
         menu.addItem(NSMenuItem(title: "Show Popup", action: #selector(showPopup), keyEquivalent: ""))
+
+        // PR5: Recent sessions submenu. Populated lazily in menuNeedsUpdate(_:).
+        let recentItem = NSMenuItem(title: "Recent", action: nil, keyEquivalent: "")
+        recentItem.submenu = NSMenu(title: "Recent")
+        menu.addItem(recentItem)
+        recentMenuItem = recentItem
+
         menu.addItem(NSMenuItem.separator())
 
         let statusMenuItem = NSMenuItem(title: "llama.cpp: Checking...", action: nil, keyEquivalent: "")
@@ -6824,6 +6954,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showPopup() {
         popupController?.showAtMouseLocation()
+    }
+
+    // MARK: - Recent sessions submenu (PR5)
+
+    /// `NSMenuDelegate` — refresh the Recent submenu whenever the status-bar menu
+    /// is about to open, so newly saved sessions show up.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildRecentMenu()
+    }
+
+    /// Rebuild the "Recent" submenu from the session store. Crash-safe: shows an
+    /// "(No recent sessions)" placeholder when empty.
+    private func rebuildRecentMenu() {
+        guard let submenu = recentMenuItem?.submenu else { return }
+        submenu.removeAllItems()
+
+        let summaries = Array(sessionStore.list().prefix(10))
+        if summaries.isEmpty {
+            let empty = NSMenuItem(title: "No recent sessions", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+            return
+        }
+
+        for summary in summaries {
+            let title = summary.title.isEmpty ? "Untitled" : summary.title
+            let relative = AppDelegate.relativeTime(from: summary.updatedAt)
+            let item = NSMenuItem(
+                title: "\(title)  —  \(relative)",
+                action: #selector(openRecentSession(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = summary.id
+            submenu.addItem(item)
+        }
+    }
+
+    @objc private func openRecentSession(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        popupController?.reopenSession(id: id)
+    }
+
+    /// Compact relative time like "just now", "5m ago", "3h ago", "2d ago".
+    static func relativeTime(from epoch: Double) -> String {
+        let seconds = Date().timeIntervalSince1970 - epoch
+        if seconds < 60 { return "just now" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h ago" }
+        let days = hours / 24
+        if days < 7 { return "\(days)d ago" }
+        let weeks = days / 7
+        if weeks < 5 { return "\(weeks)w ago" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter.string(from: Date(timeIntervalSince1970: epoch))
     }
 
     func triggerAction(actionID: String) {
