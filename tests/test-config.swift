@@ -168,19 +168,53 @@ test("Load rule (a): full v2 config.json is used as-is") {
     assert(c.ttsVoice == "af_nicole", "v2 JSON value used")
 }
 
-test("Load rule (b): defaults <- legacy plaintext <- legacy minimal JSON stub") {
+test("Load rule (b): legacy plaintext WINS over legacy minimal JSON stub") {
     let dir = createTempDir()
     defer { cleanup(dir) }
 
-    // Legacy plaintext sets several fields.
+    // Legacy plaintext sets several fields, including provider.
     write("PROVIDER=ollama\nOLLAMA_MODEL=mistral\nTTS_SPEED=1.5", to: dir, named: "config")
-    // Legacy minimal/partial JSON stub (version < 2) overlays provider only.
+    // Legacy minimal/partial JSON stub (version < 2) disagrees on provider.
     write(#"{"provider":"claude"}"#, to: dir, named: "config.json")
 
     let c = AppConfig.load(dir: dir)
-    assert(c.provider == "claude", "minimal JSON stub overlays plaintext provider, got \(c.provider)")
-    assert(c.ollamaModel == "mistral", "plaintext value retained where stub is silent")
+    // Plaintext is the old binary's real source of truth -> it wins over the stub.
+    assert(c.provider == "ollama", "plaintext provider wins over stub, got \(c.provider)")
+    assert(c.ollamaModel == "mistral", "plaintext value retained")
     assert(c.ttsSpeed == 1.5, "plaintext value retained")
+}
+
+test("Upgrade regression: install.sh stub must NOT reset a real plaintext config") {
+    let dir = createTempDir()
+    defer { cleanup(dir) }
+
+    // Simulate an existing user: old binary's real plaintext config with non-default settings.
+    write("""
+    PROVIDER=openai
+    OPENAI_MODEL=gpt-4o
+    CLAUDE_API_KEY=sk-xxx
+    OLLAMA_MODEL=qwen3.5:7b
+    """, to: dir, named: "config")
+    // install.sh writes this stub before the new binary runs on upgrade.
+    write(#"{"provider":"llamacpp"}"#, to: dir, named: "config.json")
+
+    let c = AppConfig.load(dir: dir)
+    assert(c.provider == "openai", "plaintext provider must survive the install stub, got \(c.provider)")
+    assert(c.openaiModel == "gpt-4o", "openaiModel from plaintext intact")
+    assert(c.claudeAPIKey == "sk-xxx", "claudeAPIKey from plaintext intact")
+    assert(c.ollamaModel == "qwen3.5:7b", "ollamaModel from plaintext intact")
+}
+
+test("Stub-only (no plaintext): provider comes from the JSON stub") {
+    let dir = createTempDir()
+    defer { cleanup(dir) }
+
+    // No plaintext `config` — only the install stub exists.
+    write(#"{"provider":"claude"}"#, to: dir, named: "config.json")
+
+    let c = AppConfig.load(dir: dir)
+    assert(c.provider == "claude", "stub provider used when no plaintext, got \(c.provider)")
+    assert(c.openaiModel == "gpt-4o", "absent keys keep defaults")
 }
 
 test("Load with empty dir returns defaults") {

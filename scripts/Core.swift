@@ -212,16 +212,24 @@ extension AppConfig {
             return decoded
         }
 
-        // (b) Build from defaults + legacy plaintext + legacy minimal JSON stub.
+        // (b) Build from defaults, then overlay sources in PRECEDENCE order
+        //     (lowest first, highest last):
+        //       1. defaults
+        //       2. legacy minimal/partial JSON stub (version < 2 or missing)
+        //       3. legacy plaintext `config`  ← highest, wins over the stub
+        //
+        // The legacy plaintext `config` is the OLD binary's real source of truth.
+        // install.sh writes a `{"provider":"llamacpp"}` stub whenever config.json
+        // is missing, and runs BEFORE the new binary on upgrade — so that stub must
+        // NEVER override a real plaintext setting (e.g. PROVIDER=openai).
         var config = AppConfig()
 
-        if let legacyText = try? String(contentsOfFile: legacyPath, encoding: .utf8) {
-            config = migrateLegacyPlaintext(legacyText)
-        }
-
-        // Overlay a legacy minimal/partial config.json stub (version < 2 or missing).
         if let data = FileManager.default.contents(atPath: jsonPath) {
             config = overlayLegacyJSON(data, onto: config)
+        }
+
+        if let legacyText = try? String(contentsOfFile: legacyPath, encoding: .utf8) {
+            config = overlayLegacyPlaintext(legacyText, onto: config)
         }
 
         return config
@@ -276,11 +284,19 @@ extension AppConfig {
 // MARK: - Legacy plaintext migration
 
 extension AppConfig {
-    /// Parse the OLD `KEY=value` plaintext config format into an `AppConfig`.
+    /// Parse the OLD `KEY=value` plaintext config format into a fresh `AppConfig`
+    /// (defaults for any key not present in the text).
     /// Mirrors the key set in the legacy `LLMConfig.load()`, including the
     /// embedded-JSON `CUSTOM_SHORTCUTS` value.
     static func migrateLegacyPlaintext(_ text: String) -> AppConfig {
-        var config = AppConfig()
+        return overlayLegacyPlaintext(text, onto: AppConfig())
+    }
+
+    /// Overlay the OLD `KEY=value` plaintext format onto a base config.
+    /// Only keys actually present in the text are set; everything else keeps the
+    /// base value. Used so legacy plaintext can take precedence over a JSON stub.
+    static func overlayLegacyPlaintext(_ text: String, onto base: AppConfig) -> AppConfig {
+        var config = base
 
         for line in text.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
