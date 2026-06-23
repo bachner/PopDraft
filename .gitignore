@@ -45,3 +45,6 @@ PopDraft
 
 # Generated image scratch (raw Gemini renders)
 generated_imgs/
+
+# Eval run outputs (the corpus IS committed; runs are not)
+tests/eval/runs/
