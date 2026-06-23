@@ -119,6 +119,7 @@ test("JSON round-trip save -> load is stable") {
     original.providerKeys = ["openai": "k1", "claude": "k2"]
     original.agentSettings = AgentSettings(maxIterations: 9, enableMacControl: true, enableWebSearch: false)
     original.webSearch = WebSearchConfig(provider: "tavily", apiKeys: ["tavily": "tvly-1"])
+    original.bubble = BubbleSettings(enabled: false, corner: "topLeft")
 
     assert(original.save(to: dir), "save should succeed")
     assert(exists(dir, "config.json"), "config.json should be written")
@@ -128,6 +129,8 @@ test("JSON round-trip save -> load is stable") {
     assert(loaded.userModels.first?.quant == "Q4_K_M", "userModels survive round-trip")
     assert(loaded.agentSettings.maxIterations == 9, "agentSettings survive round-trip")
     assert(loaded.webSearch.provider == "tavily", "webSearch survive round-trip")
+    assert(loaded.bubble.enabled == false, "bubble.enabled survives round-trip")
+    assert(loaded.bubble.corner == "topLeft", "bubble.corner survives round-trip")
 }
 
 test("New fields default when absent from JSON") {
@@ -146,6 +149,11 @@ test("New fields default when absent from JSON") {
     assert(c.agentSettings.maxIterations == 6, "agentSettings.maxIterations defaults to 6")
     assert(c.agentSettings.enableMacControl == false, "enableMacControl defaults false")
     assert(c.webSearch.provider == "ddg", "webSearch.provider defaults to ddg")
+    // Bubble settings default when absent (enabled, pinned bottom-right).
+    assert(c.bubble.enabled == true, "bubble.enabled defaults to true when absent")
+    assert(c.bubble.corner == "bottomRight", "bubble.corner defaults to bottomRight when absent")
+    assert(BubbleCorner.parse(c.bubble.corner) == .bottomRight, "BubbleCorner.parse maps default")
+    assert(BubbleCorner.parse("garbage") == .bottomRight, "BubbleCorner.parse falls back for unknown")
     // Absent legacy fields also get defaults.
     assert(c.ttsVoice == "af_heart", "ttsVoice defaults")
     assert(c.popupHotkey == "Space", "popupHotkey defaults")

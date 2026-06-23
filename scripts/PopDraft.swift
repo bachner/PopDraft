@@ -374,6 +374,9 @@ struct LLMConfig {
     var userModels: [ModelRef] = []
     var providerKeys: [String: String] = [:]
 
+    // PR4: persistent corner bubble settings (carried through to AppConfig).
+    var bubble: BubbleSettings = BubbleSettings()
+
     // TTS voice list — all 54 Kokoro v1.0 voices grouped by language
     static let ttsVoiceLanguages: [String] = [
         "American English",
@@ -516,6 +519,7 @@ struct LLMConfig {
         self.customShortcuts = app.customShortcuts
         self.userModels = app.userModels
         self.providerKeys = app.providerKeys
+        self.bubble = app.bubble
     }
 
     /// Map this LLMConfig onto an AppConfig, preserving the AppConfig's
@@ -543,6 +547,7 @@ struct LLMConfig {
         app.customShortcuts = customShortcuts
         app.userModels = userModels
         app.providerKeys = providerKeys
+        app.bubble = bubble
         return app
     }
 
@@ -2317,6 +2322,288 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+// MARK: - Corner Bubble (PR4)
+
+/// The persistent orb that lives in a screen corner. Renders the bundled brand
+/// orb (`AppAssets.bubbleOrb`) when present, otherwise a drawn Liquid-Glass
+/// fallback (radial-gradient sphere + sparkle + soft glow) so it ALWAYS shows,
+/// even for a bare source install with no bundled art.
+///
+/// The hosting panel is non-key (it must never steal focus), so this view cannot
+/// receive SwiftUI key/tap events the usual way — clicks are delivered via a
+/// local mouse-down handler in the controller, which calls `onExpand`.
+struct BubbleView: View {
+    /// Diameter of the orb in points.
+    static let diameter: CGFloat = 64
+
+    /// When true, render the hover (scale + brighter glow) state. The controller
+    /// drives this from `.onHover`; an explicit flag lets us also render the hover
+    /// state deterministically for the offscreen PNG snapshots.
+    var forceHover: Bool = false
+
+    @State private var isHovering = false
+
+    private var hovered: Bool { forceHover || isHovering }
+
+    var body: some View {
+        ZStack {
+            orb
+            // Small "ready" status dot at the lower-right, like an online badge.
+            Circle()
+                .fill(Color.green)
+                .frame(width: 11, height: 11)
+                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1.5))
+                .shadow(color: Color.green.opacity(0.6), radius: 3)
+                .offset(x: Self.diameter * 0.30, y: Self.diameter * 0.30)
+        }
+        // Leave headroom around the orb for the glow + hover scale so nothing clips.
+        .frame(width: Self.diameter + 24, height: Self.diameter + 24)
+        .scaleEffect(hovered ? 1.06 : 1.0)
+        .animation(.spring(response: 0.28, dampingFraction: 0.6), value: hovered)
+        .onHover { hovering in isHovering = hovering }
+        .help("PopDraft — click or press the hotkey to open")
+    }
+
+    @ViewBuilder
+    private var orb: some View {
+        ZStack {
+            // Soft outer glow — brighter on hover.
+            Circle()
+                .fill(Color(red: 0.45, green: 0.5, blue: 0.98))
+                .frame(width: Self.diameter, height: Self.diameter)
+                .blur(radius: hovered ? 18 : 12)
+                .opacity(hovered ? 0.65 : 0.42)
+
+            if let orb = AppAssets.bubbleOrb {
+                // Bundled brand orb (carries its own coloring/glow).
+                Image(nsImage: orb)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: Self.diameter, height: Self.diameter)
+                    .shadow(color: Color.black.opacity(0.25), radius: 6, y: 2)
+            } else {
+                drawnOrb
+            }
+        }
+    }
+
+    /// Drawn Liquid-Glass fallback orb: a radial-gradient sphere with a glossy
+    /// highlight, a thin rim, and a small 4-point sparkle.
+    private var drawnOrb: some View {
+        ZStack {
+            // Sphere body.
+            Circle()
+                .fill(
+                    RadialGradient(
+                        gradient: Gradient(colors: [
+                            Color(red: 0.62, green: 0.68, blue: 1.0),
+                            Color(red: 0.40, green: 0.45, blue: 0.95),
+                            Color(red: 0.26, green: 0.22, blue: 0.78)
+                        ]),
+                        center: UnitPoint(x: 0.35, y: 0.30),
+                        startRadius: 2,
+                        endRadius: Self.diameter * 0.75
+                    )
+                )
+                .frame(width: Self.diameter, height: Self.diameter)
+
+            // Glassy top highlight.
+            Ellipse()
+                .fill(
+                    LinearGradient(
+                        gradient: Gradient(colors: [Color.white.opacity(0.55), Color.white.opacity(0.0)]),
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .frame(width: Self.diameter * 0.62, height: Self.diameter * 0.40)
+                .offset(y: -Self.diameter * 0.20)
+                .blur(radius: 1)
+
+            // Thin rim for the glass edge.
+            Circle()
+                .stroke(Color.white.opacity(0.35), lineWidth: 1)
+                .frame(width: Self.diameter, height: Self.diameter)
+
+            // Sparkle (4-point star) at the upper-right.
+            SparkleShape()
+                .fill(Color.white.opacity(0.95))
+                .frame(width: Self.diameter * 0.30, height: Self.diameter * 0.30)
+                .offset(x: Self.diameter * 0.20, y: -Self.diameter * 0.20)
+                .shadow(color: Color.white.opacity(0.8), radius: 3)
+        }
+        .shadow(color: Color.black.opacity(0.30), radius: 6, y: 2)
+    }
+}
+
+/// A simple 4-point sparkle/star drawn with concave sides.
+struct SparkleShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let c = CGPoint(x: rect.midX, y: rect.midY)
+        let arm = min(rect.width, rect.height) / 2
+        let waist = arm * 0.22
+        var p = Path()
+        p.move(to: CGPoint(x: c.x, y: c.y - arm))               // top tip
+        p.addQuadCurve(to: CGPoint(x: c.x + arm, y: c.y),       // right tip
+                       control: CGPoint(x: c.x + waist, y: c.y - waist))
+        p.addQuadCurve(to: CGPoint(x: c.x, y: c.y + arm),       // bottom tip
+                       control: CGPoint(x: c.x + waist, y: c.y + waist))
+        p.addQuadCurve(to: CGPoint(x: c.x - arm, y: c.y),       // left tip
+                       control: CGPoint(x: c.x - waist, y: c.y + waist))
+        p.addQuadCurve(to: CGPoint(x: c.x, y: c.y - arm),       // back to top
+                       control: CGPoint(x: c.x - waist, y: c.y - waist))
+        p.closeSubpath()
+        return p
+    }
+}
+
+/// A borderless, NON-ACTIVATING panel that hosts the corner orb. Unlike
+/// `KeyPanel`, it must NEVER become key or activate the app — it just floats.
+final class BubblePanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Hosting view for the orb that turns a mouse-down into an expand. Because the
+/// panel is non-key it won't get SwiftUI tap/key events, so we catch the click
+/// here directly (this fires for clicks on a non-activating panel without ever
+/// activating the app).
+final class BubbleClickHostingView: NSHostingView<BubbleView> {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+}
+
+/// Owns the persistent corner orb panel: shows/hides it, pins it to the chosen
+/// corner of the active screen, repositions on screen changes, and forwards a
+/// click to `onExpand` (the controller is non-key, so it watches mouse-down).
+final class BubbleWindowController: NSWindowController {
+    /// Called when the orb is clicked — wired to the same expand path as the hotkey.
+    var onExpand: (() -> Void)?
+
+    private var hostingView: BubbleClickHostingView?
+    private var isShown = false
+
+    init() {
+        let size = NSSize(width: BubbleView.diameter + 24, height: BubbleView.diameter + 24)
+        let panel = BubblePanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .statusBar
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false  // the orb art carries its own glow
+        panel.ignoresMouseEvents = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        super.init(window: panel)
+
+        let host = BubbleClickHostingView(rootView: BubbleView())
+        host.frame = NSRect(origin: .zero, size: size)
+        host.onClick = { [weak self] in self?.onExpand?() }
+        panel.contentView = host
+        hostingView = host
+
+        // Reposition when displays/arrangement change.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: Corner geometry
+
+    /// Compute the orb's origin for a given corner of a screen's visible frame,
+    /// inset by `margin`. Pure geometry so it stays easy to reason about.
+    static func origin(for corner: BubbleCorner, in visibleFrame: NSRect, size: NSSize, margin: CGFloat) -> NSPoint {
+        switch corner {
+        case .topLeft:
+            return NSPoint(x: visibleFrame.minX + margin,
+                           y: visibleFrame.maxY - size.height - margin)
+        case .topRight:
+            return NSPoint(x: visibleFrame.maxX - size.width - margin,
+                           y: visibleFrame.maxY - size.height - margin)
+        case .bottomLeft:
+            return NSPoint(x: visibleFrame.minX + margin,
+                           y: visibleFrame.minY + margin)
+        case .bottomRight:
+            return NSPoint(x: visibleFrame.maxX - size.width - margin,
+                           y: visibleFrame.minY + margin)
+        }
+    }
+
+    private func pinToCorner(animated: Bool) {
+        guard let window = window else { return }
+        let corner = BubbleCorner.parse(LLMConfig.load().bubble.corner)
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let origin = BubbleWindowController.origin(
+            for: corner, in: visible, size: window.frame.size, margin: 16
+        )
+        window.setFrameOrigin(origin)
+    }
+
+    @objc private func screenParametersChanged() {
+        if isShown { pinToCorner(animated: false) }
+    }
+
+    // MARK: Show / hide
+
+    /// Show the orb in its corner, fading in. Does NOT activate the app.
+    func show(animated: Bool = true) {
+        guard let window = window else { return }
+        pinToCorner(animated: false)
+        isShown = true
+        if animated {
+            window.alphaValue = 0
+            window.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.22
+                window.animator().alphaValue = 1
+            }
+        } else {
+            window.alphaValue = 1
+            window.orderFrontRegardless()
+        }
+    }
+
+    /// Hide the orb, fading out, then ordering it out.
+    func hide(animated: Bool = true) {
+        guard let window = window, isShown else { return }
+        isShown = false
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.16
+                window.animator().alphaValue = 0
+            }, completionHandler: { [weak window] in
+                window?.orderOut(nil)
+            })
+        } else {
+            window.orderOut(nil)
+        }
+    }
+
+    var isVisible: Bool { isShown }
+}
+
 // MARK: - Key Panel (allows text input)
 
 class KeyPanel: NSPanel {
@@ -2337,6 +2624,13 @@ class PopupWindowController: NSWindowController {
     private var localMonitor: Any?
     private var ttsStatusTimer: Timer?
     private var previousApp: NSRunningApplication?
+
+    /// Called right before the popup is shown at the cursor — used to minimize
+    /// the corner bubble (PR4). The popup itself stays bubble-agnostic.
+    var onWillShow: (() -> Void)?
+    /// Called when the popup is dismissed (copy / Esc / lost focus / TTS done) —
+    /// used to bring the corner bubble back (PR4).
+    var onDidDismiss: (() -> Void)?
 
     init() {
         let window = KeyPanel(
@@ -2501,13 +2795,21 @@ class PopupWindowController: NSWindowController {
     }
 
     func showAtMouseLocation() {
+        // Minimize the corner bubble (if enabled) as we transition to the panel.
+        onWillShow?()
+
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
 
-        // Reset state
+        // Reset state. When the bubble is enabled and no text is selected, drop
+        // straight into the custom-prompt entry state (a sensible default until
+        // the agent-chat routing lands in a later PR). With the bubble DISABLED,
+        // keep today's exact behavior (always the action list). With text
+        // selected, it's always the action list.
         searchText = ""
         selectedIndex = 0
-        state = .actionList
+        let bubbleEnabled = LLMConfig.load().bubble.enabled
+        state = (bubbleEnabled && clipboardText.isEmpty) ? .customPrompt : .actionList
         customPromptText = ""
         resultText = ""
         updateView()
@@ -2555,6 +2857,9 @@ class PopupWindowController: NSWindowController {
     }
 
     func showWithAction(actionID: String) {
+        // Minimize the corner bubble (if enabled) as we transition to the panel.
+        onWillShow?()
+
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
 
@@ -2620,6 +2925,10 @@ class PopupWindowController: NSWindowController {
             app.activate(options: [])
         }
         previousApp = nil
+
+        // Bring the corner bubble back (when enabled). With the bubble disabled
+        // this is a no-op, so behavior matches today exactly.
+        onDidDismiss?()
     }
 
     private func goBack() {
@@ -3013,6 +3322,9 @@ struct SettingsView: View {
     @State private var customPromptShortcut: String? = "P"
     @State private var popupHotkey: String = "Space"
     @State private var editingPopupHotkey: Bool = false
+    // PR4: corner bubble settings.
+    @State private var bubbleEnabled: Bool = true
+    @State private var bubbleCorner: BubbleCorner = .bottomRight
     @State private var selectedLlamaModel: String = "qwen3.5-2b"
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
@@ -3261,6 +3573,40 @@ struct SettingsView: View {
                     Spacer()
                 }
             }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+
+            // PR4: Corner bubble
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: $bubbleEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Show corner bubble")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Keep a small orb pinned to a screen corner instead of vanishing")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                HStack {
+                    Text("Corner")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Picker("", selection: $bubbleCorner) {
+                        ForEach(BubbleCorner.allCases, id: \.self) { corner in
+                            Text(corner.displayName).tag(corner)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                    .disabled(!bubbleEnabled)
+                    Spacer()
+                }
+                .opacity(bubbleEnabled ? 1.0 : 0.5)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
             .background(Color(NSColor.controlBackgroundColor))
             .cornerRadius(8)
@@ -4480,6 +4826,8 @@ struct SettingsView: View {
         ttsVoice = config.ttsVoice
         ttsSpeed = config.ttsSpeed
         popupHotkey = config.popupHotkey
+        bubbleEnabled = config.bubble.enabled
+        bubbleCorner = BubbleCorner.parse(config.bubble.corner)
         settingsActions = ActionManager.shared.actions
         customPromptShortcut = ActionManager.shared.customPromptShortcut
         customPromptEnabled = ActionManager.shared.customPromptEnabled
@@ -4539,6 +4887,8 @@ struct SettingsView: View {
         // PR3: persist user-managed models + provider keys.
         config.userModels = userModels
         config.providerKeys = providerKeys
+        // PR4: persist corner-bubble settings.
+        config.bubble = BubbleSettings(enabled: bubbleEnabled, corner: bubbleCorner.rawValue)
         onSave(config)
     }
 }
@@ -4862,6 +5212,9 @@ class SettingsWindowController: NSWindowController {
 
         // Reload hotkeys to apply any shortcut changes
         HotkeyManager.shared.reloadHotkeys()
+
+        // PR4: re-apply corner-bubble settings (enabled + chosen corner).
+        (NSApp.delegate as? AppDelegate)?.refreshBubble()
 
         // Show notification
         let script = """
@@ -6243,6 +6596,7 @@ class HotkeyManager {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popupController: PopupWindowController?
+    var bubbleController: BubbleWindowController?
     var settingsController: SettingsWindowController?
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
@@ -6314,6 +6668,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create controllers
         popupController = PopupWindowController()
         settingsController = SettingsWindowController()
+
+        // PR4: persistent corner bubble. Clicking it expands into the panel at
+        // the cursor (same path as the hotkey). The popup minimizes the bubble
+        // while it's open and restores it on dismiss/copy — but ONLY when the
+        // bubble is enabled, so the disabled case is byte-for-byte today's flow.
+        bubbleController = BubbleWindowController()
+        bubbleController?.onExpand = { [weak self] in
+            self?.popupController?.showAtMouseLocation()
+        }
+        popupController?.onWillShow = { [weak self] in
+            // Hide the orb while the expanded panel is open.
+            if self?.isBubbleEnabled == true { self?.bubbleController?.hide() }
+        }
+        popupController?.onDidDismiss = { [weak self] in
+            // Restore the orb to its corner once the panel closes.
+            if self?.isBubbleEnabled == true { self?.bubbleController?.show() }
+        }
+        if isBubbleEnabled {
+            bubbleController?.show()
+        }
 
         // Start TTS server if needed
         TTSServerManager.shared.ensureRunning()
@@ -6428,6 +6802,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         HotkeyManager.shared.unregisterAll()
         TTSServerManager.shared.stopServer()
+    }
+
+    /// Whether the persistent corner bubble is enabled in config (PR4).
+    private var isBubbleEnabled: Bool {
+        LLMConfig.load().bubble.enabled
+    }
+
+    /// Re-apply bubble settings after the user changes them in Settings: show or
+    /// hide the orb and re-pin it to the (possibly new) corner.
+    func refreshBubble() {
+        guard let bubble = bubbleController else { return }
+        if isBubbleEnabled {
+            // show() re-pins to the configured corner; if already visible it just
+            // re-positions (and fades in if it was hidden).
+            bubble.show(animated: !bubble.isVisible)
+        } else {
+            bubble.hide()
+        }
     }
 
     @objc func showPopup() {

@@ -52,6 +52,49 @@ struct AgentSettings: Codable, Equatable {
     }
 }
 
+/// Settings for the persistent corner bubble (PR4).
+///
+/// `corner` is one of "topLeft" / "topRight" / "bottomLeft" / "bottomRight".
+/// Unknown values fall back to the default ("bottomRight") via `BubbleCorner`.
+struct BubbleSettings: Codable, Equatable {
+    var enabled: Bool
+    var corner: String
+
+    init(enabled: Bool = true, corner: String = "bottomRight") {
+        self.enabled = enabled
+        self.corner = corner
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        corner = try c.decodeIfPresent(String.self, forKey: .corner) ?? "bottomRight"
+    }
+}
+
+/// The four screen corners the bubble can be pinned to. Pure (no AppKit) so it
+/// can live in Core.swift and be unit-tested; the AppKit side maps it to points.
+enum BubbleCorner: String, CaseIterable, Equatable {
+    case topLeft
+    case topRight
+    case bottomLeft
+    case bottomRight
+
+    /// Parse a stored string, defaulting to `.bottomRight` for unknown values.
+    static func parse(_ raw: String) -> BubbleCorner {
+        return BubbleCorner(rawValue: raw) ?? .bottomRight
+    }
+
+    var displayName: String {
+        switch self {
+        case .topLeft: return "Top Left"
+        case .topRight: return "Top Right"
+        case .bottomLeft: return "Bottom Left"
+        case .bottomRight: return "Bottom Right"
+        }
+    }
+}
+
 /// Web-search provider configuration.
 struct WebSearchConfig: Codable, Equatable {
     var provider: String              // "ddg" (default, no key), "tavily", "brave", "exa"
@@ -103,6 +146,7 @@ struct AppConfig: Codable, Equatable {
     var providerKeys: [String: String]
     var agentSettings: AgentSettings
     var webSearch: WebSearchConfig
+    var bubble: BubbleSettings
 
     // MARK: Defaults
 
@@ -129,7 +173,8 @@ struct AppConfig: Codable, Equatable {
         userModels: [ModelRef] = [],
         providerKeys: [String: String] = [:],
         agentSettings: AgentSettings = AgentSettings(),
-        webSearch: WebSearchConfig = WebSearchConfig()
+        webSearch: WebSearchConfig = WebSearchConfig(),
+        bubble: BubbleSettings = BubbleSettings()
     ) {
         self.version = version
         self.provider = provider
@@ -154,6 +199,7 @@ struct AppConfig: Codable, Equatable {
         self.providerKeys = providerKeys
         self.agentSettings = agentSettings
         self.webSearch = webSearch
+        self.bubble = bubble
     }
 
     // MARK: Backward-compatible decoding
@@ -185,6 +231,7 @@ struct AppConfig: Codable, Equatable {
         providerKeys = try c.decodeIfPresent([String: String].self, forKey: .providerKeys) ?? d.providerKeys
         agentSettings = try c.decodeIfPresent(AgentSettings.self, forKey: .agentSettings) ?? d.agentSettings
         webSearch = try c.decodeIfPresent(WebSearchConfig.self, forKey: .webSearch) ?? d.webSearch
+        bubble = try c.decodeIfPresent(BubbleSettings.self, forKey: .bubble) ?? d.bubble
     }
 }
 
