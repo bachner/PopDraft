@@ -36,7 +36,7 @@ else
     echo ""
     echo "Compiling PopDraft..."
 
-    if swiftc -O -o "$CONFIG_DIR/PopDraft" "$SCRIPT_DIR/scripts/PopDraft.swift" -framework Cocoa -framework Carbon 2>/dev/null; then
+    if swiftc -O -o "$CONFIG_DIR/PopDraft" "$SCRIPT_DIR/scripts/PopDraft.swift" "$SCRIPT_DIR/scripts/Core.swift" -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation 2>/dev/null; then
         echo "  [OK] PopDraft compiled"
     else
         echo "  [ERROR] Failed to compile PopDraft"

@@ -1,6 +1,9 @@
-#!/usr/bin/env swift
 // PopDraft - Popup Menu App
 // A menu bar app that shows a floating action popup for text processing
+//
+// Built by co-compiling with scripts/Core.swift:
+//   swiftc -O scripts/PopDraft.swift scripts/Core.swift \
+//       -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation
 
 import Cocoa
 import SwiftUI
@@ -382,81 +385,87 @@ struct LLMConfig {
         "Custom..."
     ]
 
+    /// Directory holding all PopDraft on-disk state (`~/.popdraft`).
+    static var configDir: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".popdraft").path
+    }
+
+    /// Default-initialized config (all stored properties keep their defaults).
+    init() {}
+
+    /// Build an LLMConfig from the corresponding AppConfig fields.
+    init(from app: AppConfig) {
+        self.provider = Provider(rawValue: app.provider) ?? .llamacpp
+        self.llamaModel = app.llamaModel
+        self.llamacppURL = app.llamacppURL
+        self.ollamaURL = app.ollamaURL
+        self.ollamaModel = app.ollamaModel
+        self.openaiAPIKey = app.openaiAPIKey
+        self.openaiModel = app.openaiModel
+        self.claudeAPIKey = app.claudeAPIKey
+        self.claudeModel = app.claudeModel
+        self.claudeExtendedThinking = app.claudeExtendedThinking
+        self.claudeThinkingBudget = app.claudeThinkingBudget
+        self.ollamaEnableThinking = app.ollamaEnableThinking
+        self.llamacppEnableThinking = app.llamacppEnableThinking
+        self.ttsVoice = app.ttsVoice
+        self.ttsSpeed = app.ttsSpeed
+        self.popupHotkey = app.popupHotkey
+        self.disabledBuiltInActions = app.disabledBuiltInActions
+        self.customShortcuts = app.customShortcuts
+    }
+
+    /// Map this LLMConfig onto an AppConfig, preserving the AppConfig's
+    /// forward-looking fields (userModels, providerKeys, agentSettings, webSearch).
+    func toAppConfig(base: AppConfig) -> AppConfig {
+        var app = base
+        app.version = 2
+        app.provider = provider.rawValue
+        app.llamaModel = llamaModel
+        app.llamacppURL = llamacppURL
+        app.ollamaURL = ollamaURL
+        app.ollamaModel = ollamaModel
+        app.openaiAPIKey = openaiAPIKey
+        app.openaiModel = openaiModel
+        app.claudeAPIKey = claudeAPIKey
+        app.claudeModel = claudeModel
+        app.claudeExtendedThinking = claudeExtendedThinking
+        app.claudeThinkingBudget = claudeThinkingBudget
+        app.ollamaEnableThinking = ollamaEnableThinking
+        app.llamacppEnableThinking = llamacppEnableThinking
+        app.ttsVoice = ttsVoice
+        app.ttsSpeed = ttsSpeed
+        app.popupHotkey = popupHotkey
+        app.disabledBuiltInActions = disabledBuiltInActions
+        app.customShortcuts = customShortcuts
+        return app
+    }
+
     static func load() -> LLMConfig {
-        var config = LLMConfig()
-        let configPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".popdraft/config")
-
-        guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else {
-            return config
-        }
-
-        for line in contents.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
-
-            let parts = trimmed.components(separatedBy: "=")
-            guard parts.count == 2 else { continue }
-
-            let key = parts[0].trimmingCharacters(in: .whitespaces)
-            let value = parts[1].trimmingCharacters(in: .whitespaces)
-
-            switch key {
-            case "PROVIDER":
-                config.provider = Provider(rawValue: value) ?? .llamacpp
-            case "LLAMACPP_URL":
-                config.llamacppURL = value
-            case "LLAMA_MODEL":
-                config.llamaModel = value
-            case "OLLAMA_URL":
-                config.ollamaURL = value
-            case "OLLAMA_MODEL":
-                config.ollamaModel = value
-            case "OPENAI_API_KEY":
-                config.openaiAPIKey = value
-            case "OPENAI_MODEL":
-                config.openaiModel = value
-            case "CLAUDE_API_KEY":
-                config.claudeAPIKey = value
-            case "CLAUDE_MODEL":
-                config.claudeModel = value
-            case "CLAUDE_EXTENDED_THINKING":
-                config.claudeExtendedThinking = (value == "true")
-            case "CLAUDE_THINKING_BUDGET":
-                config.claudeThinkingBudget = Int(value) ?? 10000
-            case "OLLAMA_ENABLE_THINKING":
-                config.ollamaEnableThinking = (value == "true")
-            case "LLAMACPP_ENABLE_THINKING":
-                config.llamacppEnableThinking = (value == "true")
-            case "TTS_VOICE":
-                config.ttsVoice = value
-            case "TTS_SPEED":
-                config.ttsSpeed = Double(value) ?? 1.0
-            case "DISABLED_ACTIONS":
-                config.disabledBuiltInActions = value.components(separatedBy: ",").filter { !$0.isEmpty }
-            case "CUSTOM_SHORTCUTS":
-                if let data = value.data(using: .utf8),
-                   let dict = try? JSONDecoder().decode([String: String].self, from: data) {
-                    config.customShortcuts = dict
-                }
-            case "POPUP_HOTKEY":
-                config.popupHotkey = value
-            default:
-                break
-            }
-        }
-
-        return config
+        // Delegate persistence to the pure Core.swift AppConfig store.
+        // This reads config.json (v2), migrating legacy plaintext `config`
+        // automatically on first run.
+        let app = AppConfig.load(dir: configDir)
+        return LLMConfig(from: app)
     }
 
     func save() {
-        let configDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".popdraft")
-        let configPath = configDir.appendingPathComponent("config")
+        let dir = LLMConfig.configDir
 
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        // Preserve any forward-looking fields already on disk.
+        let base = AppConfig.load(dir: dir)
+        let app = toAppConfig(base: base)
+        app.save(to: dir)
 
+        // Dual-write the legacy plaintext `~/.popdraft/config` for ONE release
+        // (best-effort) so rolling back to an older binary still works.
+        writeLegacyPlaintext(to: dir)
+    }
+
+    /// Best-effort write of the old KEY=value plaintext format (for rollback safety).
+    private func writeLegacyPlaintext(to dir: String) {
+        let configPath = (dir as NSString).appendingPathComponent("config")
         var lines: [String] = []
         lines.append("PROVIDER=\(provider.rawValue)")
         lines.append("LLAMACPP_URL=\(llamacppURL)")
@@ -476,7 +485,7 @@ struct LLMConfig {
         lines.append("POPUP_HOTKEY=\(popupHotkey)")
 
         let content = lines.joined(separator: "\n")
-        try? content.write(to: configPath, atomically: true, encoding: .utf8)
+        try? content.write(toFile: configPath, atomically: true, encoding: .utf8)
     }
 
 }
@@ -5875,8 +5884,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Main
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+@main
+struct PopDraftMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}

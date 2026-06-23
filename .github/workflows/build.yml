@@ -25,7 +25,7 @@ jobs:
         timeout-minutes: 5
         run: |
           swiftc --version
-          swiftc -O -o PopDraft scripts/PopDraft.swift -framework Cocoa -framework Carbon
+          swiftc -O -o PopDraft scripts/PopDraft.swift scripts/Core.swift -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation
           ls -la PopDraft
           echo "Binary built successfully"
 
@@ -106,6 +106,19 @@ jobs:
         with:
           name: PopDraft-${{ steps.version.outputs.version }}
           path: build/*.dmg
+
+  unit-tests:
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: |
+          swiftc --version
+          bash tests/run-tests.sh
 
   e2e-install-test:
     needs: build
