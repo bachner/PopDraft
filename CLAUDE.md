@@ -100,6 +100,26 @@ Selected Text -> Ctrl+Option+Shortcut -> Direct Action -> LLM API -> Result Prev
 
 **TTS server:** `http://127.0.0.1:7865`
 
+**Agent / Mac-control / MCP config (PR9):** under `agentSettings` and `mcpServers`
+in `config.json`:
+```json
+{
+  "agentSettings": {
+    "enableMacControl": false,        // master switch for run_shell / run_applescript (default OFF)
+    "autoApproveSafeReadOnly": false, // skip confirm for ls/cat/pwd/echo/date/whoami (default OFF)
+    "macControlDryRun": false,        // headless/eval: never execute, record "would execute" (default OFF)
+    "enableWebSearch": true,
+    "maxIterations": 6
+  },
+  "mcpServers": []                    // [{name, command, args, enabled}] — stdio JSON-RPC servers
+}
+```
+Mac-control tools are confirm-gated: the agent PROPOSES; nothing runs without an
+explicit user Approve/Edit (or the opt-in auto-approve-safe-read-only path). A
+hard denylist (sudo, `rm -rf /`, `curl|sh`, fork bomb, `dd if=`, `> /dev/…`,
+shutdown/reboot) is enforced even on Approve. MacControlGuard / MacControlPolicy
+live in `scripts/Core.swift` (pure, unit-tested by `tests/test-maccontrol.swift`).
+
 ## Installation Targets
 
 - App: `/Applications/PopDraft.app`

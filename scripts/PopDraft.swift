@@ -381,6 +381,10 @@ struct LLMConfig {
     // PR4: persistent corner bubble settings (carried through to AppConfig).
     var bubble: BubbleSettings = BubbleSettings()
 
+    // PR9: agent + Mac-control + MCP settings (carried through to AppConfig).
+    var agentSettings: AgentSettings = AgentSettings()
+    var mcpServers: [MCPServerConfig] = []
+
     // TTS voice list — all 54 Kokoro v1.0 voices grouped by language
     static let ttsVoiceLanguages: [String] = [
         "American English",
@@ -524,6 +528,8 @@ struct LLMConfig {
         self.userModels = app.userModels
         self.providerKeys = app.providerKeys
         self.bubble = app.bubble
+        self.agentSettings = app.agentSettings
+        self.mcpServers = app.mcpServers
     }
 
     /// Map this LLMConfig onto an AppConfig, preserving the AppConfig's
@@ -552,6 +558,8 @@ struct LLMConfig {
         app.userModels = userModels
         app.providerKeys = providerKeys
         app.bubble = bubble
+        app.agentSettings = agentSettings
+        app.mcpServers = mcpServers
         return app
     }
 
@@ -2695,7 +2703,7 @@ enum ToolResultPreview: Equatable {
 /// the injected `ToolProgressHook`. `@MainActor` so all `@Published` mutations
 /// are main-thread safe; the agent runs in a detached `Task`.
 @MainActor
-final class AgentChatViewModel: ObservableObject {
+final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// The persisted conversation (system/user/assistant/tool turns).
     @Published private(set) var session: ChatSession
     /// Display-only messages (user + assistant), in order. Tool/system turns are
@@ -2717,6 +2725,13 @@ final class AgentChatViewModel: ObservableObject {
     /// Tool cards keyed by the assistant message id they belong to (so a finished
     /// turn keeps its cards rendered above its answer).
     @Published private(set) var cardsByMessage: [String: [ToolCallState]] = [:]
+    /// PR9: Mac-control confirmations awaiting the user's Approve/Edit/Deny. The
+    /// chat renders a confirm card per entry; resolving one resumes the paused
+    /// tool. Usually 0 or 1.
+    @Published private(set) var pendingConfirmations: [ConfirmationRequest] = []
+
+    /// PR9: the broker the Mac-control tools `await`. This view-model is its sink.
+    let confirmBroker = MacControlBroker()
 
     private let store: SessionStore
     private var runTask: Task<Void, Never>?
@@ -2733,6 +2748,8 @@ final class AgentChatViewModel: ObservableObject {
         self.webEnabled = cfg.agentSettings.enableWebSearch
         self.modelLabel = AgentChatViewModel.makeModelLabel()
         rebuildVisible()
+        // PR9: receive Mac-control confirmation requests as our sink.
+        confirmBroker.sink = self
     }
 
     /// A compact "Model · provider" label for the header.
@@ -2873,6 +2890,7 @@ final class AgentChatViewModel: ObservableObject {
             do {
                 let outcome = try await PopDraftAgent.run(
                     session: snapshot, config: appConfig,
+                    confirmer: self.confirmBroker,
                     onTextDelta: onDelta, onProgress: onProgress)
                 guard self.generation == gen else { return }  // superseded → drop
                 var saved = outcome.session
@@ -2899,6 +2917,7 @@ final class AgentChatViewModel: ObservableObject {
     private func finishGenerating() {
         streamingText = ""
         liveToolCards = []
+        pendingConfirmations = []
         isGenerating = false
         rebuildVisible()
     }
@@ -2935,11 +2954,36 @@ final class AgentChatViewModel: ObservableObject {
     /// transient generating state.
     func cancel() {
         generation += 1
+        // PR9: deny any pending Mac-control confirmations so their paused tools
+        // resume (as denied) rather than leaking a suspended continuation.
+        confirmBroker.denyAll()
         runTask?.cancel()
         runTask = nil
         isGenerating = false
         streamingText = ""
         liveToolCards = []
+        pendingConfirmations = []
+    }
+
+    // MARK: - PR9: Mac-control confirmation (MacControlBroker.Sink)
+
+    /// Show a confirm card for `request`. The card's buttons call `resolveConfirmation`.
+    func present(_ request: ConfirmationRequest) {
+        if !pendingConfirmations.contains(where: { $0.id == request.id }) {
+            pendingConfirmations.append(request)
+        }
+    }
+
+    /// Remove a confirm card (the broker resolved/withdrew it).
+    func withdraw(id: String) {
+        pendingConfirmations.removeAll { $0.id == id }
+    }
+
+    /// Called by the confirm card's Approve / Edit / Deny buttons. Forwards the
+    /// decision to the broker, which resumes the paused tool. The card is removed
+    /// by the broker's `withdraw` callback.
+    func resolveConfirmation(id: String, decision: ConfirmationDecision) {
+        confirmBroker.resolve(id: id, decision: decision)
     }
 
     /// The latest assistant answer text (for whole-answer copy).
@@ -3434,6 +3478,158 @@ struct ToolCallCard: View {
     }
 }
 
+// MARK: - Chat UI: Mac-control confirm card (PR9)
+
+/// The confirm-before-execute card for a `run_shell` / `run_applescript` proposal.
+/// Shows the EXACT command/script verbatim plus a warning, and Approve / Edit /
+/// Deny buttons. The tool is paused until the user decides — the agent loop
+/// CANNOT run a Mac-control command without a tap here. Liquid-Glass styling
+/// mirrors `ToolCallCard`.
+struct ConfirmCardView: View {
+    let request: ConfirmationRequest
+    /// (decision) -> void: Approve / Edit(command) / Deny.
+    let onDecide: (ConfirmationDecision) -> Void
+
+    @State private var editing = false
+    @State private var editedCommand: String = ""
+
+    private var kindIcon: String {
+        switch request.kind {
+        case .shell: return "terminal"
+        case .applescript: return "applescript"
+        }
+    }
+    private var kindLabel: String {
+        switch request.kind {
+        case .shell: return "run_shell"
+        case .applescript: return "run_applescript"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header: warning glyph + tool name + "needs approval".
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.orange)
+                Image(systemName: kindIcon)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(ChatPalette.ink2)
+                Text(kindLabel)
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .foregroundColor(ChatPalette.ink)
+                Spacer(minLength: 6)
+                Text("NEEDS APPROVAL")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+            .padding(.horizontal, 11)
+            .padding(.top, 9)
+            .padding(.bottom, 7)
+
+            if !request.explanation.isEmpty {
+                Text(request.explanation)
+                    .font(.system(size: 11))
+                    .foregroundColor(ChatPalette.ink2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 11)
+                    .padding(.bottom, 7)
+            }
+
+            Divider().opacity(0.35)
+
+            // The EXACT command/script, monospaced. Editable when "Edit" is tapped.
+            Group {
+                if editing {
+                    TextEditor(text: $editedCommand)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .frame(minHeight: 54, maxHeight: 140)
+                        .scrollContentBackground(.hidden)
+                } else {
+                    ScrollView {
+                        Text(request.command)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .foregroundColor(ChatPalette.ink)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 140)
+                }
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.05))
+
+            Divider().opacity(0.35)
+
+            // Approve / Edit / Deny.
+            HStack(spacing: 8) {
+                if editing {
+                    Button { onDecide(.edit(editedCommand)) } label: {
+                        Label("Run edited", systemImage: "play.fill")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(ConfirmButtonStyle(tint: ChatPalette.blue, filled: true))
+                    Button { editing = false } label: {
+                        Text("Cancel edit").font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(ConfirmButtonStyle(tint: ChatPalette.ink2, filled: false))
+                    Spacer(minLength: 0)
+                } else {
+                    Button { onDecide(.approve) } label: {
+                        Label("Approve", systemImage: "checkmark")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(ConfirmButtonStyle(tint: ChatPalette.green, filled: true))
+
+                    Button {
+                        editedCommand = request.command
+                        editing = true
+                    } label: {
+                        Label("Edit", systemImage: "pencil")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(ConfirmButtonStyle(tint: ChatPalette.blue, filled: false))
+
+                    Button { onDecide(.deny) } label: {
+                        Label("Deny", systemImage: "xmark")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(ConfirmButtonStyle(tint: .red, filled: false))
+
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+        }
+        .background(ChatPalette.cardFill)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.5), lineWidth: 1))
+    }
+}
+
+/// Small pill button style for the confirm card (filled = primary action).
+struct ConfirmButtonStyle: ButtonStyle {
+    let tint: Color
+    let filled: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(filled ? .white : tint)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(filled ? tint.opacity(configuration.isPressed ? 0.8 : 1.0)
+                              : tint.opacity(configuration.isPressed ? 0.22 : 0.12))
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(tint.opacity(filled ? 0 : 0.4), lineWidth: 0.5))
+    }
+}
+
 // MARK: - Chat UI: message bubble (PR8)
 
 /// One conversation turn. User turns get a blue-tinted right-aligned bubble;
@@ -3699,6 +3895,7 @@ struct ChatView: View {
             .onChange(of: viewModel.visibleMessages.count) { _, _ in scrollToBottom(proxy) }
             .onChange(of: viewModel.streamingText) { _, _ in scrollToBottom(proxy) }
             .onChange(of: viewModel.liveToolCards.count) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: viewModel.pendingConfirmations.count) { _, _ in scrollToBottom(proxy) }
         }
     }
 
@@ -3718,7 +3915,17 @@ struct ChatView: View {
                 ForEach(viewModel.liveToolCards) { card in
                     ToolCallCard(card: card)
                 }
-                if viewModel.streamingText.isEmpty {
+                // PR9: confirm cards for any Mac-control proposal awaiting approval.
+                ForEach(viewModel.pendingConfirmations) { req in
+                    ConfirmCardView(request: req) { decision in
+                        viewModel.resolveConfirmation(id: req.id, decision: decision)
+                    }
+                }
+                if !viewModel.pendingConfirmations.isEmpty {
+                    Text("Waiting for your approval…")
+                        .font(.system(size: 11))
+                        .foregroundColor(.orange)
+                } else if viewModel.streamingText.isEmpty {
                     HStack(spacing: 6) {
                         ProgressView().scaleEffect(0.5).frame(width: 14, height: 14)
                         Text(viewModel.liveToolCards.contains { $0.status == .running }
@@ -5053,6 +5260,10 @@ struct SettingsView: View {
     // PR4: corner bubble settings.
     @State private var bubbleEnabled: Bool = true
     @State private var bubbleCorner: BubbleCorner = .bottomRight
+    // PR9: agent Mac-control settings.
+    @State private var macControlEnabled: Bool = false
+    @State private var autoApproveSafeReadOnly: Bool = false
+    @State private var mcpServers: [MCPServerConfig] = []
     @State private var selectedLlamaModel: String = "qwen3.5-2b"
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
@@ -5333,6 +5544,52 @@ struct SettingsView: View {
                     Spacer()
                 }
                 .opacity(bubbleEnabled ? 1.0 : 0.5)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+
+            // PR9: Mac-control (confirm-gated) — OFF by default, with a warning.
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: $macControlEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundColor(.orange)
+                            Text("Allow agent to control your Mac")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                        Text("Lets the agent PROPOSE shell commands and AppleScripts. Every action is shown to you for explicit approval before it runs — the agent can never execute anything on its own. Dangerous commands (sudo, rm -rf /, curl | sh, …) are always blocked.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if macControlEnabled {
+                    Toggle(isOn: $autoApproveSafeReadOnly) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Auto-approve safe read-only commands")
+                                .font(.system(size: 12))
+                            Text("Skip the approval prompt for read-only commands like ls, cat, pwd, echo, date, whoami. Everything else still asks; the denylist always applies.")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(10)
+                    .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+                    .cornerRadius(6)
+
+                    if !mcpServers.isEmpty {
+                        Text("MCP servers (from config.json): \(mcpServers.map { $0.name }.joined(separator: ", "))")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
@@ -6556,6 +6813,10 @@ struct SettingsView: View {
         popupHotkey = config.popupHotkey
         bubbleEnabled = config.bubble.enabled
         bubbleCorner = BubbleCorner.parse(config.bubble.corner)
+        // PR9: Mac-control + MCP.
+        macControlEnabled = config.agentSettings.enableMacControl
+        autoApproveSafeReadOnly = config.agentSettings.autoApproveSafeReadOnly
+        mcpServers = config.mcpServers
         settingsActions = ActionManager.shared.actions
         customPromptShortcut = ActionManager.shared.customPromptShortcut
         customPromptEnabled = ActionManager.shared.customPromptEnabled
@@ -6617,6 +6878,14 @@ struct SettingsView: View {
         config.providerKeys = providerKeys
         // PR4: persist corner-bubble settings.
         config.bubble = BubbleSettings(enabled: bubbleEnabled, corner: bubbleCorner.rawValue)
+        // PR9: persist Mac-control settings, PRESERVING the other agentSettings
+        // fields (maxIterations / enableWebSearch / macControlDryRun) already on
+        // disk — we only own the two General-tab toggles here.
+        var agent = AppConfig.load(dir: LLMConfig.configDir).agentSettings
+        agent.enableMacControl = macControlEnabled
+        agent.autoApproveSafeReadOnly = autoApproveSafeReadOnly
+        config.agentSettings = agent
+        config.mcpServers = mcpServers
         onSave(config)
     }
 }
@@ -10012,6 +10281,503 @@ struct ExtractTextTool: AgentTool {
     }
 }
 
+// MARK: - PR9: Mac-control confirmation seam
+
+/// The seam between a Mac-control tool (running off-main inside `ToolRunner`)
+/// and the chat UI. The tool `await`s `requestConfirmation(_:)`; the UI renders a
+/// confirm card and later calls `resolve(id:decision:)`. `@MainActor`-isolated
+/// so all UI state mutation is main-thread safe; the tool hops here via `await`.
+///
+/// CRITICAL: this is the ONLY way a Mac-control tool obtains permission to run.
+/// There is no bypass — a tool with no confirmer (headless / no UI) gets `.deny`
+/// from the default broker, so it can never auto-execute.
+@MainActor
+protocol MacControlConfirmer: AnyObject {
+    /// Present `request` to the user and suspend until they decide. Implementations
+    /// MUST eventually resolve (approve/edit/deny) — including on cancel/teardown.
+    func requestConfirmation(_ request: ConfirmationRequest) async -> ConfirmationDecision
+}
+
+/// A broker that funnels confirmation requests from the tool to a UI sink and
+/// suspends on a continuation until the UI resolves them. The active chat
+/// view-model registers itself as the `sink`; with no sink (headless), every
+/// request resolves to `.deny` so nothing can run without a real UI tap.
+@MainActor
+final class MacControlBroker: MacControlConfirmer {
+    /// A presenter the UI implements: show the card; the broker is told the
+    /// decision later via `resolve(id:decision:)`.
+    @MainActor
+    protocol Sink: AnyObject {
+        func present(_ request: ConfirmationRequest)
+        /// Called when a request is withdrawn (e.g. run cancelled) so the UI can
+        /// drop its card.
+        func withdraw(id: String)
+    }
+
+    weak var sink: Sink?
+
+    private var pending: [String: CheckedContinuation<ConfirmationDecision, Never>] = [:]
+
+    func requestConfirmation(_ request: ConfirmationRequest) async -> ConfirmationDecision {
+        // No UI to confirm → deny, structurally. Nothing runs.
+        guard let sink = sink else { return .deny }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<ConfirmationDecision, Never>) in
+                if Task.isCancelled {
+                    cont.resume(returning: .deny)
+                    return
+                }
+                self.pending[request.id] = cont
+                sink.present(request)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.resolve(id: request.id, decision: .deny) }
+        }
+    }
+
+    /// Resolve a pending confirmation (called by the UI on Approve/Edit/Deny).
+    func resolve(id: String, decision: ConfirmationDecision) {
+        guard let cont = pending.removeValue(forKey: id) else { return }
+        sink?.withdraw(id: id)
+        cont.resume(returning: decision)
+    }
+
+    /// Deny + withdraw everything still pending (used on chat dismiss/cancel).
+    func denyAll() {
+        let ids = Array(pending.keys)
+        for id in ids { resolve(id: id, decision: .deny) }
+    }
+}
+
+// MARK: - PR9: Mac-control command execution (reuses the .command primitive)
+
+/// Runs a shell command via the SAME `Process` primitive as the `.command`
+/// action (zsh + 30s timeout + captured stdout/stderr). Pure execution only —
+/// the denylist + confirm-gate are enforced by the CALLER before this is ever
+/// reached. Never elevates privileges. Returns (stdout, stderr, exitCode).
+enum MacControlExec {
+    static let timeoutSeconds: Double = 30
+
+    /// Run `command` in zsh. `@Sendable`/nonisolated so the tool can call it off
+    /// the main actor inside the ToolRunner task group.
+    static func runShell(_ command: String) -> (stdout: String, stderr: String, exit: Int32) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", command]
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        // 30s timeout — terminate the process if it overruns (mirrors .command).
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + timeoutSeconds)
+        timer.setEventHandler { process.terminate() }
+        timer.resume()
+
+        do {
+            try process.run()
+            // Read BEFORE waitUntilExit to avoid a pipe-buffer deadlock on large output.
+            let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            timer.cancel()
+            let out = String(data: outData, encoding: .utf8) ?? ""
+            let err = String(data: errData, encoding: .utf8) ?? ""
+            return (out, err, process.terminationStatus)
+        } catch {
+            timer.cancel()
+            return ("", "Failed to launch: \(error.localizedDescription)", -1)
+        }
+    }
+
+    /// Run an AppleScript via `osascript -e`. Same 30s bound.
+    static func runAppleScript(_ script: String) -> (stdout: String, stderr: String, exit: Int32) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + timeoutSeconds)
+        timer.setEventHandler { process.terminate() }
+        timer.resume()
+
+        do {
+            try process.run()
+            let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            timer.cancel()
+            let out = String(data: outData, encoding: .utf8) ?? ""
+            let err = String(data: errData, encoding: .utf8) ?? ""
+            return (out, err, process.terminationStatus)
+        } catch {
+            timer.cancel()
+            return ("", "Failed to launch: \(error.localizedDescription)", -1)
+        }
+    }
+}
+
+// MARK: - PR9: Mac-control tools (confirm-gated)
+
+/// Shared confirm-gate logic for `run_shell` / `run_applescript`. This is the
+/// SINGLE execution path; both tools route through it so the gate cannot be
+/// bypassed.
+///
+/// Flow for one invocation:
+///   1. Denylist check (always) → on hit, return an error, run NOTHING + log.
+///   2. `MacControlPolicy.decide` → `.autoApprove` only if the user enabled the
+///      safe-read-only setting AND the command is allowlisted; else `.needsConfirm`.
+///   3. Dry-run / headless → record "would execute" and return WITHOUT running.
+///   4. `.needsConfirm` → `await confirmer.requestConfirmation(...)`:
+///        - `.deny`     → return "user denied", run NOTHING.
+///        - `.edit(c2)` → re-run the gate on the edited command (deny still applies),
+///                        then run it.
+///        - `.approve`  → run it.
+///   5. Run via `MacControlExec`, cap output, LOG the executed command, return.
+struct MacControlGate: @unchecked Sendable {
+    // `@unchecked Sendable`: `confirmer` is a MainActor-isolated class, only ever
+    // touched via `await confirmer.requestConfirmation(...)` (i.e. on the
+    // MainActor); `settings`/`kind` are value/Sendable. No mutable shared state.
+    let kind: ConfirmationKind
+    let confirmer: (any MacControlConfirmer)?
+    let settings: AgentSettings
+
+    /// Thread-safe log line. `Logger.shared` appends to a file via `FileHandle`
+    /// (safe to call from any thread), so no actor hop is needed.
+    private func log(_ message: String, error: Bool = false) {
+        if error { Logger.shared.error(message) } else { Logger.shared.info(message) }
+    }
+
+    /// `run(command:)` returns the model-facing tool result string. `runner`
+    /// is the actual executor (shell or applescript), injected so the same gate
+    /// serves both tools and stays unit-testable.
+    func run(command rawCommand: String,
+             explanation: String,
+             runner: @Sendable (String) -> (stdout: String, stderr: String, exit: Int32)) async -> String {
+        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else { return "Error: an empty command cannot be run." }
+
+        // (1)+(2) Pure decision (denylist first).
+        let decision = MacControlPolicy.decide(
+            command: command, autoApproveSafeReadOnly: settings.autoApproveSafeReadOnly)
+        if case .denied(let reason) = decision {
+            log("[mac-control] DENIED (\(kind.rawValue)): \(reason) :: \(command)", error: true)
+            return "Error: this command is blocked by the safety denylist (\(reason)). It was NOT run. Propose a safer command."
+        }
+
+        // (3) Dry-run / headless: never execute when there's no UI to confirm.
+        if settings.macControlDryRun {
+            log("[mac-control] DRY-RUN would execute (\(kind.rawValue)): \(command)")
+            return "Dry-run: would execute (awaiting confirm): \(command)\n(Mac-control dry-run mode is on, so nothing ran.)"
+        }
+
+        // (4) Decide the command to actually run (immutable result via a helper so
+        //     nothing is a captured `var`).
+        let commandToRun: String
+        if case .needsConfirm = decision {
+            // No confirmer at all → structurally deny (cannot run without UI).
+            guard let confirmer = confirmer else {
+                log("[mac-control] no confirmer; refusing to run \(command)")
+                return "Error: no confirmation UI is available, so this command was NOT run."
+            }
+            let req = ConfirmationRequest(
+                id: UUID().uuidString, kind: kind, command: command,
+                explanation: explanation.isEmpty ? defaultExplanation(command) : explanation)
+            let userDecision = await confirmer.requestConfirmation(req)
+            switch userDecision {
+            case .deny:
+                log("[mac-control] user DENIED (\(kind.rawValue)): \(command)")
+                return "The user denied running this command. It was NOT run. Do not retry it; ask the user what they'd prefer or continue without it."
+            case .approve:
+                commandToRun = command
+            case .edit(let edited):
+                let trimmedEdit = edited.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Re-apply the denylist to the edited command — Edit can't smuggle danger.
+                if let reason = MacControlGuard.denialReason(trimmedEdit) {
+                    log("[mac-control] edited command DENIED: \(reason) :: \(trimmedEdit)", error: true)
+                    return "Error: the edited command is blocked by the safety denylist (\(reason)). It was NOT run."
+                }
+                commandToRun = trimmedEdit.isEmpty ? command : trimmedEdit
+            }
+        } else {
+            // .autoApprove: a user-opted-in safe read-only command.
+            commandToRun = command
+        }
+
+        // (5) Execute via the .command Process primitive.
+        log("[mac-control] EXECUTING (\(kind.rawValue)): \(commandToRun)")
+        let result = runner(commandToRun)
+        log("[mac-control] done (\(kind.rawValue)) exit=\(result.exit) out=\(result.stdout.count)ch")
+        return MacControlOutput.format(stdout: result.stdout, stderr: result.stderr, exitCode: result.exit)
+    }
+
+    private func defaultExplanation(_ command: String) -> String {
+        switch kind {
+        case .shell: return "Run this shell command on your Mac."
+        case .applescript: return "Run this AppleScript on your Mac."
+        }
+    }
+}
+
+/// `run_shell` — propose a shell command; runs only after the user approves.
+struct RunShellTool: AgentTool {
+    let gate: MacControlGate
+    var spec: ToolSpec {
+        ToolSpec.fromOpenAIJSON(MacControlSchemas.runShell)
+            ?? ToolSpec(name: "run_shell", description: "Propose a shell command (user must approve).")
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let command = (d["command"] as? String) ?? ""
+        let explanation = (d["explanation"] as? String) ?? ""
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Error: 'command' is required."
+        }
+        return await gate.run(command: command, explanation: explanation) { cmd in
+            MacControlExec.runShell(cmd)
+        }
+    }
+}
+
+/// `run_applescript` — propose an AppleScript; runs only after the user approves.
+struct RunAppleScriptTool: AgentTool {
+    let gate: MacControlGate
+    var spec: ToolSpec {
+        ToolSpec.fromOpenAIJSON(MacControlSchemas.runAppleScript)
+            ?? ToolSpec(name: "run_applescript", description: "Propose an AppleScript (user must approve).")
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let script = (d["script"] as? String) ?? ""
+        let explanation = (d["explanation"] as? String) ?? ""
+        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Error: 'script' is required."
+        }
+        return await gate.run(command: script, explanation: explanation) { src in
+            MacControlExec.runAppleScript(src)
+        }
+    }
+}
+
+// MARK: - PR9: MCP client (stdio JSON-RPC subprocess)
+
+/// A minimal but real MCP client: spawns the configured server subprocess, does
+/// the 2025-06-18 handshake (`initialize` → `notifications/initialized` →
+/// `tools/list`), and exposes a `call(tool:arguments:)` that forwards
+/// `tools/call` over stdio. The pure wire format lives in `MCPProtocol`
+/// (Core.swift); this owns the process + pipes + request/response matching.
+///
+/// `@unchecked Sendable`: all access is serialized through `ioQueue`; the public
+/// async API is the only entry point.
+final class MCPClient: @unchecked Sendable {
+    let serverName: String
+    private let process = Process()
+    private let stdin = Pipe()
+    private let stdout = Pipe()
+    private let ioQueue = DispatchQueue(label: "com.popdraft.mcp.\(UUID().uuidString)")
+    private var nextId = 100
+    private var buffer = Data()
+    private var started = false
+
+    init(serverName: String) {
+        self.serverName = serverName
+    }
+
+    /// Spawn the server and run the handshake; returns the discovered tool specs.
+    /// Throws if the server can't start or doesn't answer — the caller skips it.
+    func start(command: String, args: [String], timeoutMs: Int = 8000) async throws -> [MCPToolSpec] {
+        // Resolve the command via /usr/bin/env so a bare name (e.g. "npx") works.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [command] + args
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        // Let the server's stderr flow to our stderr/log (don't capture/block on it).
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            throw NSError(domain: "MCPClient", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "failed to start MCP server '\(serverName)': \(error.localizedDescription)"])
+        }
+        started = true
+
+        // initialize → wait for response → send initialized → tools/list.
+        _ = try await request(MCPProtocol.initializeRequest(), expectId: 1, timeoutMs: timeoutMs)
+        writeLine(MCPProtocol.initializedNotification())
+        let listResp = try await request(MCPProtocol.toolsListRequest(id: 2), expectId: 2, timeoutMs: timeoutMs)
+        return MCPProtocol.parseToolsList(listResp)
+    }
+
+    /// Forward a `tools/call`, returning (text, isError).
+    func call(tool: String, arguments: [String: Any], timeoutMs: Int = 30000) async -> (text: String, isError: Bool) {
+        guard started, process.isRunning else { return ("Error: MCP server '\(serverName)' is not running.", true) }
+        let id = nextRequestId()
+        do {
+            let resp = try await request(
+                MCPProtocol.toolsCallRequest(id: id, name: tool, arguments: arguments),
+                expectId: id, timeoutMs: timeoutMs)
+            return MCPProtocol.parseToolCallResult(resp)
+        } catch {
+            return ("Error calling MCP tool '\(tool)': \(error.localizedDescription)", true)
+        }
+    }
+
+    func shutdown() {
+        ioQueue.async { [process, stdin] in
+            try? stdin.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+        }
+    }
+
+    private func nextRequestId() -> Int {
+        return ioQueue.sync { nextId += 1; return nextId }
+    }
+
+    /// Write one newline-delimited JSON-RPC message.
+    private func writeLine(_ data: Data) {
+        ioQueue.async { [stdin] in
+            var line = data
+            line.append(0x0A)  // '\n'
+            try? stdin.fileHandleForWriting.write(contentsOf: line)
+        }
+    }
+
+    /// Hard cap on the rolling read buffer so a chatty/garbage server can't grow
+    /// memory without bound while we wait for our id.
+    private static let maxBufferBytes = 4 * 1024 * 1024
+
+    /// Send a request and await the response line whose `id` matches `expectId`.
+    /// Reads newline-delimited JSON-RPC from stdout, bounded by `timeoutMs`.
+    ///
+    /// The blocking `availableData` read is RACED against the remaining deadline
+    /// (via a throwing task group) so a silent server that writes nothing and
+    /// never EOFs cannot hang the call past the timeout — the deadline is
+    /// authoritative.
+    private func request(_ data: Data, expectId: Int, timeoutMs: Int) async throws -> Data {
+        writeLine(data)
+        let handle = stdout.fileHandleForReading
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        // Drain whole lines from a rolling buffer until we see our id (or time out).
+        while Date() < deadline {
+            if let line = try takeBufferedLine(matching: expectId) { return line }
+            let remainingMs = Int(deadline.timeIntervalSinceNow * 1000)
+            if remainingMs <= 0 { break }
+
+            // Race the (blocking) read against the remaining time budget.
+            let chunk: Data? = try await withThrowingTaskGroup(of: Data?.self) { group in
+                group.addTask {
+                    await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
+                        self.ioQueue.async { cont.resume(returning: handle.availableData) }
+                    }
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(remainingMs) * 1_000_000)
+                    return nil  // deadline sentinel
+                }
+                let first = try await group.next() ?? nil
+                group.cancelAll()
+                return first
+            }
+
+            guard let chunk = chunk else { break }  // deadline won the race
+            if chunk.isEmpty {
+                // EOF or no data yet; if the process is gone and nothing's left, stop.
+                if !process.isRunning && buffer.isEmpty { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+                continue
+            }
+            buffer.append(chunk)
+            if buffer.count > Self.maxBufferBytes {
+                throw NSError(domain: "MCPClient", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "MCP server '\(serverName)' response exceeded buffer cap"])
+            }
+        }
+        throw NSError(domain: "MCPClient", code: 2, userInfo: [
+            NSLocalizedDescriptionKey: "timed out waiting for MCP response id=\(expectId)"])
+    }
+
+    /// Pull a complete newline-delimited JSON object from `buffer` whose id
+    /// matches (skipping notifications / other ids), or nil if none yet.
+    private func takeBufferedLine(matching expectId: Int) throws -> Data? {
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = buffer.subdata(in: buffer.startIndex..<nl)
+            buffer.removeSubrange(buffer.startIndex...nl)
+            let trimmed = line.trimmingTrailingWhitespace()
+            if trimmed.isEmpty { continue }
+            if MCPProtocol.responseId(trimmed) == expectId { return trimmed }
+            // Different id or a notification — discard and keep scanning.
+        }
+        return nil
+    }
+}
+
+private extension Data {
+    func trimmingTrailingWhitespace() -> Data {
+        var d = self
+        while let last = d.last, last == 0x20 || last == 0x09 || last == 0x0D || last == 0x0A {
+            d.removeLast()
+        }
+        return d
+    }
+}
+
+/// An `AgentTool` backed by a discovered MCP tool. Forwards `invoke` to the
+/// client's `tools/call`. NOT confirm-gated (MCP servers are explicit,
+/// user-configured integrations), but only ever registered when the server is
+/// configured + reachable.
+struct MCPTool: AgentTool {
+    let client: MCPClient
+    let originalName: String        // the server-side tool name
+    let toolSpec: ToolSpec          // namespaced spec (server__tool)
+    var spec: ToolSpec { toolSpec }
+
+    func invoke(_ args: JSONObject) async throws -> String {
+        let (text, isError) = await client.call(tool: originalName, arguments: args.dictionary)
+        if isError {
+            // Surface as a thrown error so ToolRunner marks the result isError,
+            // letting the model adapt — same contract as the other tools.
+            throw NSError(domain: "MCPTool", code: -1, userInfo: [NSLocalizedDescriptionKey: text])
+        }
+        return text
+    }
+}
+
+/// Spawns every configured+enabled MCP server, runs the handshake, and returns
+/// the discovered `AgentTool`s. A server that fails to start/handshake is
+/// skipped + logged (never crashes the agent). The live clients are returned so
+/// the caller can shut them down when the turn ends.
+@MainActor
+enum MCPManager {
+    static func buildTools(servers: [MCPServerConfig]) async -> (tools: [any AgentTool], clients: [MCPClient]) {
+        var tools: [any AgentTool] = []
+        var clients: [MCPClient] = []
+        for cfg in servers where cfg.enabled && !cfg.command.isEmpty {
+            let client = MCPClient(serverName: cfg.name)
+            do {
+                let specs = try await client.start(command: cfg.command, args: cfg.args)
+                for s in specs {
+                    let namespaced = s.toToolSpec(serverName: cfg.name)
+                    tools.append(MCPTool(client: client, originalName: s.name, toolSpec: namespaced))
+                }
+                clients.append(client)
+                Logger.shared.info("[mcp] '\(cfg.name)' started; \(specs.count) tools")
+            } catch {
+                client.shutdown()
+                Logger.shared.error("[mcp] '\(cfg.name)' skipped: \(error.localizedDescription)")
+            }
+        }
+        return (tools, clients)
+    }
+}
+
 // MARK: - PopDraftAgent (registry + loop wiring)
 
 /// Builds the tool registry from config and runs the `AgentLoop` over the real
@@ -10028,9 +10794,19 @@ struct PopDraftAgent {
     """
 
     /// Build the registry of tools the agent may use, honoring config gates.
-    /// Web tools are gated on `agentSettings.enableWebSearch`. (Mac-control + MCP
-    /// tools are PR9 and are intentionally NOT registered here.)
-    static func buildRegistry(config: AppConfig) async -> ToolRegistry {
+    ///
+    /// - Web tools: gated on `agentSettings.enableWebSearch`.
+    /// - Mac-control tools (`run_shell`/`run_applescript`): registered ONLY when
+    ///   `agentSettings.enableMacControl == true` (default false). When the gate
+    ///   is off they are literally absent from the registry, so the model cannot
+    ///   call them. When on, each runs through `MacControlGate` (denylist +
+    ///   confirm-before-execute); `confirmer` is the UI seam.
+    /// - MCP tools: discovered from each configured+enabled server; failures are
+    ///   skipped. The live clients are returned so the caller can shut them down.
+    static func buildRegistry(
+        config: AppConfig,
+        confirmer: (any MacControlConfirmer)? = nil
+    ) async -> (registry: ToolRegistry, mcpClients: [MCPClient]) {
         let registry = ToolRegistry()
         // Text tools are always available (no network).
         await registry.register([SummarizeTextTool(), ExtractTextTool()])
@@ -10040,23 +10816,45 @@ struct PopDraftAgent {
                 WebScreenshotTool(), WebExtractTool(),
             ])
         }
-        return registry
+        // PR9: confirm-gated Mac-control tools — OFF by default.
+        if config.agentSettings.enableMacControl {
+            await registry.register([
+                RunShellTool(gate: MacControlGate(kind: .shell, confirmer: confirmer, settings: config.agentSettings)),
+                RunAppleScriptTool(gate: MacControlGate(kind: .applescript, confirmer: confirmer, settings: config.agentSettings)),
+            ])
+        }
+        // PR9: MCP tools — only for configured+enabled servers (default none).
+        let mcp = await MCPManager.buildTools(servers: config.mcpServers)
+        if !mcp.tools.isEmpty { await registry.register(mcp.tools) }
+        return (registry, mcp.clients)
     }
 
     /// Run the agent loop on `session`. Returns the loop outcome (updated session
     /// + final answer). The model `call` is `LLMClient.chatCompletion`; tools run
     /// in parallel via `ToolRunner` with the renderer cap as the concurrency cap.
+    ///
+    /// `confirmer` is the Mac-control confirmation seam (the chat view-model). With
+    /// no confirmer, confirm-gated commands structurally resolve to deny.
     static func run(
         session: ChatSession,
         config: AppConfig,
+        confirmer: (any MacControlConfirmer)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil,
         onProgress: ToolProgressHook? = nil
     ) async throws -> AgentLoop.Outcome {
-        let registry = await buildRegistry(config: config)
+        let (registry, mcpClients) = await buildRegistry(config: config, confirmer: confirmer)
+        // Shut MCP servers down when the turn ends, however it ends.
+        defer { for c in mcpClients { c.shutdown() } }
         // Tool concurrency cap == renderer pool size (web tools are the heavy ones).
+        // Per-tool timeout: normally web-nav + slack, but when Mac-control is on a
+        // confirm-gated tool may sit AWAITING THE USER'S APPROVAL — so give the
+        // batch a generous wall-clock window. (The execution itself is still
+        // bounded by MacControlExec's own 30s process timeout.)
+        let baseTimeout = max(5000, config.webNavTimeoutMs + 5000)
+        let perToolTimeout = config.agentSettings.enableMacControl ? max(baseTimeout, 300_000) : baseTimeout
         let runner = ToolRunner(
             maxConcurrent: max(1, config.webMaxRenderers),
-            perToolTimeoutMs: max(5000, config.webNavTimeoutMs + 5000))
+            perToolTimeoutMs: perToolTimeout)
         let loop = AgentLoop(maxIterations: config.agentSettings.maxIterations, runner: runner)
 
         let modelCall: AgentLoop.ModelCall = { messages, toolsBoxed in

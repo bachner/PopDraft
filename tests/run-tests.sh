@@ -18,6 +18,7 @@ TESTS=(
   "tests/test-webengine-core.swift scripts/Core.swift"
   "tests/test-toolrunner.swift scripts/Core.swift"
   "tests/test-agentloop.swift scripts/Core.swift"
+  "tests/test-maccontrol.swift scripts/Core.swift"
 )
 
 OVERALL_EXIT=0

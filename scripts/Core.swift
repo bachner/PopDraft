@@ -35,13 +35,30 @@ struct ModelRef: Codable, Equatable {
 /// Settings for the (forthcoming) agent loop.
 struct AgentSettings: Codable, Equatable {
     var maxIterations: Int
+    /// Master switch for the confirm-gated Mac-control tools (`run_shell` /
+    /// `run_applescript`). OFF by default — when false the tools are NOT even
+    /// registered, so the model literally cannot call them. (PR9)
     var enableMacControl: Bool
     var enableWebSearch: Bool
+    /// When true, a small set of safe READ-ONLY command prefixes (ls/cat/pwd/…)
+    /// may run WITHOUT the confirm dialog. Everything else always confirms; the
+    /// hard denylist always applies. Default OFF. (PR9)
+    var autoApproveSafeReadOnly: Bool
+    /// Headless/eval safety: when true, Mac-control tools NEVER execute — they
+    /// record "would execute: <cmd> (awaiting confirm)" and return. Used by a
+    /// future headless eval where there is no UI to confirm. Default OFF. (PR9)
+    var macControlDryRun: Bool
 
-    init(maxIterations: Int = 6, enableMacControl: Bool = false, enableWebSearch: Bool = true) {
+    init(maxIterations: Int = 6,
+         enableMacControl: Bool = false,
+         enableWebSearch: Bool = true,
+         autoApproveSafeReadOnly: Bool = false,
+         macControlDryRun: Bool = false) {
         self.maxIterations = maxIterations
         self.enableMacControl = enableMacControl
         self.enableWebSearch = enableWebSearch
+        self.autoApproveSafeReadOnly = autoApproveSafeReadOnly
+        self.macControlDryRun = macControlDryRun
     }
 
     init(from decoder: Decoder) throws {
@@ -49,6 +66,34 @@ struct AgentSettings: Codable, Equatable {
         maxIterations = try c.decodeIfPresent(Int.self, forKey: .maxIterations) ?? 6
         enableMacControl = try c.decodeIfPresent(Bool.self, forKey: .enableMacControl) ?? false
         enableWebSearch = try c.decodeIfPresent(Bool.self, forKey: .enableWebSearch) ?? true
+        autoApproveSafeReadOnly = try c.decodeIfPresent(Bool.self, forKey: .autoApproveSafeReadOnly) ?? false
+        macControlDryRun = try c.decodeIfPresent(Bool.self, forKey: .macControlDryRun) ?? false
+    }
+}
+
+/// One configured MCP server: a subprocess the app spawns and speaks JSON-RPC
+/// (stdio) to, exposing its `tools/list` as agent tools. Default config carries
+/// an empty list, so nothing is spawned until a user configures a server. (PR9)
+struct MCPServerConfig: Codable, Equatable {
+    var name: String
+    var command: String
+    var args: [String]
+    /// Whether this server is active (lets a user keep a config but disable it).
+    var enabled: Bool
+
+    init(name: String, command: String, args: [String] = [], enabled: Bool = true) {
+        self.name = name
+        self.command = command
+        self.args = args
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
+        args = try c.decodeIfPresent([String].self, forKey: .args) ?? []
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 }
 
@@ -147,6 +192,9 @@ struct AppConfig: Codable, Equatable {
     var agentSettings: AgentSettings
     var webSearch: WebSearchConfig
     var bubble: BubbleSettings
+    /// Configured MCP servers (PR9). Default `[]` — nothing is spawned until the
+    /// user adds one. Discovered tools register into the same agent ToolRegistry.
+    var mcpServers: [MCPServerConfig]
 
     // --- PR6: homemade WebEngine knobs ---
     /// Max concurrent offscreen WKWebViews. Clamped to 1...6. Default 2 (vetted posture).
@@ -187,6 +235,7 @@ struct AppConfig: Codable, Equatable {
         agentSettings: AgentSettings = AgentSettings(),
         webSearch: WebSearchConfig = WebSearchConfig(),
         bubble: BubbleSettings = BubbleSettings(),
+        mcpServers: [MCPServerConfig] = [],
         webMaxRenderers: Int = 2,
         webNavTimeoutMs: Int = 15000,
         webSettleMs: Int = 600,
@@ -217,6 +266,7 @@ struct AppConfig: Codable, Equatable {
         self.agentSettings = agentSettings
         self.webSearch = webSearch
         self.bubble = bubble
+        self.mcpServers = mcpServers
         self.webMaxRenderers = webMaxRenderers
         self.webNavTimeoutMs = webNavTimeoutMs
         self.webSettleMs = webSettleMs
@@ -254,6 +304,7 @@ struct AppConfig: Codable, Equatable {
         agentSettings = try c.decodeIfPresent(AgentSettings.self, forKey: .agentSettings) ?? d.agentSettings
         webSearch = try c.decodeIfPresent(WebSearchConfig.self, forKey: .webSearch) ?? d.webSearch
         bubble = try c.decodeIfPresent(BubbleSettings.self, forKey: .bubble) ?? d.bubble
+        mcpServers = try c.decodeIfPresent([MCPServerConfig].self, forKey: .mcpServers) ?? d.mcpServers
         // PR6 web-engine knobs: clamp/sanitize so out-of-range disk values can't break the pool.
         webMaxRenderers = WebTuning.clampRenderers(try c.decodeIfPresent(Int.self, forKey: .webMaxRenderers) ?? d.webMaxRenderers)
         webNavTimeoutMs = max(1000, try c.decodeIfPresent(Int.self, forKey: .webNavTimeoutMs) ?? d.webNavTimeoutMs)
@@ -2467,5 +2518,519 @@ struct AgentLoop {
         working.updatedAt = Date().timeIntervalSince1970
         return Outcome(session: working, finalText: lastText,
                        iterations: iterations, stoppedAtMax: true)
+    }
+}
+
+// =====================================================================
+// MARK: - PR9: Mac-control safety + confirm-gate decision logic (pure)
+//
+// Everything below is Foundation-only and PURE so it is unit-tested by
+// `tests/test-maccontrol.swift` with NO process execution.
+//
+//   - `MacControlGuard`   — the HARD denylist (sudo, rm -rf /, dd, fork bomb,
+//                           curl|sh, …) enforced even on Approve, plus the
+//                           opt-in safe read-only allowlist.
+//   - `MacControlPolicy`  — pure decision: given a command + settings, returns
+//                           .denied / .autoApprove / .needsConfirm. The
+//                           confirm-gate's structural guarantee lives here.
+//   - `ConfirmationDecision` / `ConfirmationKind` — the seam the UI resolves.
+//   - MCP JSON-RPC framing — encode initialize/tools-call requests, parse a
+//                           tools/list response into specs (no subprocess).
+//
+// The AppKit/Process side (the actual `Process` run, the UI confirm card, the
+// MCP subprocess) lives in PopDraft.swift and calls into these.
+// =====================================================================
+
+// MARK: - MacControlGuard (hard denylist + safe-allowlist)
+
+/// Pure, unit-testable matcher for dangerous shell commands. The denylist is a
+/// HARD block: it rejects outright even after a user taps Approve (defense in
+/// depth against social-engineering the user into approving a destructive
+/// command). The allowlist is the opposite — a tiny set of read-only prefixes
+/// that MAY skip the confirm dialog, but ONLY when the user has opted in.
+enum MacControlGuard {
+    /// Why a command was denied (for the error result + log line).
+    struct Denial: Equatable {
+        var reason: String
+    }
+
+    /// Read-only command prefixes that are safe to auto-approve (when the user
+    /// has enabled `autoApproveSafeReadOnly`). The FIRST shell word must equal
+    /// one of these. Anything else always confirms.
+    static let safeReadOnlyPrefixes: Set<String> = [
+        "ls", "cat", "pwd", "echo", "date", "whoami",
+    ]
+
+    /// True iff `command` matches a hard-denied dangerous pattern. The denylist
+    /// ALWAYS applies, regardless of approval or the allowlist.
+    static func isDenied(_ command: String) -> Bool {
+        return denialReason(command) != nil
+    }
+
+    /// The human-readable denial reason, or nil if the command is not denied.
+    /// Matching is done on a normalized (lowercased, whitespace-collapsed) copy
+    /// so simple obfuscation (extra spaces, case) can't slip a pattern past us.
+    static func denialReason(_ command: String) -> String? {
+        let raw = command
+        let lower = command.lowercased()
+        // Collapse runs of whitespace to single spaces for pattern matching,
+        // but keep a version WITHOUT spaces too for "rm -rf" style gaps and the
+        // fork-bomb which is whitespace-insensitive.
+        let collapsed = lower
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let nospace = lower.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+
+        // 1. Privilege escalation — sudo / su / doas anywhere as a command word.
+        if hasCommandWord(collapsed, anyOf: ["sudo", "doas"]) || collapsed == "su" || collapsed.hasPrefix("su ") {
+            return "privilege escalation (sudo/su/doas) is not allowed"
+        }
+
+        // 2. Recursive force-remove of root / home / glob roots.
+        //    Matches `rm -rf /`, `rm -fr /`, `rm -rf ~`, `rm -rf /*`, `rm -rf .` etc.
+        if isDangerousRm(collapsed) {
+            return "recursive force-delete of a root/home path is not allowed"
+        }
+
+        // 3. Filesystem creation / raw disk writes.
+        if hasCommandWord(collapsed, anyOf: ["mkfs"]) || collapsed.contains("mkfs.") || collapsed.contains("newfs") {
+            return "filesystem creation (mkfs) is not allowed"
+        }
+        if collapsed.contains("dd if=") || collapsed.contains("dd if =") || nospace.contains("ddif=") {
+            return "raw disk write (dd if=) is not allowed"
+        }
+
+        // 4. Fork bomb — `:(){ :|:& };:` and whitespace variants.
+        if nospace.contains(":(){") || nospace.contains(":(){:|:&};:") {
+            return "fork bomb is not allowed"
+        }
+
+        // 5. Pipe-to-shell of network downloads — `curl … | sh`, `wget … | bash`.
+        if isPipeToShell(collapsed) {
+            return "piping a network download into a shell is not allowed"
+        }
+
+        // 6. Redirecting into device nodes — `> /dev/sda`, `> /dev/disk0`.
+        if redirectsToDevice(collapsed) {
+            return "writing to a device node (> /dev/...) is not allowed"
+        }
+
+        // 7. Power state — shutdown / reboot / halt / poweroff.
+        if hasCommandWord(collapsed, anyOf: ["shutdown", "reboot", "halt", "poweroff"]) {
+            return "shutting down or rebooting the machine is not allowed"
+        }
+        // `osascript … restart`/`shut down` (AppleScript) variants.
+        if raw.range(of: "(?i)tell\\s+app(lication)?\\s+\"?(system events|finder)\"?.*(restart|shut\\s*down|log\\s*out)",
+                     options: .regularExpression) != nil {
+            return "shutting down or rebooting the machine is not allowed"
+        }
+
+        return nil
+    }
+
+    /// Whether `command`'s FIRST shell word is in the opt-in safe read-only set.
+    /// Note: a denied command is never "safe", even if it starts with `ls`.
+    static func isSafeReadOnly(_ command: String) -> Bool {
+        if isDenied(command) { return false }
+        guard let first = firstWord(command) else { return false }
+        // Reject if the command contains shell metacharacters that could chain
+        // a non-safe command after the safe prefix (`ls; rm -rf x`, `cat $(…)`).
+        if containsShellChaining(command) { return false }
+        return safeReadOnlyPrefixes.contains(first)
+    }
+
+    // MARK: helpers
+
+    /// The first shell word (the command name), lowercased, or nil if empty.
+    static func firstWord(_ command: String) -> String? {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let parts = trimmed.lowercased().components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        return parts.first
+    }
+
+    /// True if any shell metacharacter that could chain/expand into a second
+    /// command is present (so an allowlisted prefix can't smuggle danger).
+    private static func containsShellChaining(_ command: String) -> Bool {
+        let metas = [";", "|", "&", "`", "$(", ">", "<", "\n", "&&", "||"]
+        return metas.contains { command.contains($0) }
+    }
+
+    /// True if any of `words` appears as a command word (start, or after a
+    /// chaining operator / whitespace). Avoids matching it inside a longer token.
+    private static func hasCommandWord(_ collapsed: String, anyOf words: [String]) -> Bool {
+        let tokens = collapsed
+            .replacingOccurrences(of: ";", with: " ")
+            .replacingOccurrences(of: "|", with: " ")
+            .replacingOccurrences(of: "&", with: " ")
+            .replacingOccurrences(of: "(", with: " ")
+            .replacingOccurrences(of: ")", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+        let set = Set(words)
+        // A word matches if a token equals it OR a token is "word/path" (e.g.
+        // /sbin/shutdown) ending in /word.
+        for t in tokens {
+            if set.contains(t) { return true }
+            if let slash = t.lastIndex(of: "/") {
+                let tail = String(t[t.index(after: slash)...])
+                if set.contains(tail) { return true }
+            }
+        }
+        return false
+    }
+
+    /// Detect `rm` with recursive+force flags targeting a root/home/glob path.
+    /// Token-based: a target is catastrophic only when the WHOLE argument token
+    /// is a root/home/glob path (so `rm -rf ./build` — a named subdir — is fine,
+    /// but `rm -rf /`, `rm -rf ~`, `rm -rf /*`, `rm -rf /Users` are caught).
+    private static func isDangerousRm(_ collapsed: String) -> Bool {
+        // Must invoke rm.
+        guard hasCommandWord(collapsed, anyOf: ["rm"]) else { return false }
+        // Recursive + force in some flag order: -rf, -fr, -r -f, --recursive --force.
+        let recursive = collapsed.contains("-rf") || collapsed.contains("-fr")
+            || (collapsed.contains("-r") && collapsed.contains("-f"))
+            || (collapsed.contains("--recursive") && collapsed.contains("--force"))
+            || collapsed.contains("-r ") || collapsed.contains("--recursive")
+        guard recursive else { return false }
+
+        // Catastrophic TOKENS (the entire argument equals one of these).
+        let catastrophic: Set<String> = [
+            "/", "/*", "~", "~/", ".", "./", "*",
+            "$home", "${home}", "/users", "/system", "/applications", "/library",
+        ]
+        // Also flag any token under a top-level system/home root (e.g. `/Users`,
+        // `/System/...`, `~/` with a glob): a token that starts with one of these
+        // AND is the root itself or root + "/*".
+        let rootPrefixes = ["/users", "/system", "/library", "/applications"]
+
+        let tokens = collapsed
+            .replacingOccurrences(of: ";", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty && !$0.hasPrefix("-") && $0 != "rm" }
+        for t in tokens {
+            if catastrophic.contains(t) { return true }
+            // `/users/*`, `/system/*`, etc.
+            if rootPrefixes.contains(where: { t == $0 || t == $0 + "/" || t == $0 + "/*" }) { return true }
+            // `~/*` (glob-delete the whole home dir).
+            if t == "~/*" || t == "$home/*" || t == "${home}/*" { return true }
+        }
+        return false
+    }
+
+    /// Detect a network-download piped straight into a shell interpreter.
+    private static func isPipeToShell(_ collapsed: String) -> Bool {
+        guard collapsed.contains("curl") || collapsed.contains("wget") || collapsed.contains("fetch") else { return false }
+        guard collapsed.contains("|") else { return false }
+        // The thing AFTER a pipe is a shell.
+        let segments = collapsed.components(separatedBy: "|")
+        guard segments.count >= 2 else { return false }
+        let shells = ["sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node"]
+        for seg in segments.dropFirst() {
+            if let w = firstWord(seg), shells.contains(w) { return true }
+            // `| sudo sh` style.
+            let trimmedSeg = seg.trimmingCharacters(in: .whitespaces)
+            for s in shells where trimmedSeg.hasPrefix(s + " ") || trimmedSeg == s { return true }
+        }
+        return false
+    }
+
+    /// Detect a redirect into a /dev device node (excluding the harmless
+    /// /dev/null and /dev/stdout|stderr).
+    private static func redirectsToDevice(_ collapsed: String) -> Bool {
+        guard collapsed.contains(">") && collapsed.contains("/dev/") else { return false }
+        // Allow the benign sinks.
+        let benign = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]
+        // Find a `> /dev/...` target.
+        if let range = collapsed.range(of: ">[[:space:]]*/dev/[a-z0-9]+", options: .regularExpression) {
+            let target = String(collapsed[range]).replacingOccurrences(of: ">", with: "").trimmingCharacters(in: .whitespaces)
+            if benign.contains(where: { target.hasPrefix($0) }) { return false }
+            return true
+        }
+        return false
+    }
+}
+
+// MARK: - MacControlPolicy (pure confirm-gate decision)
+
+/// The structural confirm-gate decision. Given a command and the user's
+/// settings, returns EXACTLY ONE of:
+///   - `.denied(reason)`     → never run, return an error result + warn.
+///   - `.autoApprove`        → run WITHOUT a dialog (only ever returned when the
+///                             user enabled auto-approve AND the command is a
+///                             safe read-only allowlisted prefix).
+///   - `.needsConfirm`       → PAUSE and ask the user (Approve/Edit/Deny).
+///
+/// This is the single source of truth for "can the loop run this without a
+/// tap?". The tool's `invoke` MUST route through it; there is no other path to
+/// execution. The denylist is checked FIRST so it always wins.
+enum MacControlPolicy {
+    enum Decision: Equatable {
+        case denied(reason: String)
+        case autoApprove
+        case needsConfirm
+    }
+
+    /// Decide what to do with `command`.
+    /// - `dryRun`: headless/eval mode — the caller must NOT execute; it records
+    ///   "would execute" and returns. We still return the real decision so the
+    ///   caller can log it, but `.autoApprove` in dryRun still means "don't run".
+    static func decide(command: String,
+                       autoApproveSafeReadOnly: Bool) -> Decision {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return .denied(reason: "empty command") }
+        // 1. Hard denylist ALWAYS wins.
+        if let reason = MacControlGuard.denialReason(trimmed) {
+            return .denied(reason: reason)
+        }
+        // 2. Opt-in safe read-only auto-approve.
+        if autoApproveSafeReadOnly && MacControlGuard.isSafeReadOnly(trimmed) {
+            return .autoApprove
+        }
+        // 3. Everything else needs an explicit user tap.
+        return .needsConfirm
+    }
+}
+
+// MARK: - Confirmation seam (resolved by the UI)
+
+/// The kind of Mac-control action awaiting confirmation (drives the card icon
+/// and the run path).
+enum ConfirmationKind: String, Equatable, Sendable {
+    case shell
+    case applescript
+}
+
+/// The user's decision on a pending confirmation. `.edit` carries the possibly
+/// user-modified command to run instead.
+enum ConfirmationDecision: Equatable, Sendable {
+    case approve
+    case edit(String)
+    case deny
+}
+
+/// A request for the user to confirm a Mac-control action, surfaced by the tool
+/// and rendered by the chat UI as a confirm card. Pure/`Sendable` so it can
+/// cross the actor boundary between the tool (off-main) and the UI (main).
+struct ConfirmationRequest: Equatable, Sendable, Identifiable {
+    let id: String
+    let kind: ConfirmationKind
+    /// The EXACT command/script that will run on Approve (shown verbatim).
+    let command: String
+    /// A short, human explanation of what this does (for the card subtitle).
+    let explanation: String
+
+    init(id: String, kind: ConfirmationKind, command: String, explanation: String) {
+        self.id = id
+        self.kind = kind
+        self.command = command
+        self.explanation = explanation
+    }
+}
+
+/// Caps the output a Mac-control tool returns to the model, so a chatty command
+/// can't blow up the context. Pure so it's unit-tested.
+enum MacControlOutput {
+    static let maxChars = 8000
+
+    /// Combine stdout/stderr/exit into a compact, capped tool-result string.
+    static func format(stdout: String, stderr: String, exitCode: Int32) -> String {
+        var parts: [String] = []
+        let out = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let err = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        parts.append("exit code: \(exitCode)")
+        if !out.isEmpty { parts.append("stdout:\n" + out) }
+        if !err.isEmpty { parts.append("stderr:\n" + err) }
+        if out.isEmpty && err.isEmpty { parts.append("(no output)") }
+        var joined = parts.joined(separator: "\n\n")
+        if joined.count > maxChars {
+            let idx = joined.index(joined.startIndex, offsetBy: maxChars)
+            joined = String(joined[..<idx]) + "\n…(output truncated)"
+        }
+        return joined
+    }
+}
+
+// MARK: - Mac-control tool JSON schemas
+
+/// OpenAI function-tool schemas for the confirm-gated Mac-control tools.
+enum MacControlSchemas {
+    static let runShell = """
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell",
+        "description": "Run a shell command on the user's Mac (zsh). The command is shown to the user for explicit Approve/Edit/Deny BEFORE it runs — you are PROPOSING, not executing. Returns the command's exit code, stdout, and stderr. Use for read-only inspection or small actions; the user controls every run.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": { "type": "string", "description": "The exact shell command to propose running." },
+            "explanation": { "type": "string", "description": "A one-line plain-English explanation of what this command does and why." }
+          },
+          "required": ["command"]
+        }
+      }
+    }
+    """
+
+    static let runAppleScript = """
+    {
+      "type": "function",
+      "function": {
+        "name": "run_applescript",
+        "description": "Run an AppleScript on the user's Mac (osascript). The script is shown to the user for explicit Approve/Edit/Deny BEFORE it runs — you are PROPOSING, not executing. Returns the script's output. Use to control Mac apps; the user controls every run.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "script": { "type": "string", "description": "The exact AppleScript source to propose running." },
+            "explanation": { "type": "string", "description": "A one-line plain-English explanation of what this script does and why." }
+          },
+          "required": ["script"]
+        }
+      }
+    }
+    """
+}
+
+// =====================================================================
+// MARK: - PR9: MCP client JSON-RPC framing (pure)
+//
+// Minimal but real MCP (Model Context Protocol, 2025-06-18) over stdio:
+// encode the handshake/tool-call requests and parse the responses. The
+// subprocess + stdio plumbing lives in PopDraft.swift; this is the pure,
+// testable wire format.
+// =====================================================================
+
+/// The MCP protocol version this client speaks.
+enum MCPProtocol {
+    static let version = "2025-06-18"
+
+    /// Encode the `initialize` request (id 1). Returns the JSON-RPC line bytes
+    /// (no trailing newline; the transport adds framing).
+    static func initializeRequest(clientName: String = "PopDraft", clientVersion: String = "1.0") -> Data {
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "protocolVersion": version,
+                "capabilities": ["tools": [String: Any]()],
+                "clientInfo": ["name": clientName, "version": clientVersion],
+            ],
+        ]
+        return encode(body)
+    }
+
+    /// Encode the `notifications/initialized` notification (no id).
+    static func initializedNotification() -> Data {
+        encode(["jsonrpc": "2.0", "method": "notifications/initialized"])
+    }
+
+    /// Encode the `tools/list` request with the given id.
+    static func toolsListRequest(id: Int = 2) -> Data {
+        encode(["jsonrpc": "2.0", "id": id, "method": "tools/list", "params": [String: Any]()])
+    }
+
+    /// Encode a `tools/call` request for `name` with `arguments`.
+    static func toolsCallRequest(id: Int, name: String, arguments: [String: Any]) -> Data {
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": ["name": name, "arguments": arguments],
+        ]
+        return encode(body)
+    }
+
+    private static func encode(_ obj: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
+    }
+}
+
+/// One tool advertised by an MCP server (name + description + input schema).
+struct MCPToolSpec: Equatable {
+    var name: String
+    var description: String
+    var inputSchema: [String: Any]
+
+    static func == (lhs: MCPToolSpec, rhs: MCPToolSpec) -> Bool {
+        lhs.name == rhs.name && lhs.description == rhs.description
+            && JSONSchema.canonical(lhs.inputSchema) == JSONSchema.canonical(rhs.inputSchema)
+    }
+
+    /// Build an agent `ToolSpec`, namespacing the tool name with the server so
+    /// two servers can't collide (`<server>__<tool>`).
+    func toToolSpec(serverName: String) -> ToolSpec {
+        let prefixed = MCPProtocol.namespacedToolName(server: serverName, tool: name)
+        return ToolSpec(name: prefixed, description: description, parametersSchema: inputSchema)
+    }
+}
+
+extension MCPProtocol {
+    /// `<server>__<tool>` — a stable, collision-free agent tool name.
+    static func namespacedToolName(server: String, tool: String) -> String {
+        let safeServer = server.replacingOccurrences(of: " ", with: "_")
+        return "\(safeServer)__\(tool)"
+    }
+
+    /// Parse a JSON-RPC `tools/list` response body into `[MCPToolSpec]`.
+    /// Tolerates a missing/odd shape by returning `[]`.
+    static func parseToolsList(_ data: Data) -> [MCPToolSpec] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        // Errors carry an `error` member; treat as empty (the caller logs).
+        if obj["error"] != nil { return [] }
+        guard let result = obj["result"] as? [String: Any],
+              let tools = result["tools"] as? [[String: Any]] else { return [] }
+        return tools.compactMap { t in
+            guard let name = t["name"] as? String, !name.isEmpty else { return nil }
+            let desc = (t["description"] as? String) ?? ""
+            let schema = (t["inputSchema"] as? [String: Any]) ?? ["type": "object"]
+            return MCPToolSpec(name: name, description: desc, inputSchema: schema)
+        }
+    }
+
+    /// Extract the text content of a `tools/call` result into a compact string
+    /// for the model. MCP results carry `content: [{type:"text", text:"…"}, …]`.
+    static func parseToolCallResult(_ data: Data) -> (text: String, isError: Bool) {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ("(no parseable MCP response)", true)
+        }
+        if let err = obj["error"] as? [String: Any] {
+            let msg = (err["message"] as? String) ?? "MCP error"
+            return ("Error: \(msg)", true)
+        }
+        guard let result = obj["result"] as? [String: Any] else {
+            return ("(empty MCP result)", true)
+        }
+        let isError = (result["isError"] as? Bool) ?? false
+        if let content = result["content"] as? [[String: Any]] {
+            let texts = content.compactMap { item -> String? in
+                if let type = item["type"] as? String, type == "text" {
+                    return item["text"] as? String
+                }
+                // Non-text blocks: surface a marker so the model knows there's more.
+                if let type = item["type"] as? String { return "[\(type) content]" }
+                return nil
+            }
+            let joined = texts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return (joined.isEmpty ? "(no text content)" : joined, isError)
+        }
+        // Fall back to structuredContent or a JSON dump.
+        if let sc = result["structuredContent"],
+           let d = try? JSONSerialization.data(withJSONObject: sc, options: [.sortedKeys]),
+           let s = String(data: d, encoding: .utf8) {
+            return (s, isError)
+        }
+        return ("(no content)", isError)
+    }
+
+    /// Pull the JSON-RPC `id` out of a response line (for matching responses to
+    /// requests when multiplexing). Returns nil for notifications.
+    static func responseId(_ data: Data) -> Int? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj["id"] as? Int
     }
 }
