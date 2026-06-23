@@ -11118,7 +11118,7 @@ enum HeadlessRunner {
             Task.detached { await collector.record(event) }
         }
 
-        Task { @MainActor [providerLabel, modelLabel] in
+        Task { @MainActor [providerLabel, modelLabel, config] in
             var exitStatus = "ok"
             var finalText = ""
             var iterations = 0
