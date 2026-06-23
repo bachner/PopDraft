@@ -71,7 +71,20 @@ func runTests() async {
     await WebEngine.shared.warmUp()
     let engine = WebEngine.shared
 
+    // --- PR11: the pinning proxy starts and WKWebView routes through it (14+) ---
+    if #available(macOS 14.0, *) {
+        let port = PinningProxy.shared.startIfNeeded()
+        R.check(port != 0, "PR11: pinning proxy bound to a loopback port (\(port))")
+        print("  [info] pinning proxy port=\(port) — fixture reads below route THROUGH it on 14+")
+    } else {
+        print("  [info] macOS < 14 — proxy pinning unavailable; PR6 mitigation path in effect")
+    }
+
     // --- read() of a clean article ---
+    // On macOS 14+ this load travels through the pinning proxy (CONNECT for the
+    // loopback fixture is validated via the test-loopback hatch). If the proxy
+    // mis-tunnels, this end-to-end read would fail — so it doubles as the
+    // "normal page still loads through the proxy" regression check.
     do {
         let r = try await engine.read(URL(string: "\(b)/article")!, maxChars: 12000)
         R.check(r.markdown.contains("# The Title of the Article") || r.title.contains("Title of the Article"),

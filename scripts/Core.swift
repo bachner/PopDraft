@@ -1389,6 +1389,175 @@ enum SafetyGuard {
         }
         return false
     }
+
+    // MARK: - Connection-level IP pinning (PR11)
+
+    /// Outcome of pinning a host to a single validated public IP. Either a chosen
+    /// address to dial (and ONLY that address may be dialed) or a block reason.
+    enum PinResult: Equatable {
+        case allowed(String)        // the picked public IP literal to dial
+        case blocked(String)        // human-readable reason (host -> ip, "no addresses", ...)
+    }
+
+    /// Pure pinning decision: given the set of addresses a host resolved to,
+    /// FAIL CLOSED — reject if there are zero addresses OR if ANY address is
+    /// blocked (loopback / RFC1918 / link-local / ULA / metadata / 0.0.0.0). When
+    /// every address is public, pick ONE deterministically (the first by stable
+    /// order) so the proxy dials only that validated IP and WebKit never resolves
+    /// the host itself → DNS-rebinding is closed.
+    ///
+    /// `allowTestLoopback` lets the GUI test suite (which serves fixtures on a
+    /// loopback port) pin to a loopback address — only ever true when the
+    /// env-gated test hook is active; the shipping app passes false.
+    static func pinnedAddress(forResolved addrs: [String], allowTestLoopback: Bool = false) -> PinResult {
+        let cleaned = addrs
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[] ")) }
+            .filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return .blocked("no addresses") }
+
+        if allowTestLoopback {
+            // Test path: every address must be loopback (and otherwise valid). We
+            // still require ALL to be loopback so a mixed set isn't silently OK.
+            for ip in cleaned {
+                let isLoopback = (parseIPv4(ip).map { $0.count == 4 && $0[0] == 127 } ?? false)
+                    || (parseIPv6(ip).map { g in g.count == 8 && g[0...6].allSatisfy { $0 == 0 } && g[7] == 1 } ?? false)
+                if !isLoopback { return .blocked("test-loopback expected but got \(ip)") }
+            }
+            return .allowed(cleaned[0])
+        }
+
+        // Production: require EVERY resolved address to be public, then pin one.
+        for ip in cleaned where isBlockedIP(ip) {
+            return .blocked(ip)
+        }
+        // Prefer the first IPv4 (broader reachability), else the first address.
+        if let v4 = cleaned.first(where: { parseIPv4($0) != nil }) {
+            return .allowed(v4)
+        }
+        return .allowed(cleaned[0])
+    }
+}
+
+// MARK: - Forward-proxy request parsing (PR11 IP-pinning proxy)
+
+/// Pure parsers for the bytes the localhost pinning proxy receives from WKWebView.
+/// No network — just request-line / header extraction so the proxy logic is unit
+/// testable. WKWebView speaks standard HTTP-proxy framing:
+///   - HTTPS: `CONNECT host:port HTTP/1.1` then a blank line, then opaque TLS.
+///   - plain HTTP: `GET http://host/path HTTP/1.1` (absolute-form) + `Host:` header.
+enum ProxyParser {
+
+    /// A parsed CONNECT target (the host:port the client wants tunneled).
+    struct ConnectTarget: Equatable {
+        var host: String
+        var port: Int
+    }
+
+    /// Parse a `CONNECT host:port HTTP/1.1` request line. Returns nil if it is not
+    /// a well-formed CONNECT (wrong method, missing port, garbage). Default port is
+    /// rejected (CONNECT must carry an explicit port) to avoid ambiguity.
+    static func parseConnect(_ requestLine: String) -> ConnectTarget? {
+        let line = requestLine.trimmingCharacters(in: .whitespaces)
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count >= 2, parts[0].uppercased() == "CONNECT" else { return nil }
+        return splitHostPort(parts[1], defaultPort: nil)
+    }
+
+    /// Split an authority `host:port` (or bracketed IPv6 `[::1]:443`) into parts.
+    /// `defaultPort` is used when no `:port` is present; if nil and no port is
+    /// given, returns nil (caller requires an explicit port).
+    static func splitHostPort(_ authority: String, defaultPort: Int?) -> ConnectTarget? {
+        let s = authority.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        // Bracketed IPv6 literal: [host]:port  or  [host]
+        if s.hasPrefix("[") {
+            guard let close = s.firstIndex(of: "]") else { return nil }
+            let host = String(s[s.index(after: s.startIndex)..<close])
+            guard !host.isEmpty else { return nil }
+            let rest = s[s.index(after: close)...]
+            if rest.isEmpty {
+                guard let dp = defaultPort else { return nil }
+                return ConnectTarget(host: host, port: dp)
+            }
+            guard rest.hasPrefix(":"), let p = Int(rest.dropFirst()), p > 0, p <= 65535 else { return nil }
+            return ConnectTarget(host: host, port: p)
+        }
+        // Unbracketed: a bare IPv6 (multiple colons) has no port here.
+        let colonCount = s.filter { $0 == ":" }.count
+        if colonCount > 1 {
+            // Bare IPv6 literal without brackets → no explicit port.
+            guard let dp = defaultPort else { return nil }
+            return ConnectTarget(host: s, port: dp)
+        }
+        if colonCount == 1 {
+            let comps = s.split(separator: ":", maxSplits: 1).map(String.init)
+            guard comps.count == 2, !comps[0].isEmpty,
+                  let p = Int(comps[1]), p > 0, p <= 65535 else { return nil }
+            return ConnectTarget(host: comps[0], port: p)
+        }
+        // No colon → host only.
+        guard let dp = defaultPort else { return nil }
+        return ConnectTarget(host: s, port: dp)
+    }
+
+    /// A parsed plain-HTTP proxy request: method, the target host:port to dial,
+    /// the origin-form path to send upstream, and the HTTP version token.
+    struct HTTPTarget: Equatable {
+        var method: String
+        var host: String
+        var port: Int
+        var path: String        // origin-form path+query to send to the upstream
+        var version: String
+    }
+
+    /// Parse a plain-HTTP proxy request line in absolute-form
+    /// (`GET http://host:port/path HTTP/1.1`). Returns nil for CONNECT, for a
+    /// non-http scheme, or anything malformed. Falls back to `hostHeader` for the
+    /// authority if the request-line is origin-form (some clients send that with a
+    /// Host header even to a proxy).
+    static func parseHTTP(requestLine: String, hostHeader: String?) -> HTTPTarget? {
+        let line = requestLine.trimmingCharacters(in: .whitespaces)
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count == 3 else { return nil }
+        let method = parts[0].uppercased()
+        guard method != "CONNECT" else { return nil }
+        let target = parts[1]
+        let version = parts[2]
+        guard version.hasPrefix("HTTP/") else { return nil }
+
+        // Absolute-form: scheme://authority/path
+        if let schemeRange = target.range(of: "://") {
+            let scheme = target[target.startIndex..<schemeRange.lowerBound].lowercased()
+            guard scheme == "http" else { return nil }   // https never arrives plain
+            let rest = String(target[schemeRange.upperBound...])
+            // Authority is up to the first '/', '?' or end.
+            let authEnd = rest.firstIndex(where: { $0 == "/" || $0 == "?" }) ?? rest.endIndex
+            let authority = String(rest[rest.startIndex..<authEnd])
+            guard let hp = splitHostPort(authority, defaultPort: 80) else { return nil }
+            var path = String(rest[authEnd...])
+            if path.isEmpty { path = "/" }
+            return HTTPTarget(method: method, host: hp.host, port: hp.port, path: path, version: version)
+        }
+
+        // Origin-form (path only) + Host header.
+        guard target.hasPrefix("/"), let hostHeader = hostHeader,
+              let hp = splitHostPort(hostHeader, defaultPort: 80) else { return nil }
+        return HTTPTarget(method: method, host: hp.host, port: hp.port, path: target, version: version)
+    }
+
+    /// Extract the value of a header (case-insensitive) from a raw header block
+    /// (the lines after the request line, CRLF-separated). Returns nil if absent.
+    static func header(_ name: String, in headerLines: [String]) -> String? {
+        let want = name.lowercased()
+        for line in headerLines {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[line.startIndex..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            if key == want {
+                return String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
 }
 
 // MARK: - URL cleaning (tracking-param stripping)

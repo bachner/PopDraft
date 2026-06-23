@@ -10,6 +10,7 @@ import SwiftUI
 import Carbon.HIToolbox
 import WebKit
 import CryptoKit
+import Network
 
 // MARK: - Version
 
@@ -9355,12 +9356,15 @@ final class OffscreenRenderHost {
 /// enforces the SSRF/scheme policy on the initial request and EVERY redirect.
 ///
 /// SSRF NOTE: the host/IP checks here (and in `WebEngine.guardURL`) classify the
-/// address(es) we resolve via `getaddrinfo`. WebKit resolves independently, so a
-/// hostile DNS server could in principle return a public IP to us and a private
-/// IP to WebKit (DNS-rebinding / TOCTOU). We mitigate by (a) requiring ALL of
-/// our resolved addresses to be public, (b) capping redirects, and (c) re-checking
-/// every redirect AND the final response URL. Full per-socket IP pinning is a
-/// tracked follow-up; until then a residual rebinding risk remains.
+/// address(es) we resolve via `getaddrinfo`. On macOS 14+ the PRIMARY control is
+/// the `PinningProxy`: WebKit routes through our localhost proxy, which resolves
+/// once, validates every address, and dials the exact validated public IP — so
+/// WebKit never resolves the host itself and DNS-rebinding / TOCTOU is closed.
+/// These navigation-delegate checks remain as defense-in-depth (a backstop). On
+/// macOS 13 (no `proxyConfigurations`) they are the only line: we mitigate by
+/// (a) requiring ALL of our resolved addresses to be public, (b) capping
+/// redirects, and (c) re-checking every redirect AND the final response URL —
+/// a residual rebinding risk remains on 13 only.
 @MainActor
 final class NavigationBridge: NSObject, WKNavigationDelegate {
     private var continuation: CheckedContinuation<Void, Error>?
@@ -9541,7 +9545,21 @@ final class RendererPool {
         await semaphore.acquire()
 
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
+        let dataStore = WKWebsiteDataStore.nonPersistent()
+        // PR11: route ALL of this webview's traffic through the in-process
+        // localhost pinning proxy so the IP WebKit connects to is the exact IP
+        // our SafetyGuard validated (closes DNS-rebinding). 14+ only; on 13 we
+        // fall back to the PR6 mitigation (redirect cap + response re-validation).
+        if #available(macOS 14.0, *) {
+            let proxyPort = PinningProxy.shared.startIfNeeded()
+            if proxyPort != 0, let nwPort = NWEndpoint.Port(rawValue: proxyPort) {
+                let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: nwPort)
+                // One config covers both CONNECT (HTTPS) and plain-HTTP loads.
+                let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
+                dataStore.proxyConfigurations = [proxy]
+            }
+        }
+        config.websiteDataStore = dataStore
         let webView = WKWebView(frame: frame, configuration: config)
         webView.customUserAgent = userAgent
 
@@ -9599,9 +9617,27 @@ struct DuckDuckGoProvider: SearchProvider {
     static let maxSearchBytes = 4 * 1024 * 1024
     func isConfigured(keys: [String: String]) -> Bool { true }  // always available
 
+    /// PR11: a URLSession whose traffic is pinned through the localhost proxy on
+    /// macOS 14+, so the search path is rebinding-safe too. On macOS 13 we fall
+    /// back to a plain shared session (PR6 behavior — DDG hosts are public CDNs).
+    static func pinnedSession() -> URLSession {
+        if #available(macOS 14.0, *) {
+            let proxyPort = PinningProxy.shared.startIfNeeded()
+            if proxyPort != 0, let nwPort = NWEndpoint.Port(rawValue: proxyPort) {
+                let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: nwPort)
+                let cfg = URLSessionConfiguration.ephemeral
+                cfg.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: endpoint)]
+                return URLSession(configuration: cfg)
+            }
+        }
+        return URLSession.shared
+    }
+
     func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
         let trimmed = q.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
+
+        let session = Self.pinnedSession()
 
         // Try lite first, then the html endpoint.
         let endpoints = [
@@ -9618,7 +9654,7 @@ struct DuckDuckGoProvider: SearchProvider {
             req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
             req.setValue("text/html", forHTTPHeaderField: "Accept")
             do {
-                let (data, response) = try await URLSession.shared.data(for: req)
+                let (data, response) = try await session.data(for: req)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 // Reject an oversized response up-front (Content-Length) or after read.
                 let declared = (response as? HTTPURLResponse)?.expectedContentLength
@@ -9828,6 +9864,505 @@ actor WebCache {
     }
 }
 
+// =====================================================================
+// MARK: - PinningProxy (PR11: connection-level IP pinning)
+// =====================================================================
+//
+// An in-process forward proxy on 127.0.0.1:<ephemeral>, built on the Network
+// framework. WKWebView (macOS 14+) is configured to send ALL of its traffic
+// here via `WKWebsiteDataStore.proxyConfigurations`. For each connection the
+// proxy:
+//   1. parses the client's first request (CONNECT or absolute-form HTTP),
+//   2. resolves the target host ONCE (getaddrinfo),
+//   3. runs EVERY resolved address through SafetyGuard — rejects if ANY is
+//      private/loopback/metadata (FAIL CLOSED), picks one validated PUBLIC IP,
+//   4. dials that exact IP (never the hostname) and tunnels/forwards bytes.
+//
+// Because we dial the resolved-and-validated IP, WebKit never performs its own
+// DNS resolution → the classic DNS-rebinding / TOCTOU window is closed: the IP
+// the guard approved is the IP the socket connects to.
+//
+// No TLS interception: for CONNECT we blind-tunnel the opaque TLS bytes, so TLS
+// still terminates inside WKWebView exactly as normal (cert validation intact).
+//
+// Sendable note: Network's state/receive handlers are @Sendable. Each connection
+// is its own reference-type `ProxyConnection` whose mutable state is confined to
+// its own serial queue; the handlers capture only `self` (a class ref, which is
+// Sendable here because all access is funnelled onto that queue) — never an
+// outer captured `var`.
+
+/// One in-process forward proxy bound to loopback. Lazily started; thread-safe.
+final class PinningProxy: @unchecked Sendable {
+    static let shared = PinningProxy()
+
+    /// Hard ceiling on simultaneously-tunnelled connections (back-pressure).
+    private static let maxConnections = 16
+    /// Per-leg dial timeout. WebKit retries; we keep this tight.
+    private static let dialTimeoutSeconds: Double = 12
+    /// Cap on a plain-HTTP response body we relay (matches the engine's page cap
+    /// ceiling; CONNECT tunnels are not byte-capped since they're opaque TLS).
+    private static let httpMaxBytes = 16 * 1024 * 1024
+
+    /// Connections run on this concurrent queue. Mutable bookkeeping below is
+    /// guarded by `lock` (a plain lock — NOT a serial queue — so the bind wait
+    /// can't re-enter and deadlock).
+    private let queue = DispatchQueue(label: "com.popdraft.pinningproxy", attributes: .concurrent)
+    private let lock = NSLock()
+    private var listener: NWListener?
+    private var boundPort: UInt16 = 0
+    private var started = false
+    private var active: [ObjectIdentifier: ProxyConnection] = [:]
+    /// Signalled by the listener's `.ready` transition so the first
+    /// `startIfNeeded()` can return a usable port synchronously.
+    private let bindSignal = DispatchSemaphore(value: 0)
+
+    /// True only when the env-gated test hook is set (loopback fixtures allowed).
+    private let allowTestLoopback: Bool
+
+    private init() {
+        self.allowTestLoopback = (SafetyGuard.allowedLoopbackTestPort() != nil)
+    }
+
+    /// Start the listener if not already running; returns the bound loopback port
+    /// (0 if it could not start). Idempotent and synchronous on first call.
+    @discardableResult
+    func startIfNeeded() -> UInt16 {
+        lock.lock()
+        if started {
+            let p = boundPort
+            lock.unlock()
+            return p
+        }
+        started = true
+        lock.unlock()
+
+        do {
+            let params = NWParameters.tcp
+            // Loopback-only: bind explicitly to 127.0.0.1 so nothing off-box can
+            // reach the proxy. Single-user, ephemeral port.
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host("127.0.0.1"), port: .any)
+            params.allowLocalEndpointReuse = true
+            let l = try NWListener(using: params)
+            l.stateUpdateHandler = { [weak self] state in
+                guard let self = self else { return }
+                if case .ready = state, let p = l.port?.rawValue {
+                    self.lock.lock()
+                    let firstReady = (self.boundPort == 0)
+                    self.boundPort = p
+                    self.lock.unlock()
+                    if firstReady { self.bindSignal.signal() }
+                }
+            }
+            l.newConnectionHandler = { [weak self] nwconn in
+                self?.accept(nwconn)
+            }
+            l.start(queue: queue)
+            lock.lock(); self.listener = l; lock.unlock()
+
+            // Wait (bounded) for the listener to bind so callers get a usable port.
+            _ = bindSignal.wait(timeout: .now() + 3.0)
+            lock.lock(); let p = boundPort; lock.unlock()
+            return p
+        } catch {
+            lock.lock(); started = false; lock.unlock()
+            return 0
+        }
+    }
+
+    /// The bound port (0 if not started). For diagnostics.
+    var port: UInt16 { lock.lock(); defer { lock.unlock() }; return boundPort }
+
+    private func accept(_ nwconn: NWConnection) {
+        lock.lock()
+        let shouldDrop = active.count >= Self.maxConnections
+        lock.unlock()
+        if shouldDrop {
+            nwconn.cancel()
+            return
+        }
+        // Each connection gets its OWN serial queue so all of its callbacks —
+        // across BOTH the client and the upstream NWConnection — are mutually
+        // exclusive. (The proxy's `queue` is concurrent; running two different
+        // NWConnections of one tunnel on it could race the connection's mutable
+        // state / teardown.) `target: queue` keeps it on the proxy's thread pool.
+        let connQueue = DispatchQueue(label: "com.popdraft.pinningproxy.conn", target: queue)
+        let conn = ProxyConnection(
+            client: nwconn,
+            queue: connQueue,
+            allowTestLoopback: allowTestLoopback,
+            dialTimeout: Self.dialTimeoutSeconds,
+            httpMaxBytes: Self.httpMaxBytes,
+            onClose: { [weak self] c in
+                guard let self = self else { return }
+                self.lock.lock()
+                self.active.removeValue(forKey: ObjectIdentifier(c))
+                self.lock.unlock()
+            })
+        lock.lock()
+        active[ObjectIdentifier(conn)] = conn
+        lock.unlock()
+        conn.start()
+    }
+}
+
+// MARK: PinningProxy — per-connection handler
+
+/// Handles ONE client connection's lifecycle: read the first request, classify
+/// + pin the target, dial the validated IP, then either blind-tunnel (CONNECT)
+/// or forward+stream (plain HTTP). Self-contained reference type; all mutable
+/// state is touched only on `queue` (the receive/send/state handlers run there).
+private final class ProxyConnection: @unchecked Sendable {
+    private let client: NWConnection
+    private let queue: DispatchQueue
+    private let allowTestLoopback: Bool
+    private let dialTimeout: Double
+    private let httpMaxBytes: Int
+    private let onClose: @Sendable (ProxyConnection) -> Void
+
+    private var upstream: NWConnection?
+    private var requestBuffer = Data()
+    /// Bytes the client pipelined after the request head (e.g. a TLS ClientHello
+    /// sent in the same segment as CONNECT); flushed upstream when the tunnel opens.
+    private var pendingClientBytes = Data()
+    private var closed = false
+    private var relayedBytes = 0
+    private var phase: Phase = .reading
+    /// Guards the upstream `.ready` handler so a duplicate ready transition does
+    /// not re-arm the tunnel/forward. Touched only on `queue`, so safe without a
+    /// captured-var (avoids new SendableClosureCaptures diagnostics).
+    private var upstreamArmed = false
+
+    private enum Phase { case reading, tunneling, forwarding, done }
+
+    init(client: NWConnection,
+         queue: DispatchQueue,
+         allowTestLoopback: Bool,
+         dialTimeout: Double,
+         httpMaxBytes: Int,
+         onClose: @escaping @Sendable (ProxyConnection) -> Void) {
+        self.client = client
+        self.queue = queue
+        self.allowTestLoopback = allowTestLoopback
+        self.dialTimeout = dialTimeout
+        self.httpMaxBytes = httpMaxBytes
+        self.onClose = onClose
+    }
+
+    func start() {
+        client.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.teardown()
+            default:
+                break
+            }
+        }
+        client.start(queue: queue)
+        // Bound the request-head read: a client that opens a socket and never
+        // completes a header (slow-loris) would otherwise hold its `active` slot
+        // forever. If we're still reading after this deadline, tear down.
+        queue.asyncAfter(deadline: .now() + dialTimeout) { [weak self] in
+            guard let self = self else { return }
+            if self.phase == .reading && !self.closed {
+                self.teardown()
+            }
+        }
+        readRequestHeader()
+    }
+
+    // MARK: Read the request head (until CRLFCRLF)
+
+    private func readRequestHeader() {
+        client.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+            if let data = data, !data.isEmpty {
+                self.requestBuffer.append(data)
+                // Guard against an unbounded header (malicious client).
+                if self.requestBuffer.count > 256 * 1024 {
+                    self.rejectAndClose(status: "431 Request Header Fields Too Large")
+                    return
+                }
+                if let headerEnd = self.indexOfHeaderTerminator(self.requestBuffer) {
+                    self.handleRequestHead(headerEndExclusive: headerEnd)
+                    return
+                }
+            }
+            if isComplete || error != nil {
+                self.teardown()
+                return
+            }
+            // Need more bytes for the header.
+            self.readRequestHeader()
+        }
+    }
+
+    /// Returns the index just past the CRLFCRLF (or LFLF) terminator, or nil.
+    private func indexOfHeaderTerminator(_ buf: Data) -> Int? {
+        let crlfcrlf: [UInt8] = [0x0D, 0x0A, 0x0D, 0x0A]
+        let lflf: [UInt8] = [0x0A, 0x0A]
+        let bytes = [UInt8](buf)
+        if let r = firstRange(of: crlfcrlf, in: bytes) { return r + crlfcrlf.count }
+        if let r = firstRange(of: lflf, in: bytes) { return r + lflf.count }
+        return nil
+    }
+
+    private func firstRange(of needle: [UInt8], in haystack: [UInt8]) -> Int? {
+        guard needle.count <= haystack.count else { return nil }
+        let upper = haystack.count - needle.count
+        var i = 0
+        while i <= upper {
+            var j = 0
+            while j < needle.count && haystack[i + j] == needle[j] { j += 1 }
+            if j == needle.count { return i }
+            i += 1
+        }
+        return nil
+    }
+
+    // MARK: Dispatch on the parsed request
+
+    private func handleRequestHead(headerEndExclusive: Int) {
+        let headData = requestBuffer.prefix(headerEndExclusive)
+        let remainder = requestBuffer.suffix(from: headerEndExclusive)   // pipelined body bytes
+        guard let headText = String(data: headData, encoding: .utf8) ?? String(data: headData, encoding: .isoLatin1) else {
+            rejectAndClose(status: "400 Bad Request")
+            return
+        }
+        let lines = headText.replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let requestLine = lines.first, !requestLine.isEmpty else {
+            rejectAndClose(status: "400 Bad Request")
+            return
+        }
+        let headerLines = Array(lines.dropFirst()).filter { !$0.isEmpty }
+
+        // CONNECT (HTTPS tunnel) — the common case.
+        if let target = ProxyParser.parseConnect(requestLine) {
+            // A client may coalesce the TLS ClientHello into the same segment as
+            // the CONNECT head; preserve those bytes to flush upstream once the
+            // tunnel is open (otherwise the handshake stalls until dial timeout).
+            pendingClientBytes = Data(remainder)
+            pinAndConnect(host: target.host, port: target.port)
+            return
+        }
+        // Plain HTTP (absolute-form or origin-form + Host header).
+        let hostHeader = ProxyParser.header("Host", in: headerLines)
+        if let t = ProxyParser.parseHTTP(requestLine: requestLine, hostHeader: hostHeader) {
+            pinAndForwardHTTP(target: t, headerLines: headerLines, pipelinedBody: Data(remainder))
+            return
+        }
+        // Anything else (unknown method / malformed) → refuse.
+        rejectAndClose(status: "405 Method Not Allowed")
+    }
+
+    // MARK: Resolve + pin to a validated public IP
+
+    /// Resolve `host`, run SafetyGuard over every address, and return the picked
+    /// IP to dial — or nil after sending a 403 and closing.
+    private func resolvePinned(host: String) -> String? {
+        let addrs = DNSResolver.resolve(host)
+        let result = SafetyGuard.pinnedAddress(forResolved: addrs, allowTestLoopback: allowTestLoopback)
+        switch result {
+        case .allowed(let ip):
+            return ip
+        case .blocked(let reason):
+            rejectAndClose(status: "403 Forbidden", body: "blocked by SSRF guard: \(host) (\(reason))")
+            return nil
+        }
+    }
+
+    /// Build an NWConnection to a validated IP literal + port.
+    private func dial(ip: String, port: Int) -> NWConnection {
+        let host = NWEndpoint.Host(ip)
+        let nwport = NWEndpoint.Port(rawValue: UInt16(port)) ?? .https
+        return NWConnection(host: host, port: nwport, using: .tcp)
+    }
+
+    // MARK: CONNECT — blind TLS tunnel to the validated IP
+
+    private func pinAndConnect(host: String, port: Int) {
+        guard let ip = resolvePinned(host: host) else { return }
+        let up = dial(ip: ip, port: port)
+        upstream = up
+        up.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                if self.upstreamArmed { return }
+                self.upstreamArmed = true
+                self.onUpstreamConnected_CONNECT()
+            case .failed, .cancelled:
+                self.teardown()
+            default:
+                break
+            }
+        }
+        armDialTimeout(up)
+        up.start(queue: queue)
+    }
+
+    private func onUpstreamConnected_CONNECT() {
+        // Tell the client the tunnel is up, then pump bytes both ways opaquely.
+        let ok = "HTTP/1.1 200 Connection Established\r\n\r\n"
+        client.send(content: Data(ok.utf8), completion: .contentProcessed { [weak self] err in
+            guard let self = self else { return }
+            if err != nil { self.teardown(); return }
+            self.phase = .tunneling
+            // Any bytes the client already sent after the CONNECT head are TLS
+            // ClientHello — they live in requestBuffer beyond the header; flush them.
+            // (We read header up to CRLFCRLF; with CONNECT there is no body, but a
+            // client may pipeline the ClientHello — forward any leftover now.)
+            self.pumpTunnel()
+        })
+    }
+
+    private func pumpTunnel() {
+        guard let up = upstream else { teardown(); return }
+        // Flush any ClientHello bytes the client pipelined with the CONNECT head.
+        if !pendingClientBytes.isEmpty {
+            let pending = pendingClientBytes
+            pendingClientBytes = Data()
+            up.send(content: pending, completion: .contentProcessed { [weak self] err in
+                guard let self = self else { return }
+                if err != nil { self.teardown() }
+            })
+        }
+        relay(from: client, to: up)
+        relay(from: up, to: client)
+    }
+
+    /// Continuously copy bytes from `src` to `dst` until either side closes.
+    private func relay(from src: NWConnection, to dst: NWConnection) {
+        src.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+            if let data = data, !data.isEmpty {
+                dst.send(content: data, completion: .contentProcessed { [weak self] err in
+                    guard let self = self else { return }
+                    if err != nil { self.teardown(); return }
+                    if !isComplete && error == nil {
+                        self.relay(from: src, to: dst)
+                    } else {
+                        self.teardown()
+                    }
+                })
+            } else if isComplete || error != nil {
+                self.teardown()
+            } else {
+                self.relay(from: src, to: dst)
+            }
+        }
+    }
+
+    // MARK: Plain HTTP — forward request, stream response (byte-capped)
+
+    private func pinAndForwardHTTP(target: ProxyParser.HTTPTarget, headerLines: [String], pipelinedBody: Data) {
+        guard let ip = resolvePinned(host: target.host) else { return }
+        let up = dial(ip: ip, port: target.port)
+        upstream = up
+
+        // Rebuild the request in origin-form for the upstream, forcing a correct
+        // Host header and dropping any proxy-only headers.
+        var rebuilt = "\(target.method) \(target.path) \(target.version)\r\n"
+        let portSuffix = (target.port == 80) ? "" : ":\(target.port)"
+        rebuilt += "Host: \(target.host)\(portSuffix)\r\n"
+        for line in headerLines {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[line.startIndex..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            // Skip headers we set ourselves or that are proxy-hop-only.
+            if key == "host" || key == "proxy-connection" || key == "connection" { continue }
+            rebuilt += line + "\r\n"
+        }
+        rebuilt += "Connection: close\r\n\r\n"
+        var outbound = Data(rebuilt.utf8)
+        outbound.append(pipelinedBody)
+        let requestBytes = outbound
+
+        up.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                if self.upstreamArmed { return }
+                self.upstreamArmed = true
+                self.onUpstreamConnected_HTTP(sending: requestBytes)
+            case .failed, .cancelled:
+                self.teardown()
+            default:
+                break
+            }
+        }
+        armDialTimeout(up)
+        up.start(queue: queue)
+    }
+
+    private func onUpstreamConnected_HTTP(sending requestBytes: Data) {
+        guard let up = upstream else { teardown(); return }
+        self.phase = .forwarding
+        up.send(content: requestBytes, completion: .contentProcessed { [weak self] err in
+            guard let self = self else { return }
+            if err != nil { self.teardown(); return }
+            // Stream the upstream response straight back to the client, capped.
+            self.streamResponse(from: up)
+        })
+    }
+
+    private func streamResponse(from up: NWConnection) {
+        up.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+            if let data = data, !data.isEmpty {
+                self.relayedBytes += data.count
+                if self.relayedBytes > self.httpMaxBytes {
+                    self.teardown()
+                    return
+                }
+                self.client.send(content: data, completion: .contentProcessed { [weak self] err in
+                    guard let self = self else { return }
+                    if err != nil { self.teardown(); return }
+                    if !isComplete && error == nil {
+                        self.streamResponse(from: up)
+                    } else {
+                        self.teardown()
+                    }
+                })
+            } else if isComplete || error != nil {
+                self.teardown()
+            } else {
+                self.streamResponse(from: up)
+            }
+        }
+    }
+
+    // MARK: Helpers
+
+    private func armDialTimeout(_ up: NWConnection) {
+        let deadline = DispatchTime.now() + dialTimeout
+        queue.asyncAfter(deadline: deadline) { [weak self, weak up] in
+            guard let self = self, let up = up else { return }
+            if up.state != .ready && !self.closed {
+                self.teardown()
+            }
+        }
+    }
+
+    private func rejectAndClose(status: String, body: String? = nil) {
+        let payload = body ?? ""
+        let resp = "HTTP/1.1 \(status)\r\nContent-Length: \(payload.utf8.count)\r\nConnection: close\r\n\r\n\(payload)"
+        client.send(content: Data(resp.utf8), completion: .contentProcessed { [weak self] _ in
+            self?.teardown()
+        })
+    }
+
+    private func teardown() {
+        if closed { return }
+        closed = true
+        phase = .done
+        upstream?.cancel()
+        upstream = nil
+        client.cancel()
+        onClose(self)
+    }
+}
+
 // MARK: - WebEngine (public async API)
 
 /// The public façade. Owns the renderer pool, search router, content blocker,
@@ -9864,8 +10399,13 @@ final class WebEngine {
     }
 
     /// Compile content-blocking rules at startup (call once from AppDelegate).
+    /// Also primes the PR11 pinning proxy (14+) so the first navigation doesn't
+    /// pay the bind latency.
     func warmUp() async {
         await ContentBlocker.shared.compileIfNeeded()
+        if #available(macOS 14.0, *) {
+            _ = PinningProxy.shared.startIfNeeded()
+        }
     }
 
     // MARK: SSRF gate
