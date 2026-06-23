@@ -784,3 +784,241 @@ extension Int64 {
         return String(format: "%.1f %@", value, units[idx])
     }
 }
+
+// MARK: - Chat session model (PR5)
+//
+// These types map 1:1 to OpenAI chat-completions `messages` / `tool_calls` /
+// `role:"tool"` so a saved session can be replayed straight into the agent loop
+// (PR7) and rendered in the chat UI (PR8). They are pure value types — Foundation
+// only — and decode forward-compatibly (every field uses `decodeIfPresent` + a
+// default) so a session written by a newer build still loads in an older one.
+
+/// One OpenAI-style tool call requested by the assistant. No execution here — just
+/// the shape, so a session that already used tools can round-trip on disk.
+struct ChatToolCall: Codable, Equatable {
+    var id: String
+    var name: String
+    var arguments: String   // raw JSON string, OpenAI-style (may be `{}` or `""`)
+
+    init(id: String, name: String, arguments: String) {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        arguments = try c.decodeIfPresent(String.self, forKey: .arguments) ?? ""
+    }
+}
+
+/// One message in a chat session. Maps to an OpenAI `messages[]` entry:
+///  - `role`     — "system" / "user" / "assistant" / "tool"
+///  - `toolCalls`  — set on an assistant turn that requested tools
+///  - `toolCallId` — set on a "tool" role message answering a specific call
+///  - `thinking`   — optional captured reasoning (rendered collapsed in the UI)
+struct ChatMessage: Codable, Equatable {
+    var id: String
+    var role: String
+    var content: String
+    var toolCalls: [ChatToolCall]?
+    var toolCallId: String?
+    var thinking: String?
+    var createdAt: Double   // epoch seconds
+
+    init(
+        id: String = UUID().uuidString,
+        role: String,
+        content: String,
+        toolCalls: [ChatToolCall]? = nil,
+        toolCallId: String? = nil,
+        thinking: String? = nil,
+        createdAt: Double = Date().timeIntervalSince1970
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.toolCalls = toolCalls
+        self.toolCallId = toolCallId
+        self.thinking = thinking
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? "user"
+        content = try c.decodeIfPresent(String.self, forKey: .content) ?? ""
+        toolCalls = try c.decodeIfPresent([ChatToolCall].self, forKey: .toolCalls)
+        toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
+        thinking = try c.decodeIfPresent(String.self, forKey: .thinking)
+        createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? 0
+    }
+}
+
+/// A persisted conversation. Every PopDraft invocation becomes one of these — a
+/// captured selection plus the resulting exchange — which can later be reopened
+/// and continued as a chat.
+struct ChatSession: Codable, Equatable {
+    var id: String
+    var title: String
+    var createdAt: Double
+    var updatedAt: Double
+    var model: String?
+    var selectedText: String?
+    var messages: [ChatMessage]
+
+    init(
+        id: String = UUID().uuidString,
+        title: String = "",
+        createdAt: Double = Date().timeIntervalSince1970,
+        updatedAt: Double = Date().timeIntervalSince1970,
+        model: String? = nil,
+        selectedText: String? = nil,
+        messages: [ChatMessage] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.model = model
+        self.selectedText = selectedText
+        self.messages = messages
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let now = Date().timeIntervalSince1970
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? now
+        updatedAt = try c.decodeIfPresent(Double.self, forKey: .updatedAt) ?? createdAt
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        selectedText = try c.decodeIfPresent(String.self, forKey: .selectedText)
+        messages = try c.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+    }
+
+    /// Derive a short, single-line, ~40-char title from the first user message
+    /// (or the captured selection), falling back to a timestamp-based title.
+    static func deriveTitle(
+        firstUserMessage: String?,
+        selectedText: String?,
+        createdAt: Double = Date().timeIntervalSince1970,
+        maxLength: Int = 40
+    ) -> String {
+        let candidates = [firstUserMessage, selectedText]
+        for raw in candidates {
+            guard let raw = raw else { continue }
+            let oneLine = raw
+                .replacingOccurrences(of: "\r", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+            // Collapse runs of whitespace to single spaces.
+            let collapsed = oneLine.split(whereSeparator: { $0 == " " }).joined(separator: " ")
+            let trimmed = collapsed.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            if trimmed.count <= maxLength { return trimmed }
+            let end = trimmed.index(trimmed.startIndex, offsetBy: maxLength)
+            return String(trimmed[..<end]).trimmingCharacters(in: .whitespaces) + "…"
+        }
+        // Fallback: timestamp-based title.
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, h:mm a"
+        return "Chat \(formatter.string(from: Date(timeIntervalSince1970: createdAt)))"
+    }
+
+    /// Recompute `title` from the session's own first user message / selectedText.
+    mutating func refreshTitle() {
+        let firstUser = messages.first(where: { $0.role == "user" })?.content
+        title = ChatSession.deriveTitle(
+            firstUserMessage: firstUser,
+            selectedText: selectedText,
+            createdAt: createdAt
+        )
+    }
+
+    /// True when the session has something worth saving: at least one user turn
+    /// AND one non-empty assistant turn. Empty / aborted sessions return false.
+    var hasMeaningfulExchange: Bool {
+        let hasUser = messages.contains { $0.role == "user" }
+        let hasAssistant = messages.contains {
+            $0.role == "assistant" && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return hasUser && hasAssistant
+    }
+}
+
+// MARK: - Session summary (lightweight listing)
+
+/// A lightweight view of a session for menus/lists — avoids decoding every
+/// message just to show a title.
+struct SessionSummary: Codable, Equatable {
+    var id: String
+    var title: String
+    var updatedAt: Double
+}
+
+// MARK: - Session persistence
+
+/// Persists `ChatSession`s as one pretty-printed `<id>.json` per session under
+/// `<dir>/sessions/` (default `~/.popdraft/sessions/`). `dir` is injectable so
+/// tests can point it at a temp directory. Foundation only — fully unit-tested.
+struct SessionStore {
+    /// The PARENT directory (e.g. `~/.popdraft`). Sessions live in `<dir>/sessions/`.
+    let dir: String
+
+    init(dir: String) {
+        self.dir = dir
+    }
+
+    /// The `<dir>/sessions/` directory where the per-session JSON files live.
+    var sessionsDir: String {
+        return (dir as NSString).appendingPathComponent("sessions")
+    }
+
+    private func path(for id: String) -> String {
+        return (sessionsDir as NSString).appendingPathComponent("\(id).json")
+    }
+
+    /// Write a session to `<dir>/sessions/<id>.json` (pretty-printed, atomic).
+    @discardableResult
+    func save(_ session: ChatSession) -> Bool {
+        try? FileManager.default.createDirectory(atPath: sessionsDir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(session) else { return false }
+        return (try? data.write(to: URL(fileURLWithPath: path(for: session.id)), options: .atomic)) != nil
+    }
+
+    /// Load a single session by id, or nil if missing / unreadable / corrupt.
+    func load(id: String) -> ChatSession? {
+        guard let data = FileManager.default.contents(atPath: path(for: id)) else { return nil }
+        return try? JSONDecoder().decode(ChatSession.self, from: data)
+    }
+
+    /// List all sessions as lightweight summaries, sorted by `updatedAt` descending.
+    /// Tolerates unreadable / corrupt files (they're skipped, never crash).
+    func list() -> [SessionSummary] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: sessionsDir) else {
+            return []
+        }
+        var summaries: [SessionSummary] = []
+        for name in names where name.hasSuffix(".json") {
+            let full = (sessionsDir as NSString).appendingPathComponent(name)
+            guard let data = FileManager.default.contents(atPath: full),
+                  let session = try? JSONDecoder().decode(ChatSession.self, from: data) else {
+                continue
+            }
+            summaries.append(SessionSummary(id: session.id, title: session.title, updatedAt: session.updatedAt))
+        }
+        return summaries.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Delete a session file by id. No-op if it doesn't exist.
+    @discardableResult
+    func delete(id: String) -> Bool {
+        return (try? FileManager.default.removeItem(atPath: path(for: id))) != nil
+    }
+}
