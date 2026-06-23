@@ -1743,3 +1743,645 @@ enum WebToolSchemas {
     /// All schemas, in registration order.
     static let all: [String] = [webSearch, webOpen, webRead, webScreenshot, webExtract]
 }
+
+// =====================================================================
+// MARK: - PR7: Agent engine (pure, Foundation-only)
+//
+// The tool-calling agent loop. Everything below is Foundation-only (NO
+// AppKit / WebKit / network) so it is unit-tested by
+// `tests/test-agentloop.swift` + `tests/test-toolrunner.swift` with
+// injected canned model turns and stub tools.
+//
+//   - `ToolArgs`        — tolerant arguments parser (object OR JSON string).
+//   - `ToolSpec`        — name/description/JSON-schema for one tool.
+//   - `ParsedToolCall`  — one tool call requested by the model.
+//   - `ToolResult`      — the (possibly-error) result of running one call.
+//   - `AgentTool`       — protocol a concrete tool implements.
+//   - `ToolRegistry`    — actor holding tools; emits the OpenAI `tools` array.
+//   - `ToolRunner`      — parallel `withTaskGroup` runner (cap + timeout +
+//                         partial-failure + deterministic re-assembly).
+//   - `AgentLoop`       — the orchestrator over an injected model `call`.
+//
+// The WebKit-backed tools and the real model `call` live in PopDraft.swift
+// and plug into these via the `AgentTool` protocol and the injected closure.
+// =====================================================================
+
+// MARK: - JSONObject (Sendable box for arbitrary JSON dictionaries)
+
+/// An immutable, `Sendable` wrapper around a `[String: Any]` JSON object.
+///
+/// Swift's `[String: Any]` is not `Sendable`, so it can't cross an actor or be
+/// captured in a `@Sendable` closure under `-strict-concurrency=complete` (a hard
+/// error in the Swift 6 language mode the CI compiles with). We only ever pass
+/// JSON we just produced and never mutate after construction, so wrapping it as
+/// an immutable snapshot is sound — hence `@unchecked Sendable`. Callers read the
+/// dictionary back through `.dictionary`.
+struct JSONObject: @unchecked Sendable {
+    let dictionary: [String: Any]
+    init(_ dictionary: [String: Any]) { self.dictionary = dictionary }
+}
+
+/// A `Sendable` box for a JSON value that may be a String OR an object OR nil —
+/// exactly the `arguments` shapes a tool call carries. Lets `ParsedToolCall`
+/// (and the closures that capture it) be `Sendable`.
+struct JSONArgs: @unchecked Sendable {
+    let raw: Any?
+    init(_ raw: Any?) { self.raw = raw }
+}
+
+// MARK: - ToolArgs (object-or-string argument parsing)
+
+/// Parses the `arguments` field of a tool call into a `[String: Any]` dictionary.
+///
+/// This is the #1 llama.cpp quirk: depending on the served chat template, the
+/// `arguments` come back as EITHER a JSON **string** (`"{\"q\":\"x\"}"`, the
+/// OpenAI spec shape) OR an already-decoded JSON **object**. We tolerate both,
+/// plus the empty / whitespace case (→ `{}`), and surface a clear error on
+/// genuinely malformed JSON so the loop can answer the model with an error tool
+/// message instead of crashing.
+enum ToolArgs {
+    enum ParseError: Error, Equatable, CustomStringConvertible {
+        case notAnObject       // valid JSON, but not a `{...}` object
+        case malformed(String) // not valid JSON at all
+
+        var description: String {
+            switch self {
+            case .notAnObject: return "tool arguments are not a JSON object"
+            case .malformed(let m): return "malformed tool arguments JSON: \(m)"
+            }
+        }
+    }
+
+    /// Parse a raw `arguments` value. `raw` may be:
+    ///   - `nil` / `NSNull`               → `[:]`
+    ///   - a `String`  (possibly `""`)    → JSON-decode (empty → `[:]`)
+    ///   - a `[String: Any]`              → returned as-is
+    ///   - any other JSON-encodable value → `.notAnObject`
+    static func parse(_ raw: Any?) throws -> [String: Any] {
+        guard let raw = raw, !(raw is NSNull) else { return [:] }
+
+        // Already an object (llama.cpp decoded-object shape).
+        if let dict = raw as? [String: Any] { return dict }
+
+        // A JSON string (OpenAI spec shape).
+        if let str = raw as? String {
+            let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return [:] }
+            guard let data = trimmed.data(using: .utf8) else {
+                throw ParseError.malformed("not utf-8")
+            }
+            let obj: Any
+            do {
+                obj = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            } catch {
+                throw ParseError.malformed(error.localizedDescription)
+            }
+            if let dict = obj as? [String: Any] { return dict }
+            throw ParseError.notAnObject
+        }
+
+        // Some other already-decoded value (array, number, bool) — not an object.
+        throw ParseError.notAnObject
+    }
+}
+
+// MARK: - Tool value types
+
+/// A tool's OpenAI-style specification. `parametersSchema` is the JSON-Schema
+/// `parameters` object (the inner schema, not the full function wrapper).
+struct ToolSpec: Equatable {
+    var name: String
+    var description: String
+    var parametersSchema: [String: Any]
+
+    init(name: String, description: String, parametersSchema: [String: Any] = ["type": "object", "properties": [String: Any]()]) {
+        self.name = name
+        self.description = description
+        self.parametersSchema = parametersSchema
+    }
+
+    /// The full OpenAI function-tool dictionary for the `tools` array.
+    var openAIToolDict: [String: Any] {
+        return [
+            "type": "function",
+            "function": [
+                "name": name,
+                "description": description,
+                "parameters": parametersSchema,
+            ],
+        ]
+    }
+
+    /// A `Sendable`-boxed copy of `openAIToolDict` (crosses the actor boundary).
+    var openAIToolBox: JSONObject { JSONObject(openAIToolDict) }
+
+    // [String: Any] isn't auto-Equatable; compare via name + a JSON encoding of
+    // the schema (stable enough for tests / dedupe).
+    static func == (lhs: ToolSpec, rhs: ToolSpec) -> Bool {
+        guard lhs.name == rhs.name, lhs.description == rhs.description else { return false }
+        return JSONSchema.canonical(lhs.parametersSchema) == JSONSchema.canonical(rhs.parametersSchema)
+    }
+
+    /// Build a `ToolSpec` from one of the JSON-string schemas in `WebToolSchemas`.
+    /// Returns nil if the JSON doesn't carry a `function.name`.
+    static func fromOpenAIJSON(_ json: String) -> ToolSpec? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let fn = obj["function"] as? [String: Any],
+              let name = fn["name"] as? String else {
+            return nil
+        }
+        let desc = fn["description"] as? String ?? ""
+        let params = fn["parameters"] as? [String: Any] ?? ["type": "object"]
+        return ToolSpec(name: name, description: desc, parametersSchema: params)
+    }
+}
+
+/// One tool call requested by the assistant, as parsed from a model response.
+/// `rawArguments` is the untouched `arguments` value (String OR object) so the
+/// loop can run `ToolArgs.parse` + schema-validate at the right moment.
+struct ParsedToolCall: Sendable {
+    var id: String
+    var name: String
+    /// The untouched `arguments` value (String OR object OR nil), `Sendable`-boxed.
+    var args: JSONArgs
+
+    var rawArguments: Any? { args.raw }
+
+    init(id: String, name: String, rawArguments: Any? = nil) {
+        self.id = id
+        self.name = name
+        self.args = JSONArgs(rawArguments)
+    }
+
+    /// The arguments as a raw JSON string, for persisting into a `ChatToolCall`.
+    /// An object is re-encoded; a string is passed through; nil → "{}".
+    var argumentsJSONString: String {
+        if let s = args.raw as? String { return s }
+        if let raw = args.raw, !(raw is NSNull),
+           let data = try? JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys]),
+           let s = String(data: data, encoding: .utf8) {
+            return s
+        }
+        return "{}"
+    }
+}
+
+/// The result of running one tool call. `isError` marks a failure (throw,
+/// timeout, unknown tool, invalid args) that is reported back to the model as a
+/// `role:"tool"` message WITHOUT tearing down the turn.
+struct ToolResult: Equatable {
+    var toolCallId: String
+    var name: String
+    var content: String
+    var isError: Bool
+
+    init(toolCallId: String, name: String, content: String, isError: Bool = false) {
+        self.toolCallId = toolCallId
+        self.name = name
+        self.content = content
+        self.isError = isError
+    }
+}
+
+// MARK: - AgentTool protocol
+
+/// A tool the agent can call. `invoke` receives already-parsed, schema-validated
+/// arguments and returns a compact string the model will read. Throwing is fine
+/// — `ToolRunner` converts a throw into an `isError` `ToolResult`.
+protocol AgentTool: Sendable {
+    var spec: ToolSpec { get }
+    /// Invoke the tool with already-parsed, schema-validated arguments. The args
+    /// arrive `Sendable`-boxed; read them via `args.dictionary`.
+    func invoke(_ args: JSONObject) async throws -> String
+}
+
+// MARK: - ToolRegistry
+
+/// Holds the set of available tools and emits the OpenAI `tools` array. An actor
+/// so registration / lookup is safe across the concurrent `ToolRunner`.
+actor ToolRegistry {
+    private var tools: [String: any AgentTool] = [:]
+    private var order: [String] = []
+
+    init() {}
+
+    /// Register (or replace) a tool. Registration order is preserved for
+    /// `openAITools()` so the `tools` array is deterministic.
+    func register(_ tool: any AgentTool) {
+        let name = tool.spec.name
+        if tools[name] == nil { order.append(name) }
+        tools[name] = tool
+    }
+
+    func register(_ newTools: [any AgentTool]) {
+        for t in newTools { register(t) }
+    }
+
+    /// Look up a tool by name.
+    func tool(named name: String) -> (any AgentTool)? {
+        return tools[name]
+    }
+
+    /// All registered tool names, in registration order.
+    func names() -> [String] {
+        return order
+    }
+
+    var count: Int { tools.count }
+
+    /// The OpenAI `tools` array (one function-tool dict per registered tool),
+    /// in registration order. Each entry is `Sendable`-boxed so the array can
+    /// cross back to a nonisolated context.
+    func openAITools() -> [JSONObject] {
+        return order.compactMap { tools[$0]?.spec.openAIToolBox }
+    }
+}
+
+/// Unwrap a boxed tools array back into plain `[[String: Any]]` for request
+/// bodies. Safe to call once the boxes are back on a single task.
+func unboxTools(_ boxed: [JSONObject]) -> [[String: Any]] {
+    return boxed.map { $0.dictionary }
+}
+
+// MARK: - Timeout helper
+
+/// Errors raised by the agent runtime.
+enum AgentError: Error, Equatable, CustomStringConvertible {
+    case timeout
+    case unknownTool(String)
+    case maxIterationsReached(Int)
+
+    var description: String {
+        switch self {
+        case .timeout: return "tool timed out"
+        case .unknownTool(let n): return "unknown tool: \(n)"
+        case .maxIterationsReached(let n): return "agent stopped after \(n) iterations"
+        }
+    }
+}
+
+/// Run `operation`, cancelling it and throwing `AgentError.timeout` if it does
+/// not finish within `milliseconds`. Implemented by racing the operation against
+/// a `Task.sleep` in a task group; whichever wins cancels the other.
+func withThrowingTimeout<T: Sendable>(
+    milliseconds: Int,
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    // A non-positive timeout means "no timeout".
+    if milliseconds <= 0 {
+        return try await operation()
+    }
+    return try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+            throw AgentError.timeout
+        }
+        // First task to finish wins; cancel the rest.
+        guard let result = try await group.next() else {
+            throw AgentError.timeout
+        }
+        group.cancelAll()
+        return result
+    }
+}
+
+// MARK: - ToolRunner (parallel, capped, timed, deterministic)
+
+/// Runs a batch of tool calls concurrently with:
+///   - a global concurrency cap (peak in-flight ≤ cap),
+///   - a per-tool timeout (→ `.timeout` `isError` result),
+///   - partial failure (a throw / timeout / unknown tool is isolated to that
+///     one result — the batch always completes),
+///   - deterministic re-assembly (results returned in the SAME order as the
+///     input `calls`, keyed by `tool_call_id`).
+struct ToolRunner {
+    /// Max concurrent tool invocations. Clamped to >= 1.
+    var maxConcurrent: Int
+    /// Per-tool timeout in milliseconds (<= 0 disables it).
+    var perToolTimeoutMs: Int
+
+    init(maxConcurrent: Int = 4, perToolTimeoutMs: Int = 30_000) {
+        self.maxConcurrent = max(1, maxConcurrent)
+        self.perToolTimeoutMs = perToolTimeoutMs
+    }
+
+    /// Run `calls` against `registry`, returning one `ToolResult` per call in the
+    /// SAME order as `calls`. Never throws — failures become `isError` results.
+    func run(_ calls: [ParsedToolCall], registry: ToolRegistry) async -> [ToolResult] {
+        if calls.isEmpty { return [] }
+
+        let cap = max(1, maxConcurrent)
+        let timeoutMs = perToolTimeoutMs
+
+        // Each unit of work returns (index, ToolResult) so we can re-assemble in
+        // input order regardless of completion order.
+        let results: [(Int, ToolResult)] = await withTaskGroup(of: (Int, ToolResult).self) { group in
+            var collected: [(Int, ToolResult)] = []
+            collected.reserveCapacity(calls.count)
+            var nextIndex = 0
+
+            // Prime the group up to the cap.
+            let initial = min(cap, calls.count)
+            while nextIndex < initial {
+                let idx = nextIndex
+                let call = calls[idx]
+                group.addTask {
+                    let r = await ToolRunner.runOne(call, registry: registry, timeoutMs: timeoutMs)
+                    return (idx, r)
+                }
+                nextIndex += 1
+            }
+
+            // As each finishes, enqueue the next — keeping in-flight ≤ cap.
+            while let finished = await group.next() {
+                collected.append(finished)
+                if nextIndex < calls.count {
+                    let idx = nextIndex
+                    let call = calls[idx]
+                    group.addTask {
+                        let r = await ToolRunner.runOne(call, registry: registry, timeoutMs: timeoutMs)
+                        return (idx, r)
+                    }
+                    nextIndex += 1
+                }
+            }
+            return collected
+        }
+
+        // Deterministic re-assembly: sort by original index.
+        return results.sorted { $0.0 < $1.0 }.map { $0.1 }
+    }
+
+    /// Run a single call, converting every failure mode into an `isError` result.
+    private static func runOne(_ call: ParsedToolCall, registry: ToolRegistry, timeoutMs: Int) async -> ToolResult {
+        guard let tool = await registry.tool(named: call.name) else {
+            return ToolResult(toolCallId: call.id, name: call.name,
+                              content: "Error: \(AgentError.unknownTool(call.name).description)", isError: true)
+        }
+
+        // Parse arguments tolerantly (object-or-string), then box for Sendable.
+        let argsBox: JSONObject
+        do {
+            argsBox = JSONObject(try ToolArgs.parse(call.rawArguments))
+        } catch {
+            return ToolResult(toolCallId: call.id, name: call.name,
+                              content: "Error parsing arguments: \(error)", isError: true)
+        }
+
+        do {
+            let content = try await withThrowingTimeout(milliseconds: timeoutMs) {
+                try await tool.invoke(argsBox)
+            }
+            return ToolResult(toolCallId: call.id, name: call.name, content: content, isError: false)
+        } catch is CancellationError {
+            return ToolResult(toolCallId: call.id, name: call.name,
+                              content: "Error: tool cancelled", isError: true)
+        } catch let e as AgentError where e == .timeout {
+            return ToolResult(toolCallId: call.id, name: call.name,
+                              content: "Error: tool timed out after \(timeoutMs) ms", isError: true)
+        } catch {
+            return ToolResult(toolCallId: call.id, name: call.name,
+                              content: "Error: \(error)", isError: true)
+        }
+    }
+}
+
+// MARK: - AssistantTurn (one decoded model turn)
+
+/// One assistant turn returned by the injected model `call`. Either it asks for
+/// tools (`toolCalls` non-empty) or it answers (`content`). `thinking` carries
+/// optional captured reasoning.
+struct AssistantTurn {
+    var content: String?
+    var toolCalls: [ParsedToolCall]
+    var thinking: String?
+
+    init(content: String? = nil, toolCalls: [ParsedToolCall] = [], thinking: String? = nil) {
+        self.content = content
+        self.toolCalls = toolCalls
+        self.thinking = thinking
+    }
+}
+
+// MARK: - JSON-Schema (minimal validator)
+
+/// A tiny, dependency-free JSON-Schema validator — just enough to catch the
+/// argument mistakes a small local model actually makes (missing `required`
+/// fields, wrong primitive types). On invalid args the loop appends an `isError`
+/// tool message so the model can retry, rather than crashing.
+enum JSONSchema {
+    /// Validate `args` against a tool's `parametersSchema`. Returns nil if valid,
+    /// or a short human-readable error string if not. Unknown/loose schemas pass.
+    static func validate(_ args: [String: Any], schema: [String: Any]) -> String? {
+        // Only object schemas are validated; anything else is treated as permissive.
+        let type = schema["type"] as? String
+        if let type = type, type != "object" { return nil }
+
+        let properties = schema["properties"] as? [String: Any] ?? [:]
+        let required = schema["required"] as? [String] ?? []
+
+        // Required-field presence.
+        for key in required {
+            if args[key] == nil || args[key] is NSNull {
+                return "missing required argument: \(key)"
+            }
+        }
+
+        // Primitive type checks for present, known properties.
+        for (key, value) in args {
+            guard let propSchema = properties[key] as? [String: Any],
+                  let expected = propSchema["type"] as? String else { continue }
+            if value is NSNull { continue }
+            if let mismatch = typeError(key: key, value: value, expected: expected) {
+                return mismatch
+            }
+        }
+        return nil
+    }
+
+    private static func typeError(key: String, value: Any, expected: String) -> String? {
+        switch expected {
+        case "string":
+            if !(value is String) { return "argument '\(key)' must be a string" }
+        case "integer":
+            // Accept any number that is integral; JSON has no separate int type.
+            if let n = value as? NSNumber {
+                if !isIntegral(n) { return "argument '\(key)' must be an integer" }
+            } else if value is Bool {
+                return "argument '\(key)' must be an integer"
+            } else if !(value is Int) {
+                return "argument '\(key)' must be an integer"
+            }
+        case "number":
+            if value is Bool { return "argument '\(key)' must be a number" }
+            if !(value is NSNumber) && !(value is Int) && !(value is Double) {
+                return "argument '\(key)' must be a number"
+            }
+        case "boolean":
+            // NSNumber bridges bools; require the underlying type to be Bool.
+            if let n = value as? NSNumber {
+                if !isBool(n) { return "argument '\(key)' must be a boolean" }
+            } else if !(value is Bool) {
+                return "argument '\(key)' must be a boolean"
+            }
+        case "array":
+            if !(value is [Any]) { return "argument '\(key)' must be an array" }
+        case "object":
+            if !(value is [String: Any]) { return "argument '\(key)' must be an object" }
+        default:
+            break
+        }
+        return nil
+    }
+
+    private static func isBool(_ n: NSNumber) -> Bool {
+        // Objective-C bools are tagged with the bool obj-c type encoding.
+        return CFGetTypeID(n) == CFBooleanGetTypeID()
+    }
+
+    private static func isIntegral(_ n: NSNumber) -> Bool {
+        if isBool(n) { return false }
+        let d = n.doubleValue
+        return d.truncatingRemainder(dividingBy: 1) == 0
+    }
+
+    /// A stable canonical JSON string for a `[String: Any]` (sorted keys), used
+    /// only for `ToolSpec` equality / dedupe. Best-effort: unencodable → "".
+    static func canonical(_ obj: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(obj),
+              let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+              let s = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return s
+    }
+}
+
+// MARK: - AgentLoop (orchestrator)
+
+/// The tool-calling agent loop. `call` is INJECTED so tests can stub the model:
+/// it takes the current messages + the OpenAI `tools` array and returns one
+/// `AssistantTurn`. The loop:
+///   1. asks the model,
+///   2. if it requested tools: append the assistant message, schema-validate +
+///      run each call (in parallel via `ToolRunner`), append one `role:"tool"`
+///      message per `tool_call_id`, and loop,
+///   3. else: append the final assistant message and return.
+/// Bounded by `maxIterations`.
+struct AgentLoop {
+    /// The injected model call: (messages, toolsJSON) -> one assistant turn.
+    /// `toolsJSON` arrives `Sendable`-boxed; unwrap with `unboxTools(_:)`.
+    typealias ModelCall = @Sendable ([ChatMessage], [JSONObject]) async throws -> AssistantTurn
+
+    var maxIterations: Int
+    var runner: ToolRunner
+
+    init(maxIterations: Int = 6, runner: ToolRunner = ToolRunner()) {
+        self.maxIterations = max(1, maxIterations)
+        self.runner = runner
+    }
+
+    /// The outcome of a loop run.
+    struct Outcome {
+        var session: ChatSession      // messages appended (assistant + tool turns)
+        var finalText: String         // the final assistant answer (may be "")
+        var iterations: Int           // how many model calls were made
+        var stoppedAtMax: Bool        // true if the iteration cap halted a tool loop
+    }
+
+    /// Run the loop. `registry` supplies tools + the `tools` array; `call` is the
+    /// (stubbed-in-tests) model. The returned `ChatSession` has all assistant and
+    /// tool messages appended.
+    func run(session: ChatSession, registry: ToolRegistry, call: ModelCall) async throws -> Outcome {
+        var working = session
+        let toolsJSON = await registry.openAITools()
+        var lastText = ""
+        var iterations = 0
+
+        while iterations < maxIterations {
+            iterations += 1
+            let turn = try await call(working.messages, toolsJSON)
+
+            // No tools requested → final answer.
+            if turn.toolCalls.isEmpty {
+                let text = turn.content ?? ""
+                lastText = text
+                working.messages.append(ChatMessage(
+                    role: "assistant", content: text, thinking: turn.thinking))
+                working.updatedAt = Date().timeIntervalSince1970
+                return Outcome(session: working, finalText: text,
+                               iterations: iterations, stoppedAtMax: false)
+            }
+
+            // Tools requested → record the assistant turn (with its tool_calls).
+            let toolCalls = turn.toolCalls.map {
+                ChatToolCall(id: $0.id, name: $0.name, arguments: $0.argumentsJSONString)
+            }
+            working.messages.append(ChatMessage(
+                role: "assistant",
+                content: turn.content ?? "",
+                toolCalls: toolCalls,
+                thinking: turn.thinking))
+
+            // Schema-validate each call. Invalid ones get an isError tool message
+            // (the model can retry) and are NOT dispatched to the runner.
+            var toRun: [ParsedToolCall] = []
+            var preErrors: [ToolResult] = []
+            for pc in turn.toolCalls {
+                let tool = await registry.tool(named: pc.name)
+                guard let tool = tool else {
+                    // Unknown tool: let the runner produce the canonical unknown-tool error.
+                    toRun.append(pc)
+                    continue
+                }
+                // Parse + validate arguments here so invalid args short-circuit.
+                let parsed: [String: Any]
+                do {
+                    parsed = try ToolArgs.parse(pc.rawArguments)
+                } catch {
+                    preErrors.append(ToolResult(
+                        toolCallId: pc.id, name: pc.name,
+                        content: "Error parsing arguments: \(error)", isError: true))
+                    continue
+                }
+                if let err = JSONSchema.validate(parsed, schema: tool.spec.parametersSchema) {
+                    preErrors.append(ToolResult(
+                        toolCallId: pc.id, name: pc.name,
+                        content: "Error: invalid arguments — \(err)", isError: true))
+                    continue
+                }
+                toRun.append(pc)
+            }
+
+            // Run the valid calls in parallel.
+            let ranResults = await runner.run(toRun, registry: registry)
+
+            // Merge pre-errors + ran results back into INPUT order by tool_call_id.
+            var byId: [String: ToolResult] = [:]
+            for r in preErrors { byId[r.toolCallId] = r }
+            for r in ranResults { byId[r.toolCallId] = r }
+
+            for pc in turn.toolCalls {
+                let result = byId[pc.id] ?? ToolResult(
+                    toolCallId: pc.id, name: pc.name,
+                    content: "Error: no result produced", isError: true)
+                working.messages.append(ChatMessage(
+                    role: "tool",
+                    content: result.content,
+                    toolCallId: result.toolCallId))
+            }
+
+            // Keep the partial assistant text (if any) as the latest answer.
+            if let c = turn.content, !c.isEmpty { lastText = c }
+            working.updatedAt = Date().timeIntervalSince1970
+            // …loop: ask the model again with the tool results in context.
+        }
+
+        // Iteration cap hit while still in a tool loop. Return whatever text we have.
+        working.updatedAt = Date().timeIntervalSince1970
+        return Outcome(session: working, finalText: lastText,
+                       iterations: iterations, stoppedAtMax: true)
+    }
+}
