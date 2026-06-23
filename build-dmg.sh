@@ -83,6 +83,10 @@ cp "${SCRIPT_DIR}/install.sh" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/uninstall.sh" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/README.md" "${APP_BUNDLE}/Contents/Resources/"
 
+# Copy bespoke brand PNGs (loaded at runtime by AppAssets)
+mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
+cp "${SCRIPT_DIR}"/design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
+
 echo "  [OK] Resources copied"
 
 # Generate DMG background image
