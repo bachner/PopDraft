@@ -122,11 +122,11 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// Count of queued-but-not-yet-processed user messages (drives the optional
     /// "queued (N)" affordance near the input).
     @Published private(set) var queuedCount: Int = 0
-    /// The chat panel's current pixel size, driven by the window's content size
-    /// (updated by the controller on resize). `ChatView` frames itself to this so
-    /// the user-resizable window's content reflows cleanly (the SwiftUI content
-    /// can't reliably fill an NSHostingView via `maxHeight: .infinity` because the
-    /// transcript's GeometryReader has no intrinsic height).
+    /// The chat panel's current pixel size, tracked from the window's content size
+    /// (updated by the controller on resize). `ChatView` now FILLS its host
+    /// (`maxWidth/maxHeight: .infinity`) instead of pinning to this — pinning a
+    /// hard frame is what defeated drag-resize — so this is kept only as the
+    /// latest-known size for any callers/diagnostics, not as the layout driver.
     @Published var panelSize: CGSize = CGSize(width: 720, height: 560)
     /// The text of the last user message sent (for Up-arrow recall in the input).
     private(set) var lastSentUserMessage: String = ""
@@ -1072,6 +1072,63 @@ struct ConfirmButtonStyle: ButtonStyle {
 /// One conversation turn. User turns get a blue-tinted right-aligned bubble;
 /// assistant turns render author-labeled Markdown (with code blocks), an optional
 /// Thinking disclosure, the turn's tool cards, and a per-message copy button.
+// MARK: - Chat UI: base text direction (RTL detection)
+
+/// Detects the base writing direction of a message so RTL languages (Hebrew,
+/// Arabic, …) render right-aligned. Mirrors the Unicode "first strong character"
+/// rule used for the UBA base direction: scan for the first character that is
+/// strongly LTR or strongly RTL; that decides the paragraph's base direction.
+/// Markdown punctuation/whitespace/digits are neutral and skipped.
+enum TextDirection {
+    /// True if the first strong directional character in `text` is right-to-left.
+    /// LTR (or no strong character) → false.
+    static func isRTL(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            switch strongDirection(scalar) {
+            case .rtl: return true
+            case .ltr: return false
+            case .neutral: continue
+            }
+        }
+        return false
+    }
+
+    private enum Strong { case ltr, rtl, neutral }
+
+    /// Classify one scalar as strongly LTR, strongly RTL, or neutral, covering the
+    /// main RTL blocks (Hebrew, Arabic + supplements/extended, Syriac, Thaana,
+    /// N'Ko) and treating common Latin letters as LTR.
+    private static func strongDirection(_ s: Unicode.Scalar) -> Strong {
+        let v = s.value
+        // Hebrew, Arabic, Syriac, Thaana, N'Ko, Arabic Supplement/Extended,
+        // Arabic Presentation Forms A & B.
+        if (0x0590...0x05FF).contains(v)      // Hebrew
+            || (0x0600...0x06FF).contains(v)  // Arabic
+            || (0x0700...0x074F).contains(v)  // Syriac
+            || (0x0750...0x077F).contains(v)  // Arabic Supplement
+            || (0x0780...0x07BF).contains(v)  // Thaana
+            || (0x07C0...0x07FF).contains(v)  // N'Ko
+            || (0x08A0...0x08FF).contains(v)  // Arabic Extended-A
+            || (0xFB1D...0xFDFF).contains(v)  // Hebrew + Arabic Presentation Forms-A
+            || (0xFE70...0xFEFF).contains(v)  // Arabic Presentation Forms-B
+        {
+            return .rtl
+        }
+        // Strong LTR: basic Latin letters, Latin-1/Extended letters, Greek,
+        // Cyrillic, and the CJK range (all LTR scripts).
+        if (0x0041...0x005A).contains(v)      // A-Z
+            || (0x0061...0x007A).contains(v)  // a-z
+            || (0x00C0...0x024F).contains(v)  // Latin-1 Supplement + Extended-A/B
+            || (0x0370...0x03FF).contains(v)  // Greek
+            || (0x0400...0x04FF).contains(v)  // Cyrillic
+            || (0x3040...0x9FFF).contains(v)  // Hiragana..CJK
+        {
+            return .ltr
+        }
+        return .neutral
+    }
+}
+
 // MARK: - Chat UI: WebKit Markdown + Mermaid renderer (UI overhaul, item 6)
 
 /// Shared, lazily-loaded copies of the bundled web assets so each message's
@@ -1092,6 +1149,27 @@ enum MarkdownWebAssets {
 
     /// The rich renderer is only usable if at least marked.js is present.
     static var available: Bool { !marked.isEmpty }
+}
+
+/// A `WKWebView` subclass that never consumes vertical scroll. Each message's
+/// web view is sized to its exact rendered content height (no internal scroll is
+/// needed), so capturing the scroll wheel would freeze the OUTER transcript
+/// `ScrollView` whenever the pointer sits over a message bubble (the user-reported
+/// "scroll only works on the right margin" bug). We forward every scroll-wheel
+/// event up to the enclosing `NSScrollView`, so the transcript scrolls with the
+/// pointer ANYWHERE over the conversation. Horizontal scroll inside a wide code
+/// block still works because the inner `<pre>` handles it in the DOM before the
+/// wheel event would ever bubble up to us.
+final class ScrollForwardingWebView: WKWebView {
+    override func scrollWheel(with event: NSEvent) {
+        // Forward to the nearest enclosing NSScrollView (the transcript). Falling
+        // back to nextResponder keeps it harmless if the hierarchy ever changes.
+        if let scroll = enclosingScrollView {
+            scroll.scrollWheel(with: event)
+        } else {
+            nextResponder?.scrollWheel(with: event)
+        }
+    }
 }
 
 /// Renders one assistant message body as full Markdown (headings, lists, tables,
@@ -1123,8 +1201,14 @@ struct MarkdownWebView: NSViewRepresentable {
         controller.add(context.coordinator, name: "copyCode")
         config.userContentController = controller
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        // Sandboxed message webview: an ephemeral, NON-persistent store with no
+        // app/file access. This is what makes it safe to render agent-emitted
+        // images + HTML/CSS/JS — nothing it loads or runs can touch the app, the
+        // user's cookies, or the filesystem (and we keep image/HTML sources to
+        // https:/data: only; never file:).
+        config.websiteDataStore = .nonPersistent()
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = ScrollForwardingWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")  // transparent → glass shows
         webView.setContentHuggingPriority(.required, for: .vertical)
@@ -1143,7 +1227,8 @@ struct MarkdownWebView: NSViewRepresentable {
     private func loadHTML(into webView: WKWebView, context: Context) {
         context.coordinator.lastMarkdown = markdown
         let isDark = (webView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
-        let html = Self.document(markdown: markdown, dark: isDark)
+        let html = Self.document(markdown: markdown, dark: isDark,
+                                 rtl: TextDirection.isRTL(markdown))
         webView.loadHTMLString(html, baseURL: nil)
     }
 
@@ -1153,7 +1238,13 @@ struct MarkdownWebView: NSViewRepresentable {
     /// JSON-encoded string constant (so backticks/quotes can't break out), parsed
     /// by marked, highlighted, and mermaid-rendered; then the body height is
     /// posted back to Swift.
-    static func document(markdown: String, dark: Bool) -> String {
+    ///
+    /// `rtl`: when true the base paragraph direction is right-to-left (Hebrew /
+    /// Arabic) — the body gets `dir="rtl"` so the whole message right-aligns;
+    /// otherwise `dir="ltr"`. Either way every block also carries `dir="auto"` so
+    /// mixed-direction content (an RTL paragraph next to an LTR code line) each
+    /// resolves its own direction.
+    static func document(markdown: String, dark: Bool, rtl: Bool = false) -> String {
         let json = (try? JSONSerialization.data(withJSONObject: [markdown]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
         let ink = dark ? "#e8e8ea" : "#1d1d1f"
@@ -1162,31 +1253,39 @@ struct MarkdownWebView: NSViewRepresentable {
         let codeBg = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.045)"
         let border = dark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.10)"
         let hlCSS = dark ? MarkdownWebAssets.highlightDark : MarkdownWebAssets.highlightLight
+        let dir = rtl ? "rtl" : "ltr"
         return """
-        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <!DOCTYPE html><html dir="\(dir)"><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
         \(hlCSS)
         html,body{margin:0;padding:0;background:transparent;}
         body{font:13px/1.5 -apple-system,"SF Pro Text",system-ui,sans-serif;color:\(ink);
-             -webkit-font-smoothing:antialiased;overflow:hidden;}
+             -webkit-font-smoothing:antialiased;overflow:hidden;
+             /* RTL/LTR: align to the start edge so RTL content reads right-aligned. */
+             text-align:start;}
         #c{padding:0;}
         #c>*:first-child{margin-top:0;} #c>*:last-child{margin-bottom:0;}
         h1,h2,h3,h4{font-weight:600;line-height:1.3;margin:0.8em 0 0.4em;}
         h1{font-size:18px;} h2{font-size:16px;} h3{font-size:14px;} h4{font-size:13px;}
-        p{margin:0.5em 0;} ul,ol{margin:0.5em 0;padding-left:1.4em;} li{margin:0.2em 0;}
+        p{margin:0.5em 0;} ul,ol{margin:0.5em 0;padding-inline-start:1.4em;} li{margin:0.2em 0;}
         a{color:\(blue);text-decoration:none;} a:hover{text-decoration:underline;}
         strong{font-weight:600;} em{font-style:italic;}
+        /* Markdown images: cap to the bubble width, never break the layout. */
+        img{max-width:100%;height:auto;border-radius:8px;margin:0.4em 0;display:block;}
         code{font-family:ui-monospace,"SF Mono",monospace;font-size:12px;
              background:\(codeBg);padding:1.5px 5px;border-radius:5px;}
-        blockquote{margin:0.6em 0;padding:2px 12px;border-left:3px solid \(blue);
+        blockquote{margin:0.6em 0;padding:2px 12px;border-inline-start:3px solid \(blue);
              color:\(ink2);}
         table{border-collapse:collapse;margin:0.6em 0;font-size:12.5px;width:auto;}
-        th,td{border:1px solid \(border);padding:5px 10px;text-align:left;}
+        th,td{border:1px solid \(border);padding:5px 10px;text-align:start;}
         th{background:\(codeBg);font-weight:600;}
         hr{border:none;border-top:1px solid \(border);margin:1em 0;}
+        /* Agent-emitted raw HTML block (```html or inline HTML): give it its own
+           isolated box so its CSS/JS render without disturbing the chat chrome. */
+        .htmlblock{margin:0.6em 0;direction:ltr;text-align:left;}
         .codewrap{position:relative;margin:0.6em 0;border:1px solid \(border);
-             border-radius:10px;overflow:hidden;background:\(codeBg);}
+             border-radius:10px;overflow:hidden;background:\(codeBg);direction:ltr;text-align:left;}
         .codewrap .bar{display:flex;align-items:center;justify-content:space-between;
              padding:5px 10px;font-size:9.5px;text-transform:uppercase;letter-spacing:0.04em;
              color:\(ink2);border-bottom:1px solid \(border);}
@@ -1195,27 +1294,35 @@ struct MarkdownWebView: NSViewRepresentable {
         .copybtn{cursor:pointer;border:none;background:none;color:\(ink2);font:inherit;
              font-size:9.5px;text-transform:uppercase;letter-spacing:0.04em;padding:2px 6px;
              border-radius:5px;} .copybtn:hover{background:\(codeBg);color:\(blue);}
-        .mermaid{margin:0.6em 0;text-align:center;background:transparent;}
-        </style></head><body><div id="c"></div>
+        .mermaid{margin:0.6em 0;text-align:center;background:transparent;direction:ltr;}
+        </style></head><body dir="\(dir)"><div id="c"></div>
         <script>\(MarkdownWebAssets.marked)</script>
         <script>\(MarkdownWebAssets.highlightJS)</script>
         <script>
         (function(){
           var md = \(json)[0];
           try {
-            marked.setOptions({gfm:true, breaks:true, highlight:function(code, lang){
+            // gfm + inline HTML pass-through (sanitize:false) so the agent can emit
+            // raw HTML in a message and have it render with its CSS/JS — see the
+            // sandboxing note in makeNSView (nonPersistent, no file/app access).
+            marked.setOptions({gfm:true, breaks:true, sanitize:false, highlight:function(code, lang){
               try { if(lang && hljs.getLanguage(lang)) return hljs.highlight(code,{language:lang}).value;
                     return hljs.highlightAuto(code).value; } catch(e){ return code; }
             }});
           } catch(e){}
-          // Split fenced ```mermaid blocks out before markdown so they aren't
-          // mangled, render the rest with marked.
           var html = '';
           try { html = marked.parse(md); } catch(e){ html = '<pre>'+md.replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];})+'</pre>'; }
           var c = document.getElementById('c');
           c.innerHTML = html;
+          // Per-block dir="auto": each top-level block resolves its own base
+          // direction from its first strong character, so a mostly-RTL message
+          // with an embedded LTR line (or vice-versa) still reads correctly.
+          Array.prototype.forEach.call(c.children, function(el){
+            if(!el.hasAttribute('dir')) el.setAttribute('dir','auto');
+          });
           // Wrap each <pre><code> in a card with a language label + copy button.
-          // Mermaid code blocks are converted to <div class="mermaid"> instead.
+          // Mermaid code blocks become <div class="mermaid">; a ```html block is
+          // rendered LIVE (its markup/CSS/JS run) instead of shown as escaped code.
           c.querySelectorAll('pre code').forEach(function(code){
             var pre = code.parentElement;
             var cls = (code.className||'');
@@ -1226,6 +1333,15 @@ struct MarkdownWebView: NSViewRepresentable {
               div.className = 'mermaid';
               div.textContent = code.textContent;
               pre.replaceWith(div);
+              return;
+            }
+            if(lang === 'html'){
+              // Live-render the fenced HTML so the agent can "show stuff" with
+              // styled/interactive content. Isolated in its own block; scripts run
+              // via execHTML() below (innerHTML alone won't execute <script>).
+              var box = document.createElement('div'); box.className='htmlblock';
+              execHTML(box, code.textContent);
+              pre.replaceWith(box);
               return;
             }
             var wrap = document.createElement('div'); wrap.className='codewrap';
@@ -1242,6 +1358,41 @@ struct MarkdownWebView: NSViewRepresentable {
             wrap.appendChild(newpre);
             pre.replaceWith(wrap);
           });
+          // Sanitize images: only https:/data: sources may load — never file: or
+          // anything else (defense in depth on top of the no-file-access sandbox).
+          c.querySelectorAll('img').forEach(function(img){
+            var src = (img.getAttribute('src')||'').trim();
+            var low = src.toLowerCase();
+            if(!(low.indexOf('https:')===0 || low.indexOf('data:image/')===0)){
+              img.removeAttribute('src');
+              img.setAttribute('alt', img.getAttribute('alt') || '[blocked image]');
+            }
+            // Report height again once each image finishes loading.
+            img.addEventListener('load', function(){ report(); });
+            img.addEventListener('error', function(){ report(); });
+          });
+          // Raw HTML emitted directly in the message body (NOT a ```html fence)
+          // lands in #c via innerHTML, but its <script>s don't auto-run. Re-create
+          // them so inline HTML "shows stuff" too. Scripts inside .htmlblock were
+          // already executed by execHTML(), so skip those to avoid double-running.
+          c.querySelectorAll('script').forEach(function(old){
+            if(old.closest('.htmlblock')) return;
+            var s = document.createElement('script');
+            Array.prototype.forEach.call(old.attributes, function(a){ s.setAttribute(a.name, a.value); });
+            s.textContent = old.textContent;
+            old.parentNode.replaceChild(s, old);
+          });
+          // Insert html-string into `target` AND execute any <script> it contains
+          // (assigning innerHTML does NOT run scripts, so we re-create each one).
+          function execHTML(target, htmlStr){
+            target.innerHTML = htmlStr;
+            target.querySelectorAll('script').forEach(function(old){
+              var s = document.createElement('script');
+              Array.prototype.forEach.call(old.attributes, function(a){ s.setAttribute(a.name, a.value); });
+              s.textContent = old.textContent;
+              old.parentNode.replaceChild(s, old);
+            });
+          }
           function report(){
             var h = Math.ceil(document.getElementById('c').getBoundingClientRect().height);
             try { window.webkit.messageHandlers.heightChanged.postMessage(h); } catch(e){}
@@ -1351,11 +1502,17 @@ struct MessageBubble: View {
 
     // MARK: User
 
+    /// RTL (Hebrew/Arabic) user message → lay the text out right-to-left so it
+    /// reads correctly; LTR is unchanged. The bubble itself stays right-aligned.
+    private var isRTL: Bool { TextDirection.isRTL(message.content) }
+
     private var userBubble: some View {
         VStack(alignment: .trailing, spacing: 4) {
             Text(message.content)
                 .font(.system(size: 13))
                 .foregroundColor(ChatPalette.ink)
+                .multilineTextAlignment(isRTL ? .trailing : .leading)
+                .environment(\.layoutDirection, isRTL ? .rightToLeft : .leftToRight)
                 .textSelection(.enabled)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
@@ -1431,16 +1588,21 @@ struct MessageBubble: View {
     }
 
     @ViewBuilder private func nativeMarkdown(_ text: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        // RTL-aware: an RTL assistant body right-aligns its prose (code blocks stay
+        // LTR). LTR content is unchanged.
+        let rtl = TextDirection.isRTL(text)
+        VStack(alignment: rtl ? .trailing : .leading, spacing: 8) {
             ForEach(MarkdownParser.blocks(text)) { block in
                 switch block {
                 case .prose(_, let p):
                     Text(MarkdownParser.attributed(p))
                         .font(.system(size: 13))
                         .foregroundColor(ChatPalette.ink)
+                        .multilineTextAlignment(rtl ? .trailing : .leading)
+                        .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
                         .textSelection(.enabled)
                         .tint(ChatPalette.blue)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
                 case .code(_, let lang, let code):
                     CodeBlockView(language: lang, code: code)
                 }
@@ -1535,10 +1697,17 @@ struct ChatView: View {
             Divider().opacity(0.4)
             inputBar
         }
-        // Size to the window's content size (published + updated on resize). This
-        // makes the user-resizable window reflow cleanly — see `panelSize`.
-        .frame(width: max(viewModel.panelSize.width, GlassWindow.ChatGeometry.minSize.width),
-               height: max(viewModel.panelSize.height, GlassWindow.ChatGeometry.minSize.height))
+        // FILL the hosting view (which the controller autoresizes + frames to the
+        // window) rather than pinning a fixed size. A hard `.frame(width:height:)`
+        // (the old code) made NSHostingView report that exact size as BOTH its min
+        // and max intrinsic size, which the window honored — so dragging an edge
+        // couldn't grow or shrink the panel. Filling + a minimum floor lets the
+        // user drag-resize and the content reflow; the controller owns the actual
+        // frame and persists it across opens.
+        .frame(minWidth: GlassWindow.ChatGeometry.minSize.width,
+               maxWidth: .infinity,
+               minHeight: GlassWindow.ChatGeometry.minSize.height,
+               maxHeight: .infinity)
         .background(LiquidGlassBackground(cornerRadius: 22))
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
