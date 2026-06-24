@@ -38,7 +38,31 @@ final class MCPClient: @unchecked Sendable {
 
     /// Spawn the server and run the handshake; returns the discovered tool specs.
     /// Throws if the server can't start or doesn't answer — the caller skips it.
-    func start(command: String, args: [String], timeoutMs: Int = 8000) async throws -> [MCPToolSpec] {
+    /// Expand `$VAR`, `${VAR}` and a leading `~` in server args. Config stores
+    /// e.g. `$HOME`, but `Process` does not run through a shell, so it would pass
+    /// the literal string — expand here so e.g. the filesystem server roots at the
+    /// real home directory.
+    static func expandedArgs(_ args: [String]) -> [String] {
+        let env = ProcessInfo.processInfo.environment
+        let home = env["HOME"] ?? NSHomeDirectory()
+        let re = try? NSRegularExpression(pattern: "\\$\\{?([A-Za-z_][A-Za-z0-9_]*)\\}?")
+        return args.map { arg -> String in
+            var s = arg
+            if s == "~" { s = home } else if s.hasPrefix("~/") { s = home + String(s.dropFirst(1)) }
+            guard let re = re else { return s }
+            let ns = s as NSString
+            var result = s
+            for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)).reversed() {
+                let name = ns.substring(with: m.range(at: 1))
+                if let val = env[name] { result = (result as NSString).replacingCharacters(in: m.range, with: val) }
+            }
+            return result
+        }
+    }
+
+    /// `timeoutMs` defaults high because `npx -y <pkg>` downloads the package on
+    /// first run (often >8s) before the server can answer `initialize`.
+    func start(command: String, args: [String], timeoutMs: Int = 60000) async throws -> [MCPToolSpec] {
         // Resolve the command via /usr/bin/env so a bare name (e.g. "npx") works.
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [command] + args
@@ -208,7 +232,7 @@ enum MCPManager {
         for cfg in servers where cfg.enabled && !cfg.command.isEmpty {
             let client = MCPClient(serverName: cfg.name)
             do {
-                let specs = try await client.start(command: cfg.command, args: cfg.args)
+                let specs = try await client.start(command: cfg.command, args: MCPClient.expandedArgs(cfg.args))
                 var registered = 0
                 for s in specs {
                     let namespaced = s.toToolSpec(serverName: cfg.name)

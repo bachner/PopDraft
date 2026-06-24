@@ -1044,7 +1044,7 @@ struct SuggestIntegrationTool: AgentTool {
                 "properties": [
                     "capability": [
                         "type": "string",
-                        "description": "The capability the user wants, e.g. 'read my email', 'check my calendar', 'send a slack message', 'read a file'.",
+                        "description": "An EXTERNAL service the user wants that needs its own account/auth, e.g. 'read my email', 'check my calendar', 'send a slack message'. Do NOT use for local file/command/code tasks — those use run_shell.",
                     ],
                 ],
                 "required": ["capability"],
@@ -1149,15 +1149,23 @@ struct PopDraftAgent {
     - If the user has a connected MCP tool that fits the request (a \
     `<server>__<tool>` tool), USE it — that is the whole point of connecting it.
 
-    CAPABILITY-AWARENESS — IMPORTANT. If the user asks for something you have NO \
-    tool for (e.g. "read my email", "what's on my calendar", "post to Slack", \
-    "open this Notion page", "read a file on disk"), DO NOT flatly refuse and do \
-    NOT say you simply cannot do it. Instead, call `suggest_integration` with the \
+    TAKING ACTION ON THIS MAC. When Mac control is enabled you have `run_shell` \
+    and `run_applescript`. Use them to ACTUALLY DO local work: run any shell \
+    command, write code to a file and execute it (python/node/bash/swift…), read \
+    and write files, inspect the system, open apps or URLs. NEVER claim you can't \
+    read a file, run code, or run a command — propose it via run_shell (the user \
+    approves before anything runs; read-only commands like cat/ls may auto-run). \
+    Do local file/command/code work with run_shell, NOT by suggesting an MCP.
+
+    CAPABILITY-AWARENESS — IMPORTANT. Reserve `suggest_integration` for EXTERNAL \
+    cloud services that need their own account/auth (email, calendar, Slack, \
+    Notion, GitHub, Drive) — NEVER for local file/command/code tasks (use \
+    run_shell for those). If the user asks for such an external service you have \
+    NO connected tool for (e.g. "read my email", "what's on my calendar", "post \
+    to Slack"), DO NOT flatly refuse: call `suggest_integration` with the \
     capability, then tell the user — in plain language — that you can connect to \
-    that service via an MCP server, name the specific server (e.g. the Gmail, \
-    Google Calendar, Slack, or Notion MCP server), and tell them to add it in \
-    Settings → MCP (mention the one-click preset). Be concrete and actionable, \
-    not a generic "I can't help with that".
+    that service via an MCP server, name the specific server, and tell them to add \
+    it in Settings → MCP (mention the one-click preset). Be concrete and actionable.
 
     ALWAYS finish your turn with a clear, direct, natural-language answer to the \
     user's question, synthesized from what you found. Never end with only a tool \
