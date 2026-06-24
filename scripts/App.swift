@@ -289,8 +289,14 @@ class DependencyManager {
         <string>-ngl</string>
         <string>99</string>
         <string>--jinja</string>
+        <string>-fa</string>
+        <string>on</string>
+        <string>-ctk</string>
+        <string>q4_0</string>
+        <string>-ctv</string>
+        <string>q4_0</string>
         <string>-c</string>
-        <string>32768</string>
+        <string>200000</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
