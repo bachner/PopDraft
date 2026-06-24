@@ -355,7 +355,7 @@ struct LLMConfig {
     ]
 
     var provider: Provider = .llamacpp
-    var llamaModel: String = "qwen3.5-2b"
+    var llamaModel: String = "qwen3.5-4b"
     var llamacppURL: String = "http://localhost:10819"
     var ollamaURL: String = "http://localhost:11434"
     var ollamaModel: String = "qwen3.5:4b"
@@ -7527,6 +7527,8 @@ class DependencyManager {
         <string>-ngl</string>
         <string>99</string>
         <string>--jinja</string>
+        <string>-c</string>
+        <string>16384</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

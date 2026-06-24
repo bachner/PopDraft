@@ -214,7 +214,7 @@ struct AppConfig: Codable, Equatable {
         version: Int = 2,
         provider: String = "llamacpp",
         llamacppURL: String = "http://localhost:10819",
-        llamaModel: String = "qwen3.5-2b",
+        llamaModel: String = "qwen3.5-4b",
         ollamaURL: String = "http://localhost:11434",
         ollamaModel: String = "qwen3.5:4b",
         openaiAPIKey: String = "",
