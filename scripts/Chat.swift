@@ -934,12 +934,14 @@ struct ConfirmCardView: View {
         switch request.kind {
         case .shell: return "terminal"
         case .applescript: return "applescript"
+        case .download: return "arrow.down.circle"
         }
     }
     private var kindLabel: String {
         switch request.kind {
         case .shell: return "run_shell"
         case .applescript: return "run_applescript"
+        case .download: return "download_file"
         }
     }
 
