@@ -11793,6 +11793,27 @@ struct PopDraftAgent {
     with the web tools when a question needs current or external information; \
     otherwise answer directly.
 
+    WHEN TO USE TOOLS — read this first. Prefer the FEWEST tools necessary, and \
+    NEVER call a tool when you can answer directly.
+    - PURE TEXT TASKS — translate, rewrite, fix grammar, summarize, rephrase, \
+    explain, format, or extract from text the user already gave you — need NO \
+    tools. Just produce the result. Do NOT call web_search / web_open / web_read \
+    / web_* / browser_* for these.
+    - GENERAL KNOWLEDGE you already know — answer DIRECTLY, no tools.
+    - Use web_search / browse tools ONLY when the user explicitly asks you to \
+    search or look something up online, OR the question genuinely needs current, \
+    external, or factual information you don't already have (news, prices, a \
+    specific person/org, recent events, a specific page).
+    - When the instruction is "translate / rewrite / summarize this text" and the \
+    text is included, output ONLY the transformed text — no tools, no preamble, \
+    no trailing commentary. If the user says "add nothing before or after", return \
+    exactly the transformed text and nothing else.
+    Examples:
+    - "Translate to Hebrew, add nothing: 'BQ incident costs:'" → answer with only \
+    the Hebrew translation, ZERO tool calls.
+    - "Fix the grammar: 'he go to store'" → answer "He goes to the store.", no tools.
+    - "What's the latest iPhone price?" → web_search is appropriate (current/external).
+
     How to use tools well:
     - When you call a tool, wait for its result before continuing.
     - After EACH tool result, reassess: decide whether you have enough to answer, \
