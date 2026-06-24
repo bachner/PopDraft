@@ -7,6 +7,8 @@ ephemeral port and prints "PORT <n>" on stdout so the test harness can read it,
 then serves a fixed set of routes:
 
   /article        a clean article page (Readability target)
+  /portal         a landing page with a link to /article + a search box (browser nav)
+  /searchresults  echoes ?q= into its body (browser_type + submit target)
   /jsrendered     a page whose body text is injected by JS after load
   /adheavy        an article wrapped in ad/tracker noise
   /redirect       302 -> /article
@@ -95,6 +97,50 @@ AD_HEAVY_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+# A landing page with a clickable link to /article (browser_click target) and a
+# search box that GETs /searchresults?q=... (browser_type + submit target).
+PORTAL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture Portal</title></head>
+<body>
+  <header><nav>Home About Contact</nav></header>
+  <main>
+    <h1>Fixture Portal Home</h1>
+    <form action="/searchresults" method="get">
+      <input type="text" name="q" placeholder="Search the fixture site" aria-label="Search">
+      <button type="submit">Go</button>
+    </form>
+    <p>Browse our content below.</p>
+    <ul>
+      <li><a href="/article">Read the Full Article</a></li>
+      <li><a href="/adheavy">An Ad Heavy Story</a></li>
+    </ul>
+  </main>
+</body>
+</html>"""
+
+
+def search_results_html(query):
+    """Server-side 'search results' page; echoes the query into its body so a
+    typed query + submit lands on content that contains the query (proving the
+    type+submit navigated and ran a search)."""
+    safe = (query or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Search Results</title></head>
+<body>
+  <main>
+    <h1>Search Results</h1>
+    <p>You searched for: <strong>%s</strong>. Here is the genuine result body text
+       with enough words and commas, like this, that the extractor treats it as
+       the main article content for this results page.</p>
+    <ul>
+      <li><a href="/article">First Result: The Full Article</a></li>
+    </ul>
+  </main>
+</body>
+</html>""" % safe
+
 
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
@@ -114,9 +160,17 @@ def make_handler():
                 self.wfile.write(data)
 
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
+            parts = self.path.split("?", 1)
+            path = parts[0]
+            query = parts[1] if len(parts) > 1 else ""
             if path == "/article":
                 self._send(200, ARTICLE_HTML)
+            elif path == "/portal":
+                self._send(200, PORTAL_HTML)
+            elif path == "/searchresults":
+                from urllib.parse import parse_qs
+                q = (parse_qs(query).get("q", [""]) or [""])[0]
+                self._send(200, search_results_html(q))
             elif path == "/jsrendered":
                 self._send(200, JS_RENDERED_HTML)
             elif path == "/adheavy":

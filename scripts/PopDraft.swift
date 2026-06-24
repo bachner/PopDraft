@@ -3941,7 +3941,12 @@ struct ConfirmButtonStyle: ButtonStyle {
 /// Shared, lazily-loaded copies of the bundled web assets so each message's
 /// WKWebView doesn't re-read them from disk. `available` is true only when
 /// marked.js loaded — the caller falls back to the native renderer otherwise.
-@MainActor
+///
+/// NOT main-actor isolated: every member is an immutable `let` `String` (which
+/// is `Sendable`) lazily initialized once, thread-safely, by the Swift runtime
+/// from a pure bundle read. Keeping it nonisolated lets `available` be read from
+/// SwiftUI view builders (which CI compiles as nonisolated) without an isolation
+/// violation, while staying concurrency-safe.
 enum MarkdownWebAssets {
     static let marked: String = AppAssets.webResource("marked.min.js") ?? ""
     static let mermaid: String = AppAssets.webResource("mermaid.min.js") ?? ""
@@ -3961,6 +3966,12 @@ enum MarkdownWebAssets {
 /// Self-contained & offline: marked / mermaid / highlight.js + CSS are inlined
 /// from the bundle, so the web view never loads anything over the network. Links
 /// open in the user's browser instead of navigating the (local) document.
+///
+/// `@MainActor` so its `NSViewRepresentable` methods (which SwiftUI always calls
+/// on the main actor) can touch the main-actor-isolated `Coordinator` (e.g.
+/// mutate `lastMarkdown`) without an isolation violation under CI's stricter
+/// concurrency checking, where these methods would otherwise be nonisolated.
+@MainActor
 struct MarkdownWebView: NSViewRepresentable {
     let markdown: String
     let width: CGFloat
@@ -4356,7 +4367,9 @@ struct StreamingCaret: View {
 /// bottom edge of the scroll view (≤ threshold ⇒ the user is pinned to the
 /// bottom). Used for smart "stick to bottom" auto-scroll.
 private struct BottomDistanceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
+    // `let` (not `var`): the protocol only reads this, and a `let` is
+    // concurrency-safe global state (no mutable shared state under Swift 6).
+    static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
@@ -10513,6 +10526,230 @@ enum WebJS {
     """#
 }
 
+// MARK: - Bundled JS for interactive browsing (Playwright-style)
+
+/// JavaScript injected into the persistent session webview to DRIVE a page:
+/// build an accessibility summary, find + click an element by text/selector,
+/// and focus + type into an input. Every function is a self-contained, bundled
+/// string — agent-supplied strings are passed ONLY as a JSON `args` object that
+/// the Swift side builds with `BrowserTargets.argLiteral` (JSON-encoded), so the
+/// page never contributes a raw string to the evaluated script.
+enum BrowserJS {
+    /// Shared prelude: helpers to read visible text, compute a stable selector for
+    /// an element, test visibility, and find the best match for a target. Prepended
+    /// to each action script. `__ARGS__` is replaced by a JSON object literal.
+    private static let prelude = #"""
+    function __pdText(n){ return (n && (n.innerText || n.textContent) || '').replace(/\s+/g,' ').trim(); }
+    function __pdVisible(n){
+      if(!n) return false;
+      var s = window.getComputedStyle(n);
+      if(!s || s.display==='none' || s.visibility==='hidden' || parseFloat(s.opacity||'1')===0) return false;
+      var r = n.getBoundingClientRect();
+      return (r.width>1 && r.height>1);
+    }
+    function __pdSelector(n){
+      if(!n || n.nodeType!==1) return '';
+      if(n.id){ return '#'+CSS.escape(n.id); }
+      var tag = n.tagName.toLowerCase();
+      // name attr is stable + common on inputs.
+      var nm = n.getAttribute && n.getAttribute('name');
+      if(nm){ return tag+'[name="'+nm.replace(/"/g,'\\"')+'"]'; }
+      // Build an nth-of-type path (short, deterministic).
+      var path=[]; var el=n; var depth=0;
+      while(el && el.nodeType===1 && depth<5 && el.tagName.toLowerCase()!=='html'){
+        var t=el.tagName.toLowerCase();
+        var parent=el.parentNode;
+        if(!parent){ path.unshift(t); break; }
+        var sibs=[]; var c=parent.firstElementChild;
+        for(; c; c=c.nextElementSibling){ if(c.tagName===el.tagName) sibs.push(c); }
+        if(sibs.length>1){ var idx=sibs.indexOf(el)+1; path.unshift(t+':nth-of-type('+idx+')'); }
+        else { path.unshift(t); }
+        el=parent; depth++;
+      }
+      return path.join(' > ');
+    }
+    function __pdLabel(n){
+      var t = __pdText(n);
+      if(t) return t.slice(0,120);
+      var v = n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('placeholder') || n.value || n.getAttribute('name') || n.getAttribute('title'));
+      return (v||'').toString().replace(/\s+/g,' ').trim().slice(0,120);
+    }
+    function __pdRole(n){
+      var tag=n.tagName.toLowerCase();
+      if(tag==='a') return 'link';
+      if(tag==='button') return 'button';
+      if(tag==='textarea') return 'textarea';
+      if(tag==='select') return 'select';
+      if(tag==='input'){
+        var ty=(n.getAttribute('type')||'text').toLowerCase();
+        if(ty==='submit'||ty==='button') return 'button';
+        return 'input';
+      }
+      var role=n.getAttribute && n.getAttribute('role');
+      if(role==='button') return 'button';
+      if(role==='link') return 'link';
+      return 'button';
+    }
+    // Candidate clickable / typeable elements (visible only).
+    function __pdClickables(){
+      var sel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [onclick]';
+      var nodes = Array.prototype.slice.call(document.querySelectorAll(sel));
+      return nodes.filter(__pdVisible);
+    }
+    // Find the best element for a target. If asSelector, querySelector first.
+    // Else: exact visible-text match, then case-insensitive contains, over
+    // clickable candidates; falls back to querySelector if the text looks usable.
+    function __pdFind(args){
+      var target=(args.target||'').trim();
+      if(!target) return null;
+      if(args.asSelector){
+        try{ var q=document.querySelector(target); if(q) return q; }catch(e){}
+      }
+      var cands=__pdClickables();
+      var lt=target.toLowerCase();
+      // 1) exact text/label match.
+      for(var i=0;i<cands.length;i++){ if(__pdText(cands[i]).toLowerCase()===lt) return cands[i]; }
+      for(var i2=0;i2<cands.length;i2++){
+        var lab=(__pdLabel(cands[i2])||'').toLowerCase();
+        if(lab===lt) return cands[i2];
+      }
+      // 2) contains.
+      for(var j=0;j<cands.length;j++){ if(__pdText(cands[j]).toLowerCase().indexOf(lt)>=0) return cands[j]; }
+      for(var j2=0;j2<cands.length;j2++){
+        var lab2=(__pdLabel(cands[j2])||'').toLowerCase();
+        if(lab2.indexOf(lt)>=0) return cands[j2];
+      }
+      // 3) last resort: try it as a selector even if it didn't "look like" one.
+      try{ var q2=document.querySelector(target); if(q2) return q2; }catch(e){}
+      return null;
+    }
+    // Find the best INPUT/textarea for a target (placeholder/label/name/aria/selector).
+    function __pdFindInput(args){
+      var target=(args.target||'').trim();
+      if(args.asSelector){
+        try{ var q=document.querySelector(target); if(q) return q; }catch(e){}
+      }
+      var inputs=Array.prototype.slice.call(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(__pdVisible);
+      // Skip hidden/checkbox/radio/submit inputs for typing.
+      inputs=inputs.filter(function(n){
+        if(n.tagName.toLowerCase()!=='input') return true;
+        var ty=(n.getAttribute('type')||'text').toLowerCase();
+        return ['hidden','checkbox','radio','submit','button','image','file','range','color'].indexOf(ty)<0;
+      });
+      if(!target){ return inputs.length?inputs[0]:null; }
+      var lt=target.toLowerCase();
+      function attrMatch(n){
+        var a=[n.getAttribute('placeholder'), n.getAttribute('aria-label'), n.getAttribute('name'), n.getAttribute('title'), n.getAttribute('id')];
+        for(var k=0;k<a.length;k++){ if(a[k] && a[k].toLowerCase().indexOf(lt)>=0) return true; }
+        // <label for=id> text.
+        if(n.id){ var lbl=document.querySelector('label[for="'+CSS.escape(n.id)+'"]'); if(lbl && __pdText(lbl).toLowerCase().indexOf(lt)>=0) return true; }
+        return false;
+      }
+      for(var i=0;i<inputs.length;i++){ if(attrMatch(inputs[i])) return inputs[i]; }
+      // selector fallback.
+      try{ var q2=document.querySelector(target); if(q2) return q2; }catch(e){}
+      return inputs.length?inputs[0]:null;
+    }
+    var __pdArgs = __ARGS__;
+    """#
+
+    /// Build the DOM-accessibility summary: title, a short readable text snapshot,
+    /// and up to `cap` clickable/typeable elements with role/label/selector.
+    /// Returns a JSON string `{title, summary, elements:[{role,label,selector}]}`.
+    static func summaryScript(cap: Int) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: "{}") + #"""
+            var CAP = \#(cap);
+            var els = [];
+            var cands = __pdClickables();
+            var seen = {};
+            for(var i=0;i<cands.length && els.length<CAP;i++){
+              var n=cands[i];
+              var label=__pdLabel(n);
+              if(!label) continue;
+              var role=__pdRole(n);
+              var sel=__pdSelector(n);
+              var key=role+'|'+label;
+              if(seen[key]) continue; seen[key]=1;
+              els.push({role:role, label:label, selector:sel});
+            }
+            var body = (document.body ? (document.body.innerText||'') : '').replace(/\s+/g,' ').trim();
+            return JSON.stringify({
+              title: (document.title||'').trim(),
+              summary: body.slice(0, 800),
+              elements: els
+            });
+          }catch(e){ return JSON.stringify({title:(document.title||''), summary:'', elements:[], error:String(e)}); }
+        })();
+        """#
+    }
+
+    /// Click script. `argLiteral` is `{target, asSelector}` from `BrowserTargets`.
+    /// Returns `{ok, clicked, role}` JSON. Splices in no page-derived string.
+    static func clickScript(argLiteral: String) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: argLiteral) + #"""
+            var el = __pdFind(__pdArgs);
+            if(!el){ return JSON.stringify({ok:false, error:'not-found'}); }
+            var label = __pdLabel(el) || __pdText(el);
+            var role = __pdRole(el);
+            try{ el.scrollIntoView({block:'center'}); }catch(e){}
+            try{ el.focus(); }catch(e){}
+            // Prefer a native click (fires navigation for <a>/<button>).
+            if(typeof el.click==='function'){ el.click(); }
+            else {
+              var ev=document.createEvent('MouseEvents');
+              ev.initEvent('click', true, true);
+              el.dispatchEvent(ev);
+            }
+            return JSON.stringify({ok:true, clicked:label, role:role});
+          }catch(e){ return JSON.stringify({ok:false, error:String(e)}); }
+        })();
+        """#
+    }
+
+    /// Type script. `argLiteral` is `{target, asSelector, text}`. `submit` triggers
+    /// an Enter keydown + form.submit() fallback. Returns `{ok, typedInto, submitted}`.
+    static func typeScript(argLiteral: String, submit: Bool) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: argLiteral) + #"""
+            var SUBMIT = \#(submit ? "true" : "false");
+            var el = __pdFindInput(__pdArgs);
+            if(!el){ return JSON.stringify({ok:false, error:'no-input'}); }
+            var label = __pdLabel(el);
+            try{ el.scrollIntoView({block:'center'}); }catch(e){}
+            try{ el.focus(); }catch(e){}
+            var text = (__pdArgs.text!=null) ? String(__pdArgs.text) : '';
+            if(el.isContentEditable){ el.textContent = text; }
+            else { el.value = text; }
+            try{ el.dispatchEvent(new Event('input', {bubbles:true})); }catch(e){}
+            try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}
+            var submitted=false;
+            if(SUBMIT){
+              try{
+                var kd=new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+                el.dispatchEvent(kd);
+                var ku=new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+                el.dispatchEvent(ku);
+              }catch(e){}
+              // Fallback: submit the enclosing form if no navigation kicked off.
+              var f = el.form || (el.closest && el.closest('form'));
+              if(f){ try{ if(typeof f.requestSubmit==='function'){ f.requestSubmit(); } else { f.submit(); } submitted=true; }catch(e){} }
+              else { submitted=true; }
+            }
+            return JSON.stringify({ok:true, typedInto:label||'(input)', submitted:submitted});
+          }catch(e){ return JSON.stringify({ok:false, error:String(e)}); }
+        })();
+        """#
+    }
+}
+
 // MARK: - Content blocking ruleset
 
 /// Compiles small `WKContentRuleList`s once at startup and caches them. Two
@@ -11639,6 +11876,296 @@ private final class ProxyConnection: @unchecked Sendable {
     }
 }
 
+// MARK: - Persistent browsing session (Playwright-style)
+
+/// ONE long-lived offscreen `WKWebView` the agent DRIVES across tool calls
+/// (open → type → click → read), distinct from the one-shot read/screenshot
+/// `RendererPool` (which recreates a fresh webview per job and never persists
+/// state). The session keeps cookies/history/scroll position alive so a flow
+/// like "search → click a result → read it" works.
+///
+/// SSRF: every navigation (initial load, click-triggered nav, redirect, response
+/// host, and Back) is gated by the SAME `policyCheck`/`responseHostCheck` the
+/// pool uses — supplied by `WebEngine` — and, on macOS 14+, routed through the
+/// `PinningProxy`. The session webview uses a NON-persistent data store so it
+/// leaves nothing on disk, but keeps that store alive for the session's lifetime.
+@MainActor
+final class BrowserSession {
+    /// The live webview (lazily created on first use). A persistent navigation
+    /// delegate stays attached so click-initiated navigations are still SSRF-gated
+    /// (the per-call `NavigationBridge` only spans an explicit load).
+    private var webView: WKWebView?
+    private let frame = NSRect(x: 0, y: 0, width: 1280, height: 2000)
+    private let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+    /// SSRF policy + byte cap supplied by `WebEngine`. `policyCheck` runs on every
+    /// navigation action (incl. click-triggered + redirects); `responseHostCheck`
+    /// re-validates the committed response URL; `maxBytes` caps the body.
+    private let policyCheck: @MainActor (URL) -> Bool
+    private let responseHostCheck: @MainActor (URL) -> Bool
+    private let maxBytes: Int
+    private let navTimeoutMs: Int
+    private let settleMs: Int
+
+    /// The persistent delegate enforcing SSRF on background (click) navigations.
+    private let guardDelegate: SessionGuardDelegate
+
+    init(policyCheck: @escaping @MainActor (URL) -> Bool,
+         responseHostCheck: @escaping @MainActor (URL) -> Bool,
+         maxBytes: Int, navTimeoutMs: Int, settleMs: Int) {
+        self.policyCheck = policyCheck
+        self.responseHostCheck = responseHostCheck
+        self.maxBytes = maxBytes
+        self.navTimeoutMs = navTimeoutMs
+        self.settleMs = settleMs
+        self.guardDelegate = SessionGuardDelegate(
+            policyCheck: policyCheck, responseHostCheck: responseHostCheck, maxBytes: maxBytes)
+    }
+
+    /// Whether a page has ever been loaded into the session.
+    var hasPage: Bool { (webView?.url) != nil }
+
+    /// Lazily build the session webview (non-persistent store, proxy on 14+).
+    private func ensureWebView() -> WKWebView {
+        if let wv = webView { return wv }
+        let config = WKWebViewConfiguration()
+        let dataStore = WKWebsiteDataStore.nonPersistent()
+        if #available(macOS 14.0, *) {
+            let proxyPort = PinningProxy.shared.startIfNeeded()
+            if proxyPort != 0, let nwPort = NWEndpoint.Port(rawValue: proxyPort) {
+                let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: nwPort)
+                let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
+                dataStore.proxyConfigurations = [proxy]
+            }
+        }
+        config.websiteDataStore = dataStore
+        let wv = WKWebView(frame: frame, configuration: config)
+        wv.customUserAgent = userAgent
+        // Ads-only ruleset (interactive pages need their images/layout).
+        if let list = ContentBlocker.shared.adsOnlyList() {
+            wv.configuration.userContentController.add(list)
+        }
+        OffscreenRenderHost.shared.attach(wv, frame: frame)
+        webView = wv
+        return wv
+    }
+
+    /// Tear down the session webview (called on engine reload / app teardown).
+    func reset() {
+        if let wv = webView {
+            wv.stopLoading()
+            wv.navigationDelegate = nil
+            OffscreenRenderHost.shared.detach(wv)
+        }
+        webView = nil
+    }
+
+    /// Navigate to `url`, wait for load + a bounded settle. SSRF-gated on the
+    /// initial request, every redirect, and the response host. Throws on
+    /// blocked host / nav failure / timeout.
+    @discardableResult
+    func load(_ url: URL) async throws -> Int {
+        let wv = ensureWebView()
+        return try await runNavigation(wv) {
+            wv.load(URLRequest(url: url))
+        }
+    }
+
+    /// Run `body` (a navigation trigger) under a fresh `NavigationBridge` so we
+    /// get a precise load completion + SSRF gate + timeout, then restore the
+    /// persistent guard delegate so background navigations stay gated.
+    private func runNavigation(_ wv: WKWebView, _ body: @escaping @MainActor () -> Void) async throws -> Int {
+        let bridge = NavigationBridge()
+        bridge.policyCheck = { [policyCheck] u in policyCheck(u) }
+        bridge.responseHostCheck = { [responseHostCheck] u in responseHostCheck(u) }
+        bridge.maxBytes = maxBytes
+        wv.navigationDelegate = bridge
+        defer { wv.navigationDelegate = guardDelegate }
+
+        let timeoutNs = UInt64(max(1000, navTimeoutMs)) * 1_000_000
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { @MainActor in
+                try await bridge.wait { body() }
+            }
+            group.addTask { @MainActor [wv] in
+                try await Task.sleep(nanoseconds: timeoutNs)
+                wv.stopLoading()
+                throw WebEngineError.timeout
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+        try await settle(wv)
+        return bridge.httpStatus
+    }
+
+    /// Poll readyState==complete (bounded) then apply the bounded settle delay.
+    private func settle(_ wv: WKWebView) async throws {
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            let state = (try? await wv.evaluateJavaScript(WebJS.readyStateScript)) as? String
+            if state == "complete" { break }
+            try await Task.sleep(nanoseconds: 80_000_000)
+        }
+        let settleNs = UInt64(max(0, settleMs)) * 1_000_000
+        if settleNs > 0 { try await Task.sleep(nanoseconds: settleNs) }
+    }
+
+    /// Evaluate a click. If the click triggers a navigation, wait for it (bounded)
+    /// and re-settle; otherwise just settle. Returns the JS result JSON string.
+    /// `argLiteral` is built by `BrowserTargets.argLiteral` (JSON-encoded).
+    func click(argLiteral: String) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        let script = BrowserJS.clickScript(argLiteral: argLiteral)
+        let urlBefore = wv.url?.absoluteString ?? ""
+        let raw = (try? await wv.evaluateJavaScript(script) as? String) ?? "{}"
+        // Give a click-triggered navigation a moment to start, then settle either
+        // way. We do NOT throw on no-navigation (many clicks mutate the DOM in
+        // place). SSRF on any nav is enforced by the persistent guard delegate.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        try await waitForNavIfLoading(wv, urlBefore: urlBefore)
+        return raw
+    }
+
+    /// Type into an input; same navigation-aware settle as `click` (submit may
+    /// navigate). Returns the JS result JSON string.
+    func type(argLiteral: String, submit: Bool) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        let script = BrowserJS.typeScript(argLiteral: argLiteral, submit: submit)
+        let urlBefore = wv.url?.absoluteString ?? ""
+        let raw = (try? await wv.evaluateJavaScript(script) as? String) ?? "{}"
+        if submit {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            try await waitForNavIfLoading(wv, urlBefore: urlBefore)
+        } else {
+            try await settle(wv)
+        }
+        return raw
+    }
+
+    /// Go back one history entry. Returns the resulting HTTP status (0 unknown).
+    /// Throws when there's no back entry.
+    @discardableResult
+    func back() async throws -> Int {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        guard wv.canGoBack else { throw WebEngineError.navigationFailed("no back history") }
+        return try await runNavigation(wv) { wv.goBack() }
+    }
+
+    /// Bounded wait while the webview is mid-load (after a click/submit that
+    /// kicked off navigation), then settle. SSRF on the navigation is enforced by
+    /// the persistent `guardDelegate`. Tolerant: a stuck load just falls through
+    /// after the timeout instead of hanging.
+    private func waitForNavIfLoading(_ wv: WKWebView, urlBefore: String) async throws {
+        let deadline = Date().addingTimeInterval(Double(max(1000, navTimeoutMs)) / 1000.0)
+        // Wait until it stops loading OR the URL changed and readyState completes.
+        while Date() < deadline {
+            if Task.isCancelled { break }
+            if !wv.isLoading {
+                let state = (try? await wv.evaluateJavaScript(WebJS.readyStateScript)) as? String
+                if state == "complete" { break }
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await settle(wv)
+    }
+
+    /// Current URL/title for result assembly.
+    func currentURL() -> String { webView?.url?.absoluteString ?? "" }
+    func currentTitle() async -> String {
+        guard let wv = webView else { return "" }
+        return (try? await wv.evaluateJavaScript("document.title") as? String) ?? ""
+    }
+
+    /// Run an arbitrary BUNDLED script on the current page (no page-derived input)
+    /// and return its string result. Used for the accessibility summary + read.
+    func evaluate(_ script: String) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        return (try? await wv.evaluateJavaScript(script) as? String) ?? ""
+    }
+
+    /// Take a snapshot PNG of the current page (delegates frame sizing to caller).
+    func snapshot(fullPage: Bool, scrollHeightScript: String) async throws -> (Data, Int) {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        var targetHeight = 2000
+        if fullPage {
+            let raw = try? await wv.evaluateJavaScript(scrollHeightScript)
+            let maxH = 12000
+            if let h = raw as? Int { targetHeight = min(max(h, 400), maxH) }
+            else if let hd = raw as? Double { targetHeight = min(max(Int(hd), 400), maxH) }
+            else if let hn = raw as? NSNumber { targetHeight = min(max(hn.intValue, 400), maxH) }
+            wv.frame = NSRect(x: 0, y: 0, width: 1280, height: targetHeight)
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        let snapConfig = WKSnapshotConfiguration()
+        if fullPage { snapConfig.rect = NSRect(x: 0, y: 0, width: 1280, height: targetHeight) }
+        let image: NSImage = try await withCheckedThrowingContinuation { cont in
+            wv.takeSnapshot(with: snapConfig) { img, err in
+                if let img = img { cont.resume(returning: img) }
+                else { cont.resume(throwing: err ?? WebEngineError.noContent) }
+            }
+        }
+        // Restore the default viewport height after a full-page resize.
+        if fullPage { wv.frame = frame }
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            throw WebEngineError.noContent
+        }
+        return (png, targetHeight)
+    }
+}
+
+/// The persistent navigation delegate the session webview keeps attached when no
+/// explicit `NavigationBridge` is in flight. It exists solely to keep SSRF
+/// enforcement on background navigations a click/script can trigger (a redirect
+/// to an internal IP after the click resolved). It does NOT bridge a
+/// continuation — it just allows/cancels per the same policy closures.
+@MainActor
+final class SessionGuardDelegate: NSObject, WKNavigationDelegate {
+    private let policyCheck: @MainActor (URL) -> Bool
+    private let responseHostCheck: @MainActor (URL) -> Bool
+    private let maxBytes: Int
+
+    init(policyCheck: @escaping @MainActor (URL) -> Bool,
+         responseHostCheck: @escaping @MainActor (URL) -> Bool,
+         maxBytes: Int) {
+        self.policyCheck = policyCheck
+        self.responseHostCheck = responseHostCheck
+        self.maxBytes = maxBytes
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        if let url = navigationAction.request.url,
+           url.absoluteString.lowercased() != "about:blank",
+           policyCheck(url) == false {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
+        let response = navigationResponse.response
+        let expected = response.expectedContentLength
+        if expected > 0, SizeGuard.rejectByContentLength(Int(expected), max: maxBytes) {
+            decisionHandler(.cancel)
+            return
+        }
+        if let url = response.url, url.absoluteString.lowercased() != "about:blank",
+           responseHostCheck(url) == false {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+}
+
 // MARK: - WebEngine (public async API)
 
 /// The public façade. Owns the renderer pool, search router, content blocker,
@@ -11653,6 +12180,10 @@ final class WebEngine {
     private let cache: WebCache
     private let shotsDir: String
     private var config: AppConfig
+    /// The persistent interactive browsing session (created on first browser_*
+    /// call). Distinct from the one-shot renderer pool; survives across tool
+    /// calls so a search → click → read flow keeps the same page/history.
+    private var browserSessionStore: BrowserSession?
 
     private init() {
         let cfg = AppConfig.load(dir: LLMConfig.configDir)
@@ -11666,12 +12197,28 @@ final class WebEngine {
     }
 
     /// Re-read config (renderer cap, timeouts, search keys) and rebuild the pool
-    /// and router. Call after the user changes settings.
+    /// and router. Call after the user changes settings. Also drops the live
+    /// browsing session so it picks up the new timeouts/byte cap on next use.
     func reloadConfig() {
         let cfg = AppConfig.load(dir: LLMConfig.configDir)
         config = cfg
         pool = RendererPool(maxRenderers: cfg.webMaxRenderers, navTimeoutMs: cfg.webNavTimeoutMs)
         router = SearchRouter(apiKeys: cfg.webSearch.apiKeys, preferred: cfg.webSearch.provider)
+        browserSessionStore?.reset()
+        browserSessionStore = nil
+    }
+
+    /// The persistent session, lazily created with the current SSRF policy + caps.
+    private var browserSession: BrowserSession {
+        if let s = browserSessionStore { return s }
+        let s = BrowserSession(
+            policyCheck: { [weak self] u in self?.redirectAllowed(u) ?? false },
+            responseHostCheck: { [weak self] u in self?.redirectAllowed(u) ?? false },
+            maxBytes: config.webMaxBytes,
+            navTimeoutMs: config.webNavTimeoutMs,
+            settleMs: config.webSettleMs)
+        browserSessionStore = s
+        return s
     }
 
     /// Compile content-blocking rules at startup (call once from AppDelegate).
@@ -11994,6 +12541,155 @@ final class WebEngine {
         return ExtractResult(finalURL: read.finalURL, title: read.title, instruction: instruction, chunks: ranked)
     }
 
+    // MARK: - Interactive browsing session (Playwright-style)
+
+    /// Max clickable/typeable elements surfaced in a `BrowserState`.
+    private static let browserElementCap = 25
+
+    /// Read the DOM-accessibility summary (title, short text, clickable elements)
+    /// off the current session page and assemble a `BrowserState`.
+    private func browserSnapshotState(action: String) async throws -> BrowserState {
+        let session = browserSession
+        let finalURL = session.currentURL()
+        let raw = try await session.evaluate(BrowserJS.summaryScript(cap: Self.browserElementCap))
+        var title = ""
+        var summary = ""
+        var elements: [BrowserElement] = []
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            title = (obj["title"] as? String) ?? ""
+            summary = (obj["summary"] as? String) ?? ""
+            if let arr = obj["elements"] as? [[String: Any]] {
+                for e in arr {
+                    let role = (e["role"] as? String) ?? "button"
+                    let label = (e["label"] as? String) ?? ""
+                    let sel = (e["selector"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    if label.isEmpty { continue }
+                    elements.append(BrowserElement(role: role, label: label, selector: sel))
+                }
+            }
+        }
+        if title.isEmpty { title = await session.currentTitle() }
+        return BrowserState(finalURL: finalURL, title: title, action: action,
+                            summary: summary, elements: elements)
+    }
+
+    /// `browser_open` — navigate the session to `url`, wait for load+settle,
+    /// return a `BrowserState`. SSRF-gated up-front + on every redirect.
+    func browserOpen(_ url: URL) async throws -> BrowserState {
+        try guardURL(url)
+        _ = try await browserSession.load(url)
+        return try await browserSnapshotState(action: "opened \(browserSession.currentURL())")
+    }
+
+    /// `browser_click` — click an element (by visible text or CSS selector) on the
+    /// current page. Throws `noContent` with a helpful message when nothing matches
+    /// (the tool layer turns this into a non-fatal error result).
+    func browserClick(target: String) async throws -> BrowserState {
+        let argLiteral = BrowserTargets.argLiteral(target: target)
+        let raw = try await browserSession.click(argLiteral: argLiteral)
+        let (ok, info, errMsg) = Self.parseActionResult(raw)
+        if !ok {
+            let reason = (errMsg == "not-found")
+                ? "No clickable element matched \"\(target)\". Try a different visible text or a CSS selector; the page's clickable elements are listed in the previous result."
+                : "Click failed: \(errMsg)"
+            throw WebEngineError.navigationFailed(reason)
+        }
+        let what = info["clicked"] ?? target
+        let role = info["role"].map { "\($0) " } ?? ""
+        return try await browserSnapshotState(action: "clicked \(role)\"\(what)\"")
+    }
+
+    /// `browser_type` — focus an input (by label/placeholder/name/selector), type
+    /// `text`, optionally submit. Throws when no input matches.
+    func browserType(target: String, text: String, submit: Bool) async throws -> BrowserState {
+        let argLiteral = BrowserTargets.argLiteral(target: target, text: text)
+        let raw = try await browserSession.type(argLiteral: argLiteral, submit: submit)
+        let (ok, info, errMsg) = Self.parseActionResult(raw)
+        if !ok {
+            let reason = (errMsg == "no-input")
+                ? "No input field matched \"\(target)\". Try the field's placeholder/label/name or a CSS selector."
+                : "Type failed: \(errMsg)"
+            throw WebEngineError.navigationFailed(reason)
+        }
+        let into = info["typedInto"] ?? target
+        let submitted = (info["submitted"] == "true" || info["submitted"] == "1")
+        let action = submitted
+            ? "typed into \"\(into)\" and submitted"
+            : "typed into \"\(into)\""
+        return try await browserSnapshotState(action: action)
+    }
+
+    /// `browser_read` — Readability-extract the CURRENT session page to Markdown.
+    /// Reuses the same extract script as `web_read` (no re-navigation).
+    func browserRead(maxChars: Int) async throws -> ReadResult {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let cap = maxChars > 0 ? maxChars : config.webReadMaxChars
+        let finalURL = session.currentURL()
+        let script = WebJS.extractScript(dropImages: true)
+        let raw = try await session.evaluate(script)
+        guard let jdata = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: jdata) as? [String: Any] else {
+            throw WebEngineError.noContent
+        }
+        if let err = obj["error"] as? String, !err.isEmpty, obj["markdown"] == nil {
+            throw WebEngineError.navigationFailed("extract: \(err)")
+        }
+        let title = (obj["title"] as? String) ?? ""
+        let byline = (obj["byline"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let siteName = (obj["siteName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        var markdown = (obj["markdown"] as? String) ?? ""
+        markdown = MarkdownSanitizer.collapseWhitespace(markdown)
+        let (capped, truncated) = MarkdownSanitizer.truncate(markdown, maxChars: cap)
+        return ReadResult(
+            finalURL: finalURL, status: 200, title: title,
+            byline: byline, siteName: siteName,
+            markdown: capped, charCount: capped.count, truncated: truncated)
+    }
+
+    /// `browser_screenshot` — snapshot the CURRENT session page to a PNG on disk.
+    func browserScreenshot(fullPage: Bool) async throws -> ShotResult {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let finalURL = session.currentURL()
+        let hashName = WebCache.key(method: "GET", url: "session:\(finalURL)", variant: "shot:\(fullPage)")
+        let path = (shotsDir as NSString).appendingPathComponent("\(hashName).png")
+        let (png, height) = try await session.snapshot(fullPage: fullPage, scrollHeightScript: WebJS.scrollHeightScript)
+        try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+        let img = NSImage(data: png)
+        let w = Int(img?.size.width ?? 1280)
+        let h = Int(img?.size.height ?? CGFloat(height))
+        return ShotResult(finalURL: finalURL, path: path, width: w, height: h, fullPage: fullPage)
+    }
+
+    /// `browser_back` — history back, then return a fresh `BrowserState`.
+    func browserBack() async throws -> BrowserState {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        _ = try await session.back()
+        return try await browserSnapshotState(action: "went back to \(session.currentURL())")
+    }
+
+    /// Decode a `{ok, ...}` JSON result from a bundled action script into
+    /// (ok, stringified-fields, error). All values are flattened to strings so the
+    /// caller can read them uniformly. `nonisolated` + pure (no engine state).
+    nonisolated private static func parseActionResult(_ raw: String) -> (ok: Bool, info: [String: String], err: String) {
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (false, [:], "no result")
+        }
+        let ok = (obj["ok"] as? Bool) ?? ((obj["ok"] as? NSNumber)?.boolValue ?? false)
+        var info: [String: String] = [:]
+        for (k, v) in obj {
+            if let s = v as? String { info[k] = s }
+            else if let b = v as? Bool { info[k] = b ? "true" : "false" }
+            else if let n = v as? NSNumber { info[k] = n.stringValue }
+        }
+        let err = (obj["error"] as? String) ?? ""
+        return (ok, info, err)
+    }
+
     // MARK: Tool schemas (re-exported for PR7)
 
     static let webSearchToolSchema = WebToolSchemas.webSearch
@@ -12001,6 +12697,12 @@ final class WebEngine {
     static let webReadToolSchema = WebToolSchemas.webRead
     static let webScreenshotToolSchema = WebToolSchemas.webScreenshot
     static let webExtractToolSchema = WebToolSchemas.webExtract
+    static let browserOpenToolSchema = WebToolSchemas.browserOpen
+    static let browserClickToolSchema = WebToolSchemas.browserClick
+    static let browserTypeToolSchema = WebToolSchemas.browserType
+    static let browserReadToolSchema = WebToolSchemas.browserRead
+    static let browserScreenshotToolSchema = WebToolSchemas.browserScreenshot
+    static let browserBackToolSchema = WebToolSchemas.browserBack
 }
 
 // =====================================================================
@@ -12113,6 +12815,95 @@ struct WebExtractTool: AgentTool {
         let r = try await WebEngine.shared.extract(url, instruction: instruction)
         if r.chunks.isEmpty { return "No content on \(r.finalURL) matched: \(instruction)" }
         return toolJSON(r)
+    }
+}
+
+// MARK: - Interactive browser tools (Playwright-style, session-backed)
+
+/// Render a `BrowserState` into a compact, model-friendly string: a header with
+/// the action + current page, a short page summary, and a numbered list of the
+/// elements the agent can act on next (with a stable selector hint). Kept terse
+/// so it doesn't blow up the context on every step.
+private func formatBrowserState(_ s: BrowserState) -> String {
+    var out = "\(s.action)\nNow on: \(s.title.isEmpty ? "(untitled)" : s.title)\nURL: \(s.finalURL)"
+    if !s.summary.isEmpty {
+        let trimmed = String(s.summary.prefix(600))
+        out += "\n\nPage summary:\n\(trimmed)"
+    }
+    if !s.elements.isEmpty {
+        out += "\n\nClickable elements / inputs you can act on:"
+        for (i, e) in s.elements.prefix(20).enumerated() {
+            let sel = e.selector.map { "  [\($0)]" } ?? ""
+            out += "\n\(i + 1). (\(e.role)) \(e.label)\(sel)"
+        }
+    }
+    return out
+}
+
+/// `browser_open` — navigate the persistent session to a URL.
+struct BrowserOpenTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserOpen, fallbackName: "browser_open", fallbackDescription: "Open a URL in the browsing session.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let url = try toolURL(args.dictionary["url"])
+        return formatBrowserState(try await WebEngine.shared.browserOpen(url))
+    }
+}
+
+/// `browser_click` — click by visible text or CSS selector.
+struct BrowserClickTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserClick, fallbackName: "browser_click", fallbackDescription: "Click an element on the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let target = (args.dictionary["target"] as? String) ?? ""
+        guard !target.isEmpty else { return "Error: 'target' is required (visible text or CSS selector)." }
+        return formatBrowserState(try await WebEngine.shared.browserClick(target: target))
+    }
+}
+
+/// `browser_type` — focus an input, type text, optionally submit.
+struct BrowserTypeTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserType, fallbackName: "browser_type", fallbackDescription: "Type text into an input on the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let target = (d["target"] as? String) ?? ""
+        let text = (d["text"] as? String) ?? ""
+        guard !target.isEmpty else { return "Error: 'target' is required (input label/placeholder/name or CSS selector)." }
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        let submit = (d["submit"] as? Bool) ?? ((d["submit"] as? NSNumber)?.boolValue ?? false)
+        return formatBrowserState(try await WebEngine.shared.browserType(target: target, text: text, submit: submit))
+    }
+}
+
+/// `browser_read` — read the current session page as Markdown.
+struct BrowserReadTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserRead, fallbackName: "browser_read", fallbackDescription: "Read the current page as Markdown.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        var maxChars = 0
+        if let n = d["max_chars"] as? Int { maxChars = n }
+        else if let n = d["max_chars"] as? NSNumber { maxChars = n.intValue }
+        let r = try await WebEngine.shared.browserRead(maxChars: maxChars)
+        var header = "# \(r.title)\nURL: \(r.finalURL)"
+        if let byline = r.byline, !byline.isEmpty { header += "\nBy: \(byline)" }
+        if r.truncated { header += "\n(truncated to \(r.charCount) chars)" }
+        return header + "\n\n" + r.markdown
+    }
+}
+
+/// `browser_screenshot` — screenshot the current session page.
+struct BrowserScreenshotTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserScreenshot, fallbackName: "browser_screenshot", fallbackDescription: "Screenshot the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let fullPage = (d["full_page"] as? Bool) ?? ((d["full_page"] as? NSNumber)?.boolValue ?? false)
+        return toolJSON(try await WebEngine.shared.browserScreenshot(fullPage: fullPage))
+    }
+}
+
+/// `browser_back` — history back in the session.
+struct BrowserBackTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserBack, fallbackName: "browser_back", fallbackDescription: "Go back in the browsing session.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        return formatBrowserState(try await WebEngine.shared.browserBack())
     }
 }
 
@@ -12735,12 +13526,12 @@ struct PopDraftAgent {
     /// Default system prompt seeding the agent.
     static let systemPrompt = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
-    and read the web and to transform text. You can also connect to external \
-    services (email, calendar, Slack, Notion, files, GitHub, …) through MCP \
-    servers the user has configured — each connected server's tools appear to you \
-    namespaced as `<server>__<tool>`. Think step by step. Prefer to verify facts \
-    with the web tools when a question needs current or external information; \
-    otherwise answer directly.
+    and read the web, to DRIVE a live browser (navigate, click, type, read), and \
+    to transform text. You can also connect to external services (email, calendar, \
+    Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
+    each connected server's tools appear to you namespaced as `<server>__<tool>`. \
+    Think step by step. Prefer to verify facts with the web tools when a question \
+    needs current or external information; otherwise answer directly.
 
     WHEN TO USE TOOLS — read this first. Prefer the FEWEST tools necessary, and \
     NEVER call a tool when you can answer directly.
@@ -12765,6 +13556,13 @@ struct PopDraftAgent {
 
     How to use tools well:
     - When you call a tool, wait for its result before continuing.
+    - For a quick lookup, use web_search + web_read. To interact with a page \
+    (run a search box, click into results, work through a multi-step flow), use \
+    the browser_* tools: browser_open a site, browser_type into a field (with \
+    submit:true to search), browser_click a link/button by its visible text or a \
+    CSS selector, browser_read the page, browser_back to go back. The browser \
+    session persists across these calls, and each result lists the clickable \
+    elements you can act on next.
     - After EACH tool result, reassess: decide whether you have enough to answer, \
     or whether one more tool call is genuinely needed. Don't repeat the same \
     search over and over — if a search returns results, READ them and answer.
@@ -12811,6 +13609,12 @@ struct PopDraftAgent {
             await registry.register([
                 WebSearchTool(), WebOpenTool(), WebReadTool(),
                 WebScreenshotTool(), WebExtractTool(),
+            ])
+            // Playwright-style interactive browsing — gated on the same web master
+            // switch. The agent DRIVES a persistent session across these calls.
+            await registry.register([
+                BrowserOpenTool(), BrowserClickTool(), BrowserTypeTool(),
+                BrowserReadTool(), BrowserScreenshotTool(), BrowserBackTool(),
             ])
         }
         // PR9: confirm-gated Mac-control tools — OFF by default.
