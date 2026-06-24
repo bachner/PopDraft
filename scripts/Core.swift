@@ -2936,12 +2936,17 @@ struct AgentLoop {
         finalize: ModelCall? = nil
     ) async throws -> Outcome {
         var working = session
-        let toolsJSON = await registry.openAITools()
         var lastText = ""
         var iterations = 0
 
         while iterations < maxIterations {
             iterations += 1
+            // Re-fetch the tools array EACH iteration: a tool can register MORE
+            // tools into the live registry mid-loop (e.g. `add_mcp_server` starts
+            // an MCP server and registers its tools), so the model must see the
+            // newly-available tools on its next turn. The registry is an actor, so
+            // this snapshot is always consistent.
+            let toolsJSON = await registry.openAITools()
             let turn = try await call(working.messages, toolsJSON)
 
             // No tools requested → final answer.
@@ -3700,6 +3705,54 @@ struct IntegrationCatalog {
             keywords: ["github", "repo", "repository", "pull request", "pr", "issue", "issues", "commit"],
             command: "npx", args: ["-y", "@modelcontextprotocol/server-github"],
             setupNote: "Set GITHUB_PERSONAL_ACCESS_TOKEN."),
+        IntegrationCatalog(
+            id: "Google_Drive", displayName: "Google Drive",
+            keywords: ["google drive", "gdrive", "drive", "spreadsheet", "google doc",
+                       "google docs", "google sheet", "google sheets", "shared drive"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-gdrive"],
+            setupNote: "Runs a one-time Google OAuth; set GDRIVE_CREDENTIALS_PATH."),
+        IntegrationCatalog(
+            id: "Linear", displayName: "Linear",
+            keywords: ["linear", "ticket", "tickets", "task tracker", "sprint", "backlog",
+                       "linear issue", "linear ticket"],
+            command: "npx", args: ["-y", "@tacticlaunch/mcp-linear"],
+            setupNote: "Set LINEAR_API_KEY to a Linear personal API key."),
+        IntegrationCatalog(
+            id: "Postgres", displayName: "PostgreSQL",
+            keywords: ["postgres", "postgresql", "psql", "sql database", "relational database",
+                       "query the database", "run a query"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-postgres",
+                                    "postgresql://localhost/mydb"],
+            setupNote: "Replace the connection string with your database URL."),
+        IntegrationCatalog(
+            id: "SQLite", displayName: "SQLite",
+            keywords: ["sqlite", "sqlite database", "local database", ".db file", "sql file"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-sqlite",
+                                    "--db-path", "$HOME/database.db"],
+            setupNote: "Point --db-path at your .db file."),
+        IntegrationCatalog(
+            id: "Brave_Search", displayName: "Brave Search",
+            keywords: ["brave", "brave search", "web search api", "search the web with brave"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-brave-search"],
+            setupNote: "Set BRAVE_API_KEY to a Brave Search API key."),
+        IntegrationCatalog(
+            id: "Apple_Notes", displayName: "Apple Notes & Reminders",
+            keywords: ["apple notes", "notes app", "reminder", "reminders", "apple reminders",
+                       "my notes", "stickies"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-apple-notes"],
+            setupNote: "Grants access to the macOS Notes & Reminders apps (will prompt)."),
+        IntegrationCatalog(
+            id: "Weather", displayName: "Weather",
+            keywords: ["weather", "forecast", "temperature", "rain", "is it going to rain",
+                       "weather in", "how hot", "how cold", "humidity"],
+            command: "npx", args: ["-y", "@h1deya/mcp-server-weather"],
+            setupNote: "Uses the public US NWS API (US locations); no key needed."),
+        IntegrationCatalog(
+            id: "Maps", displayName: "Maps & Places",
+            keywords: ["map", "maps", "directions", "route", "nearby", "places", "restaurant near",
+                       "how far", "navigate to", "location of"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-google-maps"],
+            setupNote: "Set GOOGLE_MAPS_API_KEY."),
     ]
 
     /// Find the best integration for a free-text capability ask. Matches against
@@ -3738,6 +3791,110 @@ struct IntegrationCatalog {
         if !setupNote.isEmpty { s += " \(setupNote)" }
         return s
     }
+}
+
+// =====================================================================
+// MARK: - add_mcp_server: pure install-request validation
+//
+// PR12: lets the agent SET UP a new MCP server itself. The agent proposes
+// `add_mcp_server(name, command, args)`; the app confirm-gates it exactly like
+// run_shell (same MacControlConfirmer seam + the hard denylist) and, on approval,
+// persists + starts it live. This is the PURE half: validate/normalize the
+// requested install and run the SAME denylist over the would-be process command,
+// so a server install can never smuggle `curl|sh`, `sudo`, etc. past the gate.
+// The subprocess spawn + live registration lives in MCP.swift.
+// =====================================================================
+
+/// The pure decision for an `add_mcp_server` request: validate the args and run
+/// the install command through the Mac-control denylist BEFORE anything spawns.
+enum MCPInstallGuard {
+    /// What `validate` decided. `.ok` carries the normalized server config to
+    /// confirm + start; `.denied`/`.invalid` carry a model-facing message.
+    enum Decision: Equatable {
+        case ok(MCPServerConfig)
+        case denied(reason: String)
+        case invalid(reason: String)
+    }
+
+    /// The single, exact shell-equivalent of the proposed MCP launch, used for
+    /// BOTH the confirm-card text and the denylist check. The app spawns via
+    /// `/usr/bin/env <command> <args…>` (no shell), but we render the
+    /// shell-joined form so the denylist sees what a human would read/approve.
+    static func commandLine(command: String, args: [String]) -> String {
+        ([command] + args).joined(separator: " ")
+    }
+
+    /// Validate + denylist-check a proposed server. `name`/`command` are required;
+    /// `args` default to none. Returns the normalized config on success.
+    static func validate(name rawName: String, command rawCommand: String,
+                         args rawArgs: [String]) -> Decision {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Drop empty arg tokens but keep order; tokens are passed verbatim to the
+        // process (no shell), so internal spaces in a single token are preserved.
+        let args = rawArgs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !name.isEmpty else { return .invalid(reason: "'name' is required") }
+        guard !command.isEmpty else { return .invalid(reason: "'command' is required") }
+        // The namespaced tool prefix derives from the server name; a name that
+        // collides with a built-in family must not be allowed to masquerade.
+        guard !BuiltinToolNames.isReserved(name) else {
+            return .invalid(reason: "server name '\(name)' collides with a built-in tool name")
+        }
+
+        // Run the SAME hard denylist the run_shell gate uses over the full launch
+        // line, so an install can never be `curl … | sh`, `sudo …`, etc.
+        let line = commandLine(command: command, args: args)
+        if let reason = MacControlGuard.denialReason(line) {
+            return .denied(reason: reason)
+        }
+        return .ok(MCPServerConfig(name: name, command: command, args: args, enabled: true))
+    }
+}
+
+/// The result of a one-shot, time-bounded MCP connection probe (the Settings
+/// "Test" action). Pure value type so the UI mapping + the parse are unit-tested
+/// without spawning a process.
+struct MCPProbeResult: Equatable {
+    enum State: Equatable {
+        case reachable(toolCount: Int)   // handshake ok; advertised N tools
+        case unreachable(String)         // failed to start / handshake / timed out
+        case probing                     // in flight (initial UI state)
+        case untested                    // never probed
+    }
+    var state: State
+
+    static let untested = MCPProbeResult(state: .untested)
+    static let probing = MCPProbeResult(state: .probing)
+
+    /// Build from a handshake outcome: a non-nil tool count = reachable; an error
+    /// string = unreachable. (`toolCount` may be 0 for a server that connects but
+    /// advertises nothing — still "reachable".)
+    static func from(toolCount: Int?, error: String?) -> MCPProbeResult {
+        if let n = toolCount { return MCPProbeResult(state: .reachable(toolCount: n)) }
+        return MCPProbeResult(state: .unreachable(error ?? "unreachable"))
+    }
+
+    /// A compact status string for the row (e.g. "14 tools", "needs auth / unreachable").
+    var label: String {
+        switch state {
+        case .reachable(let n): return n == 1 ? "1 tool" : "\(n) tools"
+        case .unreachable(let msg):
+            // A handshake timeout usually means the server is up but waiting on an
+            // auth/OAuth step — surface that, not just "timed out".
+            if msg.localizedCaseInsensitiveContains("time") {
+                return "needs auth / unreachable"
+            }
+            return "unreachable"
+        case .probing: return "testing…"
+        case .untested: return "not tested"
+        }
+    }
+
+    /// Whether the dot should read as success (green) / failure (red) / neutral.
+    var isReachable: Bool { if case .reachable = state { return true }; return false }
+    var isFailure: Bool { if case .unreachable = state { return true }; return false }
 }
 
 /// Names of the built-in agent tools that an MCP server's tool must NEVER shadow.

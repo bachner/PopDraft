@@ -136,6 +136,22 @@ hard denylist (sudo, `rm -rf /`, `curl|sh`, fork bomb, `dd if=`, `> /dev/…`,
 shutdown/reboot) is enforced even on Approve. MacControlGuard / MacControlPolicy
 live in `scripts/Core.swift` (pure, unit-tested by `tests/test-maccontrol.swift`).
 
+**Self-service MCP (PR12):** the agent can SET UP a new MCP server itself via the
+confirm-gated `add_mcp_server({name, command, args, description?})` tool: it
+checks `IntegrationCatalog` (13+ presets: Gmail/Calendar/Drive/Slack/Notion/
+GitHub/Linear/Postgres/SQLite/Brave/Apple Notes/Weather/Maps) or `web_search`es
+for the right `npx`/`uvx` package, PROPOSES the launch command (gated through the
+SAME `MacControlConfirmer` seam + `MCPInstallGuard` denylist as run_shell), and on
+approval persists the `MCPServerConfig`, starts it live, and registers its tools
+into the running `ToolRegistry` so they're usable IN THE SAME turn (the agent
+loop re-reads the registry each iteration). `MCPServerInstaller` (the live seam)
++ `MCPClientHolder` (teardown set, appended-to mid-turn) live in `scripts/MCP.swift`;
+`MCPInstallGuard` + `MCPProbeResult` are pure in `Core.swift`. MCP servers now
+start CONCURRENTLY in `MCPManager.buildTools` (ordered output) so a slow/auth-
+gated server doesn't block the others, and `MCPSettingsView` has a per-server
+status dot + bounded "Test" probe (`MCPManager.probe` → `MCPProbeResult`).
+Unit-tested by `tests/test-mcp.swift`.
+
 ## WebEngine IP pinning (PR11) — DNS-rebinding defense
 
 The WebEngine's `SafetyGuard` resolves a host and verifies every IP is public,
