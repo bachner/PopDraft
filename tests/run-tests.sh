@@ -23,6 +23,7 @@ TESTS=(
   "tests/test-maccontrol.swift scripts/Core.swift"
   "tests/test-ippinning.swift scripts/Core.swift"
   "tests/test-mcp.swift scripts/Core.swift"
+  "tests/test-vision.swift scripts/Core.swift"
   "tests/test-localactions.swift scripts/Core.swift scripts/MacControl.swift scripts/LocalActionTools.swift"
 )
 

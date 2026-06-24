@@ -604,7 +604,14 @@ class LLMClient {
                 entry["content"] = m.content
                 if let id = m.toolCallId { entry["tool_call_id"] = id }
             default:
-                entry["content"] = m.content
+                // VISION: a user turn carrying images emits a content-PART array.
+                // Otherwise keep the EXACT bare-string fast-path (byte-identical
+                // for every existing flow — zero regression).
+                if let images = m.images, !images.isEmpty {
+                    entry["content"] = VisionContent.openAIParts(text: m.content, images: images)
+                } else {
+                    entry["content"] = m.content
+                }
             }
             out.append(entry)
         }
@@ -737,7 +744,17 @@ class LLMClient {
             case "system":
                 systemPrompt = (systemPrompt.map { $0 + "\n" } ?? "") + m.content
             case "user":
-                anthropicMessages.append(["role": "user", "content": m.content])
+                // VISION: a user turn carrying images emits a content-PART array
+                // (text block + image blocks). With no images, keep the EXACT
+                // bare-string fast-path — byte-identical to before.
+                if let images = m.images, !images.isEmpty {
+                    anthropicMessages.append([
+                        "role": "user",
+                        "content": VisionContent.anthropicParts(text: m.content, images: images),
+                    ])
+                } else {
+                    anthropicMessages.append(["role": "user", "content": m.content])
+                }
             case "assistant":
                 var blocks: [[String: Any]] = []
                 if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
@@ -1156,6 +1173,7 @@ enum BuiltinTools {
         WebTools.register()        // web_* + browser_*  (gated on enableWebSearch)
         MacControlTools.register() // run_shell / run_applescript (gated on enableMacControl)
         LocalActionTools.register() // current_datetime / calculator / clipboard_* / current_context / open_app_or_url
+        VisionTools.register()     // see_image (local path / image URL / screenshot:<url>) — vision
     }
 
     /// Arm the catalog's install hook. Safe to call multiple times; the catalog
@@ -1286,6 +1304,14 @@ struct PopDraftAgent {
     If `add_mcp_server` reports the server was added but not reachable (it may need \
     a one-time auth/OAuth or setup step), tell the user that plainly and point them \
     at Settings → MCP (Test) — don't pretend it worked.
+
+    SEEING IMAGES & WEBSITES. You have `see_image` — call it whenever the user asks \
+    what a website LOOKS like, whether a page's layout is broken or correct, or to \
+    visually inspect / describe a page or an image. To capture AND see a live site, \
+    pass `source:"screenshot:<url>"` to see_image in a SINGLE call (it screenshots \
+    the page itself, then looks at it) — do NOT call web_screenshot first. To look \
+    at an image, pass a local file path or an `https:` image URL. Use see_image \
+    instead of guessing from HTML/text when the question is about VISUAL appearance.
 
     ALWAYS finish your turn with a clear, direct, natural-language answer to the \
     user's question, synthesized from what you found. Never end with only a tool \
