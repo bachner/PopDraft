@@ -737,6 +737,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var popupController: PopupWindowController?
     var bubbleController: BubbleWindowController?
     var settingsController: SettingsWindowController?
+    var historyController: HistoryWindowController?
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
     var serverStatusMenuItem: NSMenuItem?
@@ -802,6 +803,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(recentItem)
         recentMenuItem = recentItem
 
+        menu.addItem(NSMenuItem(title: "Browse History…", action: #selector(browseHistory), keyEquivalent: ""))
+
         menu.addItem(NSMenuItem.separator())
 
         let statusMenuItem = NSMenuItem(title: "llama.cpp: Checking...", action: nil, keyEquivalent: "")
@@ -822,6 +825,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Create controllers
         popupController = PopupWindowController()
         settingsController = SettingsWindowController()
+        historyController = HistoryWindowController()
 
         // PR4: persistent corner bubble. Clicking it expands into the panel at
         // the cursor (same path as the hotkey). The popup minimizes the bubble
@@ -1023,6 +1027,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openRecentSession(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         popupController?.reopenSession(id: id)
+    }
+
+    @objc func browseHistory() {
+        historyController?.showWindow()
     }
 
     /// Compact relative time like "just now", "5m ago", "3h ago", "2d ago".
