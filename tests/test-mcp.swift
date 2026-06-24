@@ -203,6 +203,35 @@ check(IntegrationCatalog.all.count >= 5, "catalog has at least 5 presets")
 
 section("built-in tool shadow guard")
 
+// `BuiltinToolNames.reserved` is DERIVED from the tools each feature file
+// registers into `AgentToolCatalog` (gates forced on). The app arms the catalog
+// at startup; in this Core-only unit test we register an equivalent set of
+// built-in groups so the derivation — and the shadow guard built on it — is
+// exercised exactly as the app uses it.
+struct _StubTool: AgentTool {
+    let _name: String
+    var spec: ToolSpec { ToolSpec(name: _name, description: "") }
+    func invoke(_ args: JSONObject) async throws -> String { "" }
+}
+AgentToolCatalog.installBuiltins = {
+    // Always-on text group.
+    AgentToolCatalog.register(BuiltinToolGroup(
+        gate: { _ in true },
+        make: { _, _ in ["summarize_text", "extract_text", "suggest_integration"].map { _StubTool(_name: $0) } }))
+    // Web/browser group — gated on enableWebSearch.
+    AgentToolCatalog.register(BuiltinToolGroup(
+        gate: { $0.agentSettings.enableWebSearch },
+        make: { _, _ in [
+            "web_search", "web_open", "web_read", "web_screenshot", "web_extract",
+            "browser_open", "browser_click", "browser_type",
+            "browser_read", "browser_screenshot", "browser_back",
+        ].map { _StubTool(_name: $0) } }))
+    // Confirm-gated Mac-control group — gated on enableMacControl.
+    AgentToolCatalog.register(BuiltinToolGroup(
+        gate: { $0.agentSettings.enableMacControl },
+        make: { _, _ in ["run_shell", "run_applescript"].map { _StubTool(_name: $0) } }))
+}
+
 check(BuiltinToolNames.isReserved("run_shell"), "run_shell is reserved")
 check(BuiltinToolNames.isReserved("run_applescript"), "run_applescript is reserved")
 check(BuiltinToolNames.isReserved("suggest_integration"), "suggest_integration is reserved")

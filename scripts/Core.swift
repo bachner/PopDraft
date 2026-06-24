@@ -2504,6 +2504,98 @@ func unboxTools(_ boxed: [JSONObject]) -> [[String: Any]] {
     return boxed.map { $0.dictionary }
 }
 
+// MARK: - Built-in agent tool catalog (self-registration)
+
+/// A self-registering group of built-in agent tools owned by one feature file.
+///
+/// The refactor replaced the hand-maintained tool list inside
+/// `PopDraftAgent.buildRegistry` (and the separately-maintained
+/// `BuiltinToolNames.reserved` set) with this catalog: each feature file
+/// (web, text, mac-control, …) declares its own group and registers it via
+/// `AgentToolCatalog.register(_:)`. Adding a built-in tool is then a change to
+/// one feature file — `buildRegistry` and the reserved-name set are derived and
+/// never edited.
+///
+/// `gate` decides, from the live config, whether the group's tools are actually
+/// made available for a turn. `make` builds the concrete tools (it receives the
+/// confirmer for the confirm-gated Mac-control tools — typed `AnyObject?` so this
+/// type stays free of any app-only protocol and remains compilable with Core
+/// alone, e.g. in unit tests). `reserved` collects EVERY group's tool names
+/// regardless of gate, so an MCP tool can never shadow a built-in even one that
+/// is currently gated off.
+struct BuiltinToolGroup: Sendable {
+    /// Whether this group's tools are enabled for the current config.
+    let gate: @Sendable (AppConfig) -> Bool
+    /// Build the concrete tools. `confirmer` is the Mac-control confirmation
+    /// seam (`MacControlConfirmer?`, passed type-erased so this type stays free
+    /// of any app-only protocol and compiles with Core alone, e.g. in tests);
+    /// other groups ignore it. Constructing tools is cheap value work (no actor
+    /// state), so this is plain `@Sendable`.
+    let make: @Sendable (AppConfig, AnyObject?) -> [any AgentTool]
+}
+
+/// Central catalog the feature files register their built-in tool groups into.
+/// `register(_:)` is called once per group from the owning file's bootstrap
+/// (`installBuiltins`), so the set of groups is assembled from the files
+/// themselves rather than a single shared function body.
+///
+/// State is single-threaded by construction: groups are installed exactly once
+/// (lazily, on first use, from the startup-armed `installBuiltins` hook) and only
+/// read thereafter. `nonisolated(unsafe)` documents that contract — there is no
+/// concurrent mutation to guard.
+enum AgentToolCatalog {
+    nonisolated(unsafe) private static var groups: [BuiltinToolGroup] = []
+    nonisolated(unsafe) private static var didInstall = false
+
+    /// The app target installs its built-in groups here. Core.swift declares the
+    /// hook (default no-op) so it compiles standalone for unit tests that link
+    /// only Core; the app (and the MCP-guard test) populate it once before first
+    /// use (see the per-file registrations / `BuiltinTools.arm()`).
+    nonisolated(unsafe) static var installBuiltins: () -> Void = {}
+
+    /// Register a group of built-in tools.
+    static func register(_ group: BuiltinToolGroup) {
+        groups.append(group)
+    }
+
+    /// Ensure the built-in groups are installed exactly once. `installBuiltins`
+    /// is the single hook the app plugs into; it is a no-op in test targets that
+    /// don't link the app files (and don't arm it themselves).
+    static func ensureInstalled() {
+        guard !didInstall else { return }
+        didInstall = true
+        groups.removeAll()
+        installBuiltins()
+    }
+
+    /// The built-in tools enabled for `config`, in registration order. Mac-control
+    /// tools receive `confirmer`.
+    static func enabledTools(config: AppConfig, confirmer: AnyObject?) -> [any AgentTool] {
+        ensureInstalled()
+        var out: [any AgentTool] = []
+        for g in groups where g.gate(config) {
+            out.append(contentsOf: g.make(config, confirmer))
+        }
+        return out
+    }
+
+    /// EVERY built-in tool name, regardless of gate — the set an MCP tool must
+    /// never shadow. Built by making each group with all gates conceptually "on":
+    /// we call `make` directly (ignoring `gate`) with a config in which the gated
+    /// switches are forced on, so even currently-disabled built-ins are reserved.
+    static func reservedNames(config: AppConfig) -> Set<String> {
+        ensureInstalled()
+        var forced = config
+        forced.agentSettings.enableWebSearch = true
+        forced.agentSettings.enableMacControl = true
+        var names = Set<String>()
+        for g in groups {
+            for t in g.make(forced, nil) { names.insert(t.spec.name) }
+        }
+        return names
+    }
+}
+
 // MARK: - Timeout helper
 
 /// Errors raised by the agent runtime.
@@ -3652,14 +3744,13 @@ struct IntegrationCatalog {
 /// MCP tools are namespaced `<server>__<tool>`, so a collision is unlikely, but
 /// we belt-and-suspenders guard the confirm-gated Mac-control tools (and the
 /// other built-ins) so a malicious/buggy server can't hijack them.
+///
+/// Derived, not hand-maintained: the set is computed from EVERY tool the feature
+/// files register into `AgentToolCatalog` (gates forced on), so it stays in sync
+/// with the built-ins automatically — adding a tool is a change to one feature
+/// file, not an edit to a duplicated list here.
 enum BuiltinToolNames {
-    static let reserved: Set<String> = [
-        "run_shell", "run_applescript",
-        "summarize_text", "extract_text", "suggest_integration",
-        "web_search", "web_open", "web_read", "web_screenshot", "web_extract",
-        "browser_open", "browser_click", "browser_type",
-        "browser_read", "browser_screenshot", "browser_back",
-    ]
+    static var reserved: Set<String> { AgentToolCatalog.reservedNames(config: AppConfig()) }
 
     /// True if `name` would shadow a built-in tool and must be rejected.
     static func isReserved(_ name: String) -> Bool { reserved.contains(name) }

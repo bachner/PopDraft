@@ -70,9 +70,10 @@ done
 # GUI / WebKit tests (LOCAL ONLY) — gated behind RUN_GUI_TESTS=1.
 #
 # Hosted CI can't reliably drive an offscreen WKWebView, so these only run when
-# explicitly requested. They co-compile with the real engine (PopDraft.swift +
-# Core.swift) — with the app's @main stripped so the test's top-level code is
-# the entry point — and drive it against a local Python fixture server.
+# explicitly requested. They co-compile with the real engine (all of the app's
+# scripts/*.swift sources except scripts/Main.swift, which carries the app's
+# @main) so the test's top-level code is the sole entry point, and drive it
+# against a local Python fixture server.
 # ----------------------------------------------------------------------------
 if [ "${RUN_GUI_TESTS:-0}" = "1" ]; then
   echo "=========================================="
@@ -106,15 +107,23 @@ if [ "${RUN_GUI_TESTS:-0}" = "1" ]; then
     # The shipping app never sets this, so its SSRF protection is unchanged.
     export PD_WEB_ALLOW_LOOPBACK_PORT="$PORT"
 
-    # Stage the GUI test as the module's main.swift, and a copy of
-    # PopDraft.swift with its @main attribute removed (so there's exactly one
-    # top-level entry point).
+    # Stage the GUI test as the module's main.swift so its top-level code is the
+    # entry point, then co-compile it with ALL of the real app's sources EXCEPT
+    # scripts/Main.swift (which carries the app's own @main) — so there's exactly
+    # one top-level entry point. After the source split, the engine lives across
+    # scripts/WebEngine.swift + its dependencies, so we link every app file.
     GSTAGE="$(mktemp -d /tmp/popdraft-webgui.XXXXXX)"
     cp "$GUI_TEST" "$GSTAGE/main.swift"
-    sed 's/^@main$//' scripts/PopDraft.swift > "$GSTAGE/PopDraft.swift"
     GBIN="/tmp/popdraft-test-webengine-gui"
 
-    if swiftc -o "$GBIN" "$GSTAGE/main.swift" "$GSTAGE/PopDraft.swift" scripts/Core.swift \
+    # Every app source except Main.swift (the @main entry).
+    APP_SOURCES=()
+    for f in scripts/*.swift; do
+      [ "$f" = "scripts/Main.swift" ] && continue
+      APP_SOURCES+=("$f")
+    done
+
+    if swiftc -o "$GBIN" "$GSTAGE/main.swift" "${APP_SOURCES[@]}" \
          -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation -framework Network; then
       echo "  Compiled. Running..."
       if ! "$GBIN"; then OVERALL_EXIT=1; fi
