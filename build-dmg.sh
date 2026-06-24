@@ -87,6 +87,13 @@ cp "${SCRIPT_DIR}/README.md" "${APP_BUNDLE}/Contents/Resources/"
 mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
 cp "${SCRIPT_DIR}"/design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
 
+# Copy bundled web assets for the chat's Markdown + Mermaid renderer
+# (marked.js / mermaid.js / highlight.js + CSS; loaded by AppAssets.webResource).
+if [ -d "${SCRIPT_DIR}/resources/web" ]; then
+  mkdir -p "${APP_BUNDLE}/Contents/Resources/web"
+  cp "${SCRIPT_DIR}"/resources/web/* "${APP_BUNDLE}/Contents/Resources/web/"
+fi
+
 echo "  [OK] Resources copied"
 
 # Generate DMG background image

@@ -223,6 +223,81 @@ func runTests() async {
         R.check(false, "concurrent reads threw: \(error)")
     }
 
+    // =====================================================================
+    // Interactive browser session: open → click a link → read.
+    // =====================================================================
+    do {
+        // open /portal
+        let s1 = try await engine.browserOpen(URL(string: "\(b)/portal")!)
+        R.check(s1.finalURL.contains("/portal"), "browser_open: landed on /portal (\(s1.finalURL))")
+        R.check(s1.title.contains("Fixture Portal"), "browser_open: title parsed (\(s1.title))")
+        R.check(s1.elements.contains { $0.label.contains("Read the Full Article") },
+                "browser_open: summary lists the article link (\(s1.elements.map{$0.label}))")
+        R.check(s1.elements.contains { $0.role == "input" },
+                "browser_open: summary lists the search input")
+
+        // click the link by visible text
+        let s2 = try await engine.browserClick(target: "Read the Full Article")
+        R.check(s2.finalURL.contains("/article"), "browser_click(text): navigated to /article (\(s2.finalURL))")
+        R.check(s2.action.lowercased().contains("clicked"), "browser_click: action describes the click")
+
+        // read the resulting page
+        let r = try await engine.browserRead(maxChars: 12000)
+        R.check(r.finalURL.contains("/article"), "browser_read: reads the current /article page")
+        R.check(r.markdown.contains("first paragraph"), "browser_read: article body extracted")
+        R.check(r.markdown.contains("```"), "browser_read: code fence preserved")
+
+        // screenshot the current session page
+        let shot = try await engine.browserScreenshot(fullPage: false)
+        R.check(FileManager.default.fileExists(atPath: shot.path) && shot.width > 0,
+                "browser_screenshot: PNG written (\(shot.width)x\(shot.height))")
+
+        // back to the portal
+        let s3 = try await engine.browserBack()
+        R.check(s3.finalURL.contains("/portal"), "browser_back: returned to /portal (\(s3.finalURL))")
+    } catch {
+        R.check(false, "browser open→click→read flow threw: \(error)")
+    }
+
+    // --- browser_type + submit drives a search box → results page ---
+    do {
+        _ = try await engine.browserOpen(URL(string: "\(b)/portal")!)
+        let st = try await engine.browserType(target: "Search", text: "eiffel tower", submit: true)
+        R.check(st.finalURL.contains("/searchresults"), "browser_type+submit: navigated to results (\(st.finalURL))")
+        let r = try await engine.browserRead(maxChars: 8000)
+        R.check(r.markdown.lowercased().contains("eiffel tower"),
+                "browser_type+submit: query echoed into results body")
+        R.check(r.markdown.contains("genuine result body"), "browser_read: results body extracted")
+    } catch {
+        R.check(false, "browser type+submit flow threw: \(error)")
+    }
+
+    // --- browser_click: element-not-found returns a clean error (no crash) ---
+    do {
+        _ = try await engine.browserOpen(URL(string: "\(b)/portal")!)
+        _ = try await engine.browserClick(target: "This Link Does Not Exist At All")
+        R.check(false, "browser_click of a missing target should have thrown")
+    } catch let e as WebEngineError {
+        if case .navigationFailed(let msg) = e {
+            R.check(msg.contains("No clickable element"), "browser_click not-found gives a helpful error: \(msg)")
+        } else {
+            R.check(true, "browser_click not-found threw (\(e))")
+        }
+    } catch {
+        R.check(false, "browser_click not-found threw a non-WebEngineError: \(error)")
+    }
+
+    // --- browser SSRF: opening a loopback URL is blocked up-front ---
+    do {
+        _ = try await engine.browserOpen(URL(string: "http://127.0.0.1:1/")!)
+        R.check(false, "browser_open of a loopback URL should have thrown")
+    } catch let e as WebEngineError {
+        if case .blockedHost = e { R.check(true, "browser_open loopback blocked (SSRF)") }
+        else { R.check(true, "browser_open loopback blocked (\(e))") }
+    } catch {
+        R.check(false, "browser_open loopback blocked but non-WebEngineError: \(error)")
+    }
+
     print("\n========================================")
     print("GUI Results: \(R.pass) passed, \(R.fail) failed")
     print("========================================")

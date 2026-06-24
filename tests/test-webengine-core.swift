@@ -384,6 +384,120 @@ test("Web tool JSON-Schema constants are valid JSON") {
     assert(WebToolSchemas.all.count == 5, "five tool schemas")
 }
 
+// MARK: - Interactive browser tool schemas are valid JSON
+
+test("Browser tool JSON-Schema constants are valid JSON") {
+    let expectedNames = ["browser_open", "browser_click", "browser_type",
+                         "browser_read", "browser_screenshot", "browser_back"]
+    assert(WebToolSchemas.browserAll.count == 6, "six browser tool schemas")
+    var names: [String] = []
+    for (i, schema) in WebToolSchemas.browserAll.enumerated() {
+        guard let data = schema.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            assert(false, "browser schema \(i) is not valid JSON")
+            continue
+        }
+        assert(obj["type"] as? String == "function", "browser schema \(i) has type=function")
+        let fn = obj["function"] as? [String: Any]
+        assert(fn != nil, "browser schema \(i) has function object")
+        let name = fn?["name"] as? String ?? ""
+        assert(!name.isEmpty, "browser schema \(i) has a name")
+        names.append(name)
+        assert(fn?["parameters"] is [String: Any], "browser schema \(i) has parameters object")
+        // Each parses into a ToolSpec with a matching name.
+        let spec = ToolSpec.fromOpenAIJSON(schema)
+        assert(spec?.name == name, "browser schema \(i) parses to a ToolSpec named \(name)")
+    }
+    assert(names == expectedNames, "browser tool names in expected order: \(names)")
+    // browser_open / click / type carry their required params.
+    let open = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserOpen)
+    let openReq = (open?.parametersSchema["required"] as? [String]) ?? []
+    assert(openReq == ["url"], "browser_open requires url")
+    let click = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserClick)
+    let clickReq = (click?.parametersSchema["required"] as? [String]) ?? []
+    assert(clickReq == ["target"], "browser_click requires target")
+    let type = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserType)
+    let typeReq = (type?.parametersSchema["required"] as? [String]) ?? []
+    assert(typeReq.contains("target") && typeReq.contains("text"), "browser_type requires target+text")
+}
+
+// MARK: - BrowserTargets: selector-vs-text classification + safe JS embedding
+
+test("BrowserTargets.looksLikeSelector classification") {
+    // Selector-ish.
+    assert(BrowserTargets.looksLikeSelector("#submit"), "# id is a selector")
+    assert(BrowserTargets.looksLikeSelector(".btn"), ". class is a selector")
+    assert(BrowserTargets.looksLikeSelector("[name=q]"), "[attr] is a selector")
+    assert(BrowserTargets.looksLikeSelector("input[name=q]"), "tag[attr] is a selector")
+    assert(BrowserTargets.looksLikeSelector("button.primary"), "tag.class is a selector")
+    assert(BrowserTargets.looksLikeSelector("a#main"), "tag#id is a selector")
+    assert(BrowserTargets.looksLikeSelector("div>span"), "tag>tag is a selector")
+    // Plain visible text — NOT a selector.
+    assert(!BrowserTargets.looksLikeSelector("Sign in"), "plain words are text")
+    assert(!BrowserTargets.looksLikeSelector("Search"), "single word is text")
+    assert(!BrowserTargets.looksLikeSelector("Add to cart"), "multi-word is text")
+    assert(!BrowserTargets.looksLikeSelector(""), "empty is not a selector")
+    // A sentence containing a period is treated as text (has whitespace).
+    assert(!BrowserTargets.looksLikeSelector("Read more here."), "sentence with period+space is text")
+}
+
+test("BrowserTargets.jsString safely encodes arbitrary strings") {
+    // Quotes / backslashes / newlines must be escaped so the JS stays valid.
+    let nasty = "a\"b\\c\nd</script>"
+    let lit = BrowserTargets.jsString(nasty)
+    assert(lit.hasPrefix("\"") && lit.hasSuffix("\""), "jsString is a quoted literal: \(lit)")
+    // Decoding the literal back as JSON yields the original string (round-trip).
+    let back = try? JSONDecoder().decode(String.self, from: Data(lit.utf8))
+    assert(back == nasty, "jsString round-trips through JSON: \(String(describing: back))")
+    // No raw double-quote escapes the literal (would break out of the JS string).
+    let inner = String(lit.dropFirst().dropLast())
+    assert(!inner.contains("\"") || inner.contains("\\\""), "inner quotes are escaped")
+}
+
+test("BrowserTargets.argLiteral builds a safe JS object with asSelector") {
+    // Visible text → asSelector:false.
+    let a = BrowserTargets.argLiteral(target: "Sign in")
+    assert(a.contains("asSelector: false"), "text target → asSelector false: \(a)")
+    assert(a.contains("\"Sign in\""), "target string embedded as JSON literal")
+    assert(!a.contains("text:"), "no text key when text is nil")
+    // Selector → asSelector:true, plus a typed text value.
+    let b = BrowserTargets.argLiteral(target: "input[name=q]", text: "Eiffel Tower")
+    assert(b.contains("asSelector: true"), "selector target → asSelector true: \(b)")
+    assert(b.contains("\"Eiffel Tower\""), "text embedded as JSON literal")
+    // The literal is parseable as JSON5-ish? At minimum the JSON string literals
+    // are valid: extract and decode the target literal.
+    assert(b.hasPrefix("{") && b.hasSuffix("}"), "argLiteral is an object literal")
+    // Injection attempt: a target trying to break out of the JS string must stay
+    // contained inside the JSON string literal (the `"` gets escaped to `\"`).
+    let inject = "\"});alert(1);//"
+    let c = BrowserTargets.argLiteral(target: inject)
+    // The target value is the JSON-encoded literal of `inject`; re-encode it
+    // directly and assert it appears verbatim in the arg literal (so the only
+    // copy of the payload is the safely-escaped one).
+    let safeLit = BrowserTargets.jsString(inject)   // e.g. "\"});alert(1);\/\/"
+    assert(c.contains(safeLit), "injection embedded only as the escaped JSON literal: \(c)")
+    // The dangerous breakout sequence — a BARE double-quote immediately closing
+    // the string then `});` — must NOT appear (the quote is escaped as \").
+    assert(!c.contains("q: \"\"});"), "no bare-quote breakout")
+    // Decoding the embedded literal back yields the original payload (round-trip),
+    // proving it's a contained string, not executable JS.
+    let decoded = try? JSONDecoder().decode(String.self, from: Data(safeLit.utf8))
+    assert(decoded == inject, "escaped injection round-trips to the original payload")
+}
+
+// MARK: - BrowserState / BrowserElement Codable sanity
+
+test("BrowserState Codable round-trip") {
+    let st = BrowserState(
+        finalURL: "https://e.com/x", title: "X", action: "opened https://e.com/x",
+        summary: "hello world",
+        elements: [BrowserElement(role: "link", label: "Next", selector: "#next"),
+                   BrowserElement(role: "input", label: "Search", selector: nil)])
+    let data = try! JSONEncoder().encode(st)
+    let back = try! JSONDecoder().decode(BrowserState.self, from: data)
+    assert(back == st, "BrowserState round-trips with nested elements")
+}
+
 // MARK: - SearchResult / value-type Codable sanity
 
 test("SearchResult Codable round-trip") {

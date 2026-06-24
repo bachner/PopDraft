@@ -1194,6 +1194,90 @@ struct ExtractResult: Codable, Equatable {
     var chunks: [ExtractChunk]
 }
 
+/// One clickable element / input surfaced in the DOM-accessibility summary the
+/// agent reads to decide what to click or type into.
+struct BrowserElement: Codable, Equatable {
+    var role: String      // "link" | "button" | "input" | "textarea" | "select"
+    var label: String     // visible text / value / placeholder / aria-label
+    var selector: String? // a stable CSS selector the agent can pass back as `target`
+}
+
+/// Snapshot of the persistent browsing session after an action. Returned by
+/// every `browser_*` tool so the agent always sees where it is and what it can
+/// do next. `action` describes what just happened (e.g. "clicked link 'Foo'").
+struct BrowserState: Codable, Equatable {
+    var finalURL: String
+    var title: String
+    var action: String          // human-readable description of the last action
+    var summary: String         // short readable text snapshot of the page
+    var elements: [BrowserElement]   // clickable elements / inputs (capped)
+
+    init(finalURL: String, title: String, action: String,
+         summary: String = "", elements: [BrowserElement] = []) {
+        self.finalURL = finalURL
+        self.title = title
+        self.action = action
+        self.summary = summary
+        self.elements = elements
+    }
+}
+
+// MARK: - Browser target resolution (pure, unit-tested)
+
+/// Pure helpers for the interactive browser tools. Kept Foundation-only so they
+/// are unit-tested without WebKit. The actual DOM lookup runs in bundled JS
+/// (`BrowserJS`); these helpers (a) decide whether a target string is a CSS
+/// selector vs. visible text, and (b) safely JSON-encode any agent-supplied
+/// string for embedding into a bundled script — so a page never contributes a
+/// raw string to the JS we evaluate.
+enum BrowserTargets {
+    /// Heuristic: does `target` look like a CSS selector (vs. plain visible text)?
+    /// Selectors start with `#`, `.`, `[`, or are a bare tag/attribute pattern
+    /// containing selector punctuation but no inner whitespace. Plain words like
+    /// "Sign in" are treated as visible text.
+    static func looksLikeSelector(_ target: String) -> Bool {
+        let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return false }
+        // Obvious selector anchors.
+        if t.hasPrefix("#") || t.hasPrefix(".") || t.hasPrefix("[") { return true }
+        // Has selector punctuation AND no inner whitespace → selector-ish
+        // (e.g. "input[name=q]", "button.primary", "a#main", "div>span").
+        let hasSelPunct = t.contains("[") || t.contains("#") || t.contains(".")
+            || t.contains(">") || t.contains("=")
+        let hasSpace = t.contains(" ")
+        if hasSelPunct && !hasSpace { return true }
+        return false
+    }
+
+    /// JSON-encode an arbitrary string as a JS string literal (with surrounding
+    /// quotes). Used to embed agent-supplied targets/text into a bundled script
+    /// WITHOUT string concatenation of raw page/user text. Falls back to an empty
+    /// JS string literal if encoding somehow fails (never returns invalid JS).
+    static func jsString(_ s: String) -> String {
+        if let data = try? JSONEncoder().encode(s),
+           let lit = String(data: data, encoding: .utf8) {
+            return lit
+        }
+        return "\"\""
+    }
+
+    /// Build the JS argument object literal `{target:..., asSelector:..., text:...}`
+    /// from agent input, with every string JSON-encoded. `text` is optional (used
+    /// by type). The returned literal is safe to splice into a bundled function
+    /// call: only structural punctuation we control plus JSON string literals.
+    static func argLiteral(target: String, text: String? = nil) -> String {
+        let sel = looksLikeSelector(target)
+        var parts = [
+            "target: \(jsString(target))",
+            "asSelector: \(sel ? "true" : "false")",
+        ]
+        if let text = text {
+            parts.append("text: \(jsString(text))")
+        }
+        return "{" + parts.joined(separator: ", ") + "}"
+    }
+}
+
 /// Errors surfaced by the web engine. `String`-bearing cases carry detail for tools.
 enum WebEngineError: Error, Equatable, CustomStringConvertible {
     case blockedScheme(String)
@@ -2049,6 +2133,115 @@ enum WebToolSchemas {
 
     /// All schemas, in registration order.
     static let all: [String] = [webSearch, webOpen, webRead, webScreenshot, webExtract]
+
+    // MARK: Interactive browser session tools (Playwright-style)
+
+    static let browserOpen = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_open",
+        "description": "Open a URL in the persistent browsing session (a live browser tab kept across tool calls) and wait for it to load. Use a full URL, or a search-engine URL like https://duckduckgo.com/ to start a search. Returns the final URL, page title, a short readable summary, and a list of clickable elements / inputs you can act on next.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute http(s) URL to navigate the session to." }
+          },
+          "required": ["url"]
+        }
+      }
+    }
+    """
+
+    static let browserClick = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_click",
+        "description": "Click an element on the CURRENT session page. Pass either its visible text (e.g. a link or button label) OR a CSS selector. Best-match is found among links, buttons, and inputs by text, else by querySelector. Returns the resulting URL, title, summary, and clickable elements after any navigation. Returns a helpful error (not a crash) if nothing matches.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": { "type": "string", "description": "Visible text of the link/button to click, OR a CSS selector (e.g. \\"#submit\\", \\"a.result-title\\")." }
+          },
+          "required": ["target"]
+        }
+      }
+    }
+    """
+
+    static let browserType = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_type",
+        "description": "Type text into an input/textarea on the CURRENT session page, identified by its visible label, placeholder, name, aria-label, OR a CSS selector. Optionally submit (press Enter / submit the form) afterward. Use this to fill a search box and run the search. Returns the resulting state.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": { "type": "string", "description": "The input's placeholder/label/name/aria-label, OR a CSS selector (e.g. \\"input[name=q]\\")." },
+            "text": { "type": "string", "description": "The text to type into the field." },
+            "submit": { "type": "boolean", "description": "Press Enter / submit the form after typing.", "default": false }
+          },
+          "required": ["target", "text"]
+        }
+      }
+    }
+    """
+
+    static let browserRead = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_read",
+        "description": "Read the CURRENT session page's main content as clean Markdown (Readability-extracted, sanitized, char-capped). Use after navigating/clicking to actually read what's on the page.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "max_chars": { "type": "integer", "description": "Hard cap on returned characters.", "default": 12000 }
+          },
+          "required": []
+        }
+      }
+    }
+    """
+
+    static let browserScreenshot = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_screenshot",
+        "description": "Take a PNG screenshot of the CURRENT session page and save it to disk. Returns the file path and image dimensions.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "full_page": { "type": "boolean", "description": "Capture the full scrollable page instead of just the viewport.", "default": false }
+          },
+          "required": []
+        }
+      }
+    }
+    """
+
+    static let browserBack = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_back",
+        "description": "Go back one step in the session's history (like the browser Back button). Returns the resulting URL, title, summary, and clickable elements.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    }
+    """
+
+    /// Interactive browser tool schemas, in registration order.
+    static let browserAll: [String] = [
+        browserOpen, browserClick, browserType, browserRead, browserScreenshot, browserBack,
+    ]
 }
 
 // =====================================================================
@@ -3464,6 +3657,8 @@ enum BuiltinToolNames {
         "run_shell", "run_applescript",
         "summarize_text", "extract_text", "suggest_integration",
         "web_search", "web_open", "web_read", "web_screenshot", "web_extract",
+        "browser_open", "browser_click", "browser_type",
+        "browser_read", "browser_screenshot", "browser_back",
     ]
 
     /// True if `name` would shadow a built-in tool and must be rejected.

@@ -66,6 +66,35 @@ enum AppAssets {
 
     /// Sheet of icon variants.
     static var iconSet: NSImage? { image(named: "popdraft-icon-set") }
+
+    /// Load a bundled web asset (JS/CSS) from `Contents/Resources/web/` for the
+    /// `WKWebView`-backed Markdown+Mermaid renderer. Falls back to the source-tree
+    /// `resources/web/` directory for dev builds run straight out of the repo, so
+    /// the rich renderer works without first packaging an .app.
+    static func webResource(_ name: String) -> String? {
+        // 1) Packaged app bundle.
+        if let url = Bundle.main.url(forResource: name, withExtension: nil, subdirectory: "web"),
+           let s = try? String(contentsOf: url, encoding: .utf8) {
+            return s
+        }
+        // 2) Source install: ~/.popdraft/web (populated by install.sh).
+        let installed = URL(fileURLWithPath: NSString(string: "~/.popdraft/web/\(name)").expandingTildeInPath)
+        if let s = try? String(contentsOf: installed, encoding: .utf8) { return s }
+
+        // 3) Dev fallback: walk up from the executable to find resources/web.
+        let fm = FileManager.default
+        var dir = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+            .deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent("resources/web/\(name)")
+            if let s = try? String(contentsOf: candidate, encoding: .utf8) { return s }
+            dir.deleteLastPathComponent()
+        }
+        // 4) CWD fallback.
+        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
+            .appendingPathComponent("resources/web/\(name)")
+        return try? String(contentsOf: cwd, encoding: .utf8)
+    }
 }
 
 // MARK: - Menu Bar Glyph
@@ -2107,6 +2136,8 @@ struct PopupView: View {
     @Binding var customPromptText: String
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isCustomPromptFocused: Bool
+    /// Drives the grow/fade-in appearance animation (item 3: smooth transitions).
+    @State private var appeared = false
     let allActions: [Action]
     let onSelect: (Action) -> Void
     let onCopy: () -> Void
@@ -2157,12 +2188,21 @@ struct PopupView: View {
                 }
             }
         }
-        .frame(width: stateKey == "chat" ? nil : 320)
+        .frame(width: stateKey == "chat" ? nil : 360)
         .background(stateKey == "chat"
             ? AnyView(Color.clear)
-            : AnyView(VisualEffectView(material: .popover, blendingMode: .behindWindow)))
-        .clipShape(RoundedRectangle(cornerRadius: stateKey == "chat" ? 0 : 10))
-        .shadow(color: .black.opacity(stateKey == "chat" ? 0 : 0.2), radius: 10, x: 0, y: 5)
+            : AnyView(LiquidGlassBackground(cornerRadius: 18)))
+        .clipShape(RoundedRectangle(cornerRadius: stateKey == "chat" ? 0 : 18, style: .continuous))
+        // Smooth state transitions (not instant swaps) + a gentle grow/fade-in
+        // when the panel first appears (mirrors the bubble→panel grow).
+        .scaleEffect(appeared ? 1.0 : 0.94)
+        .opacity(appeared ? 1.0 : 0.0)
+        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: appeared)
+        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: stateKey)
+        .onAppear {
+            appeared = false
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { appeared = true }
+        }
         .onChange(of: stateKey) { _, newKey in
             if newKey == "customPrompt" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -2201,11 +2241,10 @@ struct PopupView: View {
                     .font(.system(size: 14))
                     .focused($isSearchFocused)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(Color(NSColor.controlBackgroundColor))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
 
-            Divider()
+            Divider().opacity(0.4)
 
             // Action list
             ScrollViewReader { proxy in
@@ -2214,15 +2253,17 @@ struct PopupView: View {
                         ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
                             ActionRow(
                                 action: action,
-                                isSelected: index == selectedIndex
+                                isSelected: index == selectedIndex,
+                                isPrimary: index == 0 && searchText.isEmpty
                             )
                             .id(action.id)
+                            .contentShape(Rectangle())
                             .onTapGesture {
                                 onSelect(action)
                             }
                         }
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
                 }
                 .onChange(of: selectedIndex) { _, newIndex in
                     if newIndex < actions.count {
@@ -2616,31 +2657,70 @@ struct PopupView: View {
 struct ActionRow: View {
     let action: Action
     let isSelected: Bool
+    /// The visually-primary default action (the first row — "Ask Agent"), matching
+    /// the mock where the new default is highlighted blue.
+    var isPrimary: Bool = false
+
+    @State private var hovering = false
+
+    /// Selected by keyboard nav OR pointer hover → the highlighted state.
+    private var active: Bool { isSelected || hovering }
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 11) {
             Image(systemName: action.icon)
-                .font(.system(size: 14))
-                .foregroundColor(isSelected ? .white : .accentColor)
-                .frame(width: 20)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(iconColor)
+                .frame(width: 22, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(iconBackground))
 
             Text(action.name)
-                .font(.system(size: 13))
-                .foregroundColor(isSelected ? .white : .primary)
+                .font(.system(size: 13, weight: isPrimary ? .semibold : .regular))
+                .foregroundColor(active ? .white : ChatPalette.ink)
 
             Spacer()
 
             if let shortcut = action.shortcut {
                 Text("⌃⌥\(shortcut)")
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(isSelected ? .white.opacity(0.8) : .secondary)
+                    .foregroundColor(active ? .white.opacity(0.85) : ChatPalette.ink3)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule().fill(active ? Color.white.opacity(0.18)
+                                              : ChatPalette.ink.opacity(0.06)))
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(isSelected ? Color.accentColor : Color.clear)
-        .cornerRadius(6)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(rowBackground)
+        .padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: active)
+    }
+
+    @ViewBuilder private var rowBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        if active {
+            shape.fill(ChatPalette.blue)
+        } else if isPrimary {
+            shape.fill(ChatPalette.blueSoft)
+        } else {
+            shape.fill(Color.clear)
+        }
+    }
+
+    private var iconColor: Color {
+        if active { return .white }
+        return isPrimary ? ChatPalette.blue : ChatPalette.blue.opacity(0.9)
+    }
+
+    private var iconBackground: Color {
+        if active { return Color.white.opacity(0.18) }
+        return isPrimary ? ChatPalette.blue.opacity(0.16) : ChatPalette.blue.opacity(0.10)
     }
 }
 
@@ -2659,6 +2739,140 @@ struct VisualEffectView: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
         nsView.material = material
         nsView.blendingMode = blendingMode
+    }
+}
+
+// MARK: - Liquid Glass background (UI overhaul)
+
+/// The reusable Liquid-Glass pane that matches `design-mocks/mock-1-liquid-glass`:
+/// a soft aurora gradient wash (low-opacity blue → indigo → violet) under a
+/// `.ultraThinMaterial` frosted layer, finished with a hairline border and a
+/// soft, layered drop shadow. Used as the background for the chat panel, the
+/// action menu, and the settings window so they read as floating frosted glass
+/// over the desktop (the hosting NSWindow must be transparent for this to show).
+///
+/// `cornerRadius` controls the rounding (≈20–24 for panels, ≈12–16 for cards).
+/// `shadow` can be disabled where the parent already casts one (e.g. cards).
+struct LiquidGlassBackground: View {
+    var cornerRadius: CGFloat = 22
+    var shadow: Bool = true
+    /// A subtler variant for nested cards (less aurora, tighter border).
+    var card: Bool = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        ZStack {
+            // 1) Aurora gradient wash — the soft colored glow behind the frost.
+            auroraWash
+                .opacity(card ? 0.5 : 1.0)
+
+            // 2) Frosted glass layer. `.ultraThinMaterial` blends with whatever
+            //    is behind the (transparent) window, giving the real glass look.
+            shape.fill(.ultraThinMaterial)
+
+            // 3) A faint top-down sheen so the glass catches light at the top.
+            shape.fill(
+                LinearGradient(
+                    colors: [Color.white.opacity(0.18), Color.white.opacity(0.0)],
+                    startPoint: .top, endPoint: .center))
+        }
+        .clipShape(shape)
+        // 4) Hairline border: a bright top edge fading to a dark bottom edge.
+        .overlay(
+            shape.strokeBorder(
+                LinearGradient(
+                    colors: [Color.white.opacity(0.55), Color.white.opacity(0.08),
+                             Color.black.opacity(0.10)],
+                    startPoint: .top, endPoint: .bottom),
+                lineWidth: 1))
+        // 5) Soft, layered drop shadow (only for top-level panels).
+        .modifier(GlassShadow(enabled: shadow))
+    }
+
+    private var auroraWash: some View {
+        ZStack {
+            // Base tint.
+            Color(red: 0.96, green: 0.97, blue: 1.0).opacity(0.55)
+            // Blue bloom, top-left.
+            RadialGradient(
+                colors: [ChatPalette.blue.opacity(0.22), .clear],
+                center: UnitPoint(x: 0.16, y: 0.10), startRadius: 0, endRadius: 360)
+            // Indigo bloom, top-right.
+            RadialGradient(
+                colors: [Color(red: 0.42, green: 0.36, blue: 0.95).opacity(0.20), .clear],
+                center: UnitPoint(x: 0.92, y: 0.04), startRadius: 0, endRadius: 380)
+            // Violet bloom, bottom-right.
+            RadialGradient(
+                colors: [Color(red: 0.74, green: 0.45, blue: 0.98).opacity(0.18), .clear],
+                center: UnitPoint(x: 0.96, y: 0.96), startRadius: 0, endRadius: 420)
+            // Soft cyan bloom, bottom-left.
+            RadialGradient(
+                colors: [Color(red: 0.30, green: 0.78, blue: 0.98).opacity(0.14), .clear],
+                center: UnitPoint(x: 0.04, y: 0.92), startRadius: 0, endRadius: 360)
+        }
+    }
+}
+
+/// A soft, layered drop shadow for a glass panel (two stacked shadows read more
+/// natural than one). A no-op when `enabled` is false.
+private struct GlassShadow: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content
+                .shadow(color: Color.black.opacity(0.18), radius: 22, x: 0, y: 12)
+                .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
+        } else {
+            content
+        }
+    }
+}
+
+/// Hosts SwiftUI content in a fully transparent NSWindow/NSPanel so a
+/// `LiquidGlassBackground` shows through (vibrancy reads the desktop behind).
+/// Centralizes the "make this window glass-ready" setup used by the chat,
+/// action menu, and settings.
+enum GlassWindow {
+    /// Persist + restore the chat window's last size & position so it doesn't snap
+    /// back to a cursor-pinned default every time it's reopened (UI overhaul: the
+    /// chat panel is now user-resizable & movable). Stored in UserDefaults as a
+    /// flat dict; absent/invalid → nil so callers fall back to the default frame.
+    enum ChatGeometry {
+        private static let key = "popdraft.chatWindowFrame"
+        static let minSize = NSSize(width: 420, height: 360)
+
+        static func save(_ frame: NSRect) {
+            UserDefaults.standard.set(
+                ["x": frame.minX, "y": frame.minY, "w": frame.width, "h": frame.height],
+                forKey: key)
+        }
+
+        static func load() -> NSRect? {
+            guard let d = UserDefaults.standard.dictionary(forKey: key),
+                  let x = (d["x"] as? NSNumber)?.doubleValue,
+                  let y = (d["y"] as? NSNumber)?.doubleValue,
+                  let w = (d["w"] as? NSNumber)?.doubleValue,
+                  let h = (d["h"] as? NSNumber)?.doubleValue
+            else { return nil }
+            let size = NSSize(width: max(CGFloat(w), minSize.width),
+                              height: max(CGFloat(h), minSize.height))
+            return NSRect(origin: NSPoint(x: x, y: y), size: size)
+        }
+    }
+
+    /// Strip the window chrome and make the backing surface clear so SwiftUI's
+    /// frosted glass + rounded corners are the only thing the user sees.
+    static func makeTransparent(_ window: NSWindow) {
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false  // the SwiftUI glass casts its own soft shadow
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.styleMask.insert(.fullSizeContentView)
+        // Hide the traffic-light buttons if this is a titled window (settings).
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
     }
 }
 
@@ -2764,6 +2978,22 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// (the `onDelta`/`onProgress` sinks fire on unstructured Tasks whose order
     /// vs. the completion is not guaranteed).
     private var generation: Int = 0
+    /// UI overhaul (item 7): messages the user sent WHILE the agent was already
+    /// generating. They're appended to the transcript immediately (shown as sent
+    /// user bubbles) and flushed together as ONE follow-up turn the moment the
+    /// current run finishes — the input never blocks and nothing is dropped.
+    private var pendingFollowups: [String] = []
+    /// Count of queued-but-not-yet-processed user messages (drives the optional
+    /// "queued (N)" affordance near the input).
+    @Published private(set) var queuedCount: Int = 0
+    /// The chat panel's current pixel size, driven by the window's content size
+    /// (updated by the controller on resize). `ChatView` frames itself to this so
+    /// the user-resizable window's content reflows cleanly (the SwiftUI content
+    /// can't reliably fill an NSHostingView via `maxHeight: .infinity` because the
+    /// transcript's GeometryReader has no intrinsic height).
+    @Published var panelSize: CGSize = CGSize(width: 720, height: 560)
+    /// The text of the last user message sent (for Up-arrow recall in the input).
+    private(set) var lastSentUserMessage: String = ""
 
     init(session: ChatSession, store: SessionStore) {
         self.session = session
@@ -2867,16 +3097,27 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         self.cardsByMessage = cards
     }
 
-    /// Submit a new user turn (from the input bar) and run the agent.
+    /// Submit a new user turn (from the input bar). The input is NEVER blocked:
+    /// if the agent is idle this starts a turn; if it's already generating the
+    /// message is appended to the transcript and queued, then drained as a
+    /// follow-up turn the moment the current run finishes (item 7).
     func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isGenerating else { return }
+        guard !trimmed.isEmpty else { return }
         draft = ""
+        lastSentUserMessage = trimmed
         let now = Date().timeIntervalSince1970
         session.messages.append(ChatMessage(role: "user", content: trimmed, createdAt: now))
         session.updatedAt = now
         rebuildVisible()
-        run()
+        if isGenerating {
+            // Mid-generation: keep streaming, queue this for the next turn. The
+            // message already shows as a sent bubble (rebuildVisible above).
+            pendingFollowups.append(trimmed)
+            queuedCount = pendingFollowups.count
+        } else {
+            run()
+        }
     }
 
     /// Run the agent loop against the current session, streaming text + tool
@@ -2918,6 +3159,15 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                     onTextDelta: onDelta, onProgress: onProgress)
                 guard self.generation == gen else { return }  // superseded → drop
                 var saved = outcome.session
+                // Item 7: re-append any user messages the person typed WHILE this
+                // run was generating (they were queued in `pendingFollowups` and
+                // appended to `self.session`, but `outcome.session` was built from
+                // the pre-run snapshot and would otherwise drop them).
+                for followup in self.pendingFollowups {
+                    saved.messages.append(ChatMessage(
+                        role: "user", content: followup,
+                        createdAt: Date().timeIntervalSince1970))
+                }
                 saved.refreshTitle()
                 self.session = saved
                 self.finishGenerating()
@@ -2938,12 +3188,22 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     }
 
     /// Clear all transient generating state and rebuild the visible transcript.
+    /// If the user queued follow-up messages mid-generation (item 7), drain them
+    /// and immediately start the next turn so nothing is dropped.
     private func finishGenerating() {
         streamingText = ""
         liveToolCards = []
         pendingConfirmations = []
         isGenerating = false
         rebuildVisible()
+        if !pendingFollowups.isEmpty {
+            // The queued messages are already in `session.messages` (appended by
+            // `send`, in order); clear the queue and run ONE follow-up turn against
+            // the full transcript so they're all processed together.
+            pendingFollowups.removeAll()
+            queuedCount = 0
+            run()
+        }
     }
 
     /// Apply one tool-progress event to the live cards.
@@ -2987,6 +3247,8 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         streamingText = ""
         liveToolCards = []
         pendingConfirmations = []
+        pendingFollowups.removeAll()
+        queuedCount = 0
     }
 
     // MARK: - PR9: Mac-control confirmation (MacControlBroker.Sink)
@@ -3033,6 +3295,21 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         self.streamingText = streamingText
         self.isGenerating = generating
         self.liveToolCards = liveCards
+    }
+
+    /// Item 9 debug: append a queued user follow-up + show it as a sent bubble,
+    /// driving the "queued (N)" affordance for the `--debug-show chat` capture.
+    /// Does NOT start a model run (no network).
+    func debugSeedQueuedFollowup(_ text: String) {
+        lastSentUserMessage = text
+        let now = Date().timeIntervalSince1970
+        session.messages.append(ChatMessage(role: "user", content: text, createdAt: now))
+        session.updatedAt = now
+        rebuildVisible()
+        pendingFollowups.append(text)
+        queuedCount = pendingFollowups.count
+        isGenerating = true
+        streamingText = "Sure — condensing further and adding rollback notes"
     }
 }
 
@@ -3659,6 +3936,268 @@ struct ConfirmButtonStyle: ButtonStyle {
 /// One conversation turn. User turns get a blue-tinted right-aligned bubble;
 /// assistant turns render author-labeled Markdown (with code blocks), an optional
 /// Thinking disclosure, the turn's tool cards, and a per-message copy button.
+// MARK: - Chat UI: WebKit Markdown + Mermaid renderer (UI overhaul, item 6)
+
+/// Shared, lazily-loaded copies of the bundled web assets so each message's
+/// WKWebView doesn't re-read them from disk. `available` is true only when
+/// marked.js loaded — the caller falls back to the native renderer otherwise.
+///
+/// NOT main-actor isolated: every member is an immutable `let` `String` (which
+/// is `Sendable`) lazily initialized once, thread-safely, by the Swift runtime
+/// from a pure bundle read. Keeping it nonisolated lets `available` be read from
+/// SwiftUI view builders (which CI compiles as nonisolated) without an isolation
+/// violation, while staying concurrency-safe.
+enum MarkdownWebAssets {
+    static let marked: String = AppAssets.webResource("marked.min.js") ?? ""
+    static let mermaid: String = AppAssets.webResource("mermaid.min.js") ?? ""
+    static let highlightJS: String = AppAssets.webResource("highlight.min.js") ?? ""
+    static let highlightLight: String = AppAssets.webResource("github.min.css") ?? ""
+    static let highlightDark: String = AppAssets.webResource("github-dark.min.css") ?? ""
+
+    /// The rich renderer is only usable if at least marked.js is present.
+    static var available: Bool { !marked.isEmpty }
+}
+
+/// Renders one assistant message body as full Markdown (headings, lists, tables,
+/// links, bold/italic, fenced code with copy + syntax highlighting) AND Mermaid
+/// diagrams (```mermaid blocks) inside a `WKWebView`. The web view auto-reports
+/// its rendered height back so the SwiftUI parent can size the bubble exactly.
+///
+/// Self-contained & offline: marked / mermaid / highlight.js + CSS are inlined
+/// from the bundle, so the web view never loads anything over the network. Links
+/// open in the user's browser instead of navigating the (local) document.
+///
+/// `@MainActor` so its `NSViewRepresentable` methods (which SwiftUI always calls
+/// on the main actor) can touch the main-actor-isolated `Coordinator` (e.g.
+/// mutate `lastMarkdown`) without an isolation violation under CI's stricter
+/// concurrency checking, where these methods would otherwise be nonisolated.
+@MainActor
+struct MarkdownWebView: NSViewRepresentable {
+    let markdown: String
+    let width: CGFloat
+    /// Updated by the JS height-report callback so the SwiftUI parent can grow.
+    @Binding var measuredHeight: CGFloat
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let controller = WKUserContentController()
+        controller.add(context.coordinator, name: "heightChanged")
+        controller.add(context.coordinator, name: "copyCode")
+        config.userContentController = controller
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.setValue(false, forKey: "drawsBackground")  // transparent → glass shows
+        webView.setContentHuggingPriority(.required, for: .vertical)
+        context.coordinator.webView = webView
+        loadHTML(into: webView, context: context)
+        return webView
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        // Re-render only when the markdown actually changed (streaming updates).
+        if context.coordinator.lastMarkdown != markdown {
+            loadHTML(into: webView, context: context)
+        }
+    }
+
+    private func loadHTML(into webView: WKWebView, context: Context) {
+        context.coordinator.lastMarkdown = markdown
+        let isDark = (webView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
+        let html = Self.document(markdown: markdown, dark: isDark)
+        webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    // MARK: HTML document
+
+    /// Build the full self-contained HTML page. The markdown is injected as a
+    /// JSON-encoded string constant (so backticks/quotes can't break out), parsed
+    /// by marked, highlighted, and mermaid-rendered; then the body height is
+    /// posted back to Swift.
+    static func document(markdown: String, dark: Bool) -> String {
+        let json = (try? JSONSerialization.data(withJSONObject: [markdown]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
+        let ink = dark ? "#e8e8ea" : "#1d1d1f"
+        let ink2 = dark ? "#a0a0a8" : "#6e6e73"
+        let blue = "#0A84FF"
+        let codeBg = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.045)"
+        let border = dark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.10)"
+        let hlCSS = dark ? MarkdownWebAssets.highlightDark : MarkdownWebAssets.highlightLight
+        return """
+        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+        \(hlCSS)
+        html,body{margin:0;padding:0;background:transparent;}
+        body{font:13px/1.5 -apple-system,"SF Pro Text",system-ui,sans-serif;color:\(ink);
+             -webkit-font-smoothing:antialiased;overflow:hidden;}
+        #c{padding:0;}
+        #c>*:first-child{margin-top:0;} #c>*:last-child{margin-bottom:0;}
+        h1,h2,h3,h4{font-weight:600;line-height:1.3;margin:0.8em 0 0.4em;}
+        h1{font-size:18px;} h2{font-size:16px;} h3{font-size:14px;} h4{font-size:13px;}
+        p{margin:0.5em 0;} ul,ol{margin:0.5em 0;padding-left:1.4em;} li{margin:0.2em 0;}
+        a{color:\(blue);text-decoration:none;} a:hover{text-decoration:underline;}
+        strong{font-weight:600;} em{font-style:italic;}
+        code{font-family:ui-monospace,"SF Mono",monospace;font-size:12px;
+             background:\(codeBg);padding:1.5px 5px;border-radius:5px;}
+        blockquote{margin:0.6em 0;padding:2px 12px;border-left:3px solid \(blue);
+             color:\(ink2);}
+        table{border-collapse:collapse;margin:0.6em 0;font-size:12.5px;width:auto;}
+        th,td{border:1px solid \(border);padding:5px 10px;text-align:left;}
+        th{background:\(codeBg);font-weight:600;}
+        hr{border:none;border-top:1px solid \(border);margin:1em 0;}
+        .codewrap{position:relative;margin:0.6em 0;border:1px solid \(border);
+             border-radius:10px;overflow:hidden;background:\(codeBg);}
+        .codewrap .bar{display:flex;align-items:center;justify-content:space-between;
+             padding:5px 10px;font-size:9.5px;text-transform:uppercase;letter-spacing:0.04em;
+             color:\(ink2);border-bottom:1px solid \(border);}
+        .codewrap pre{margin:0;padding:10px;overflow-x:auto;}
+        .codewrap pre code{background:none;padding:0;font-size:11.5px;line-height:1.45;}
+        .copybtn{cursor:pointer;border:none;background:none;color:\(ink2);font:inherit;
+             font-size:9.5px;text-transform:uppercase;letter-spacing:0.04em;padding:2px 6px;
+             border-radius:5px;} .copybtn:hover{background:\(codeBg);color:\(blue);}
+        .mermaid{margin:0.6em 0;text-align:center;background:transparent;}
+        </style></head><body><div id="c"></div>
+        <script>\(MarkdownWebAssets.marked)</script>
+        <script>\(MarkdownWebAssets.highlightJS)</script>
+        <script>
+        (function(){
+          var md = \(json)[0];
+          try {
+            marked.setOptions({gfm:true, breaks:true, highlight:function(code, lang){
+              try { if(lang && hljs.getLanguage(lang)) return hljs.highlight(code,{language:lang}).value;
+                    return hljs.highlightAuto(code).value; } catch(e){ return code; }
+            }});
+          } catch(e){}
+          // Split fenced ```mermaid blocks out before markdown so they aren't
+          // mangled, render the rest with marked.
+          var html = '';
+          try { html = marked.parse(md); } catch(e){ html = '<pre>'+md.replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];})+'</pre>'; }
+          var c = document.getElementById('c');
+          c.innerHTML = html;
+          // Wrap each <pre><code> in a card with a language label + copy button.
+          // Mermaid code blocks are converted to <div class="mermaid"> instead.
+          c.querySelectorAll('pre code').forEach(function(code){
+            var pre = code.parentElement;
+            var cls = (code.className||'');
+            var langm = cls.match(/language-(\\w+)/);
+            var lang = langm ? langm[1] : '';
+            if(lang === 'mermaid'){
+              var div = document.createElement('div');
+              div.className = 'mermaid';
+              div.textContent = code.textContent;
+              pre.replaceWith(div);
+              return;
+            }
+            var wrap = document.createElement('div'); wrap.className='codewrap';
+            var bar = document.createElement('div'); bar.className='bar';
+            var label = document.createElement('span'); label.textContent = lang || 'code';
+            var btn = document.createElement('button'); btn.className='copybtn'; btn.textContent='Copy';
+            btn.addEventListener('click', function(){
+              try { window.webkit.messageHandlers.copyCode.postMessage(code.textContent); } catch(e){}
+              btn.textContent='Copied'; setTimeout(function(){btn.textContent='Copy';}, 1400);
+            });
+            bar.appendChild(label); bar.appendChild(btn);
+            wrap.appendChild(bar);
+            var newpre = document.createElement('pre'); newpre.appendChild(code.cloneNode(true));
+            wrap.appendChild(newpre);
+            pre.replaceWith(wrap);
+          });
+          function report(){
+            var h = Math.ceil(document.getElementById('c').getBoundingClientRect().height);
+            try { window.webkit.messageHandlers.heightChanged.postMessage(h); } catch(e){}
+          }
+          // Render mermaid diagrams (async), then report final height.
+          function renderMermaid(){
+            if(typeof mermaid === 'undefined' || !c.querySelector('.mermaid')){ report(); return; }
+            try {
+              mermaid.initialize({startOnLoad:false, theme:\(dark ? "'dark'" : "'default'"),
+                                  securityLevel:'strict', fontFamily:'-apple-system,system-ui,sans-serif'});
+              mermaid.run({nodes: c.querySelectorAll('.mermaid')}).then(report).catch(report);
+            } catch(e){ report(); }
+          }
+          // Report height now (text) and again after mermaid + images settle.
+          report();
+          new ResizeObserver(report).observe(c);
+          renderMermaid();
+        })();
+        </script>
+        <script>\(MarkdownWebAssets.mermaid)</script>
+        <script>/* mermaid loads last; trigger a re-render now that it exists */
+          (function(){ try {
+            var c=document.getElementById('c');
+            if(typeof mermaid!=='undefined' && c.querySelector('.mermaid')){
+              mermaid.initialize({startOnLoad:false, theme:\(dark ? "'dark'" : "'default'"),
+                                  securityLevel:'strict', fontFamily:'-apple-system,system-ui,sans-serif'});
+              mermaid.run({nodes:c.querySelectorAll('.mermaid')}).then(function(){
+                var h=Math.ceil(c.getBoundingClientRect().height);
+                try{window.webkit.messageHandlers.heightChanged.postMessage(h);}catch(e){}
+              }).catch(function(){});
+            }
+          } catch(e){} })();
+        </script>
+        </body></html>
+        """
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        let parent: MarkdownWebView
+        weak var webView: WKWebView?
+        var lastMarkdown: String = "\u{0}"  // sentinel so first render always fires
+
+        init(_ parent: MarkdownWebView) { self.parent = parent }
+
+        func userContentController(_ uc: WKUserContentController, didReceive message: WKScriptMessage) {
+            switch message.name {
+            case "heightChanged":
+                if let n = message.body as? NSNumber {
+                    let h = CGFloat(truncating: n)
+                    if abs(h - parent.measuredHeight) > 0.5 {
+                        parent.measuredHeight = max(h, 1)
+                    }
+                }
+            case "copyCode":
+                if let s = message.body as? String {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(s, forType: .string)
+                }
+            default: break
+            }
+        }
+
+        // Links open in the user's browser; never navigate the local document.
+        func webView(_ webView: WKWebView, decidePolicyFor nav: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if nav.navigationType == .linkActivated, let url = nav.request.url {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+            } else {
+                decisionHandler(.allow)
+            }
+        }
+    }
+}
+
+/// A SwiftUI wrapper that hosts `MarkdownWebView` at its self-measured height,
+/// with a native-Markdown fallback while the height is unknown / web assets are
+/// missing. Keeps a plain-text copy affordance via the parent message bubble.
+struct RichMarkdownBody: View {
+    let markdown: String
+    @State private var height: CGFloat = 1
+
+    var body: some View {
+        GeometryReader { geo in
+            MarkdownWebView(markdown: markdown, width: geo.size.width, measuredHeight: $height)
+        }
+        .frame(height: max(height, 1))
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     /// Tool cards belonging to THIS assistant turn (finished) — rendered above the answer.
@@ -3745,6 +4284,17 @@ struct MessageBubble: View {
     }
 
     @ViewBuilder private func renderedMarkdown(_ text: String) -> some View {
+        // Item 6: when the bundled web assets are present, render the full body
+        // (Markdown + tables + fenced code + Mermaid diagrams) in a WKWebView.
+        // Otherwise fall back to the native AttributedString + CodeBlockView path.
+        if MarkdownWebAssets.available {
+            RichMarkdownBody(markdown: text)
+        } else {
+            nativeMarkdown(text)
+        }
+    }
+
+    @ViewBuilder private func nativeMarkdown(_ text: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(MarkdownParser.blocks(text)) { block in
                 switch block {
@@ -3813,10 +4363,30 @@ struct StreamingCaret: View {
 /// live tool cards + streaming caret, and a bottom input bar with a send button,
 /// tool chips, and a streaming hint. Fixed-size panel + internal ScrollView (no
 /// `fittingSize` auto-resize).
+/// Reports how far the transcript's bottom sentinel sits below the visible
+/// bottom edge of the scroll view (≤ threshold ⇒ the user is pinned to the
+/// bottom). Used for smart "stick to bottom" auto-scroll.
+private struct BottomDistanceKey: PreferenceKey {
+    // `let` (not `var`): the protocol only reads this, and a `let` is
+    // concurrency-safe global state (no mutable shared state under Swift 6).
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 struct ChatView: View {
     @ObservedObject var viewModel: AgentChatViewModel
     let onMinimize: () -> Void
     @FocusState private var inputFocused: Bool
+    /// Smart auto-scroll: true while the user is pinned to the bottom. Auto-scroll
+    /// follows new content only while this is true; scrolling up turns it off, and
+    /// scrolling back to the bottom turns it back on.
+    @State private var isAtBottom = true
+
+    private let scrollSpaceName = "transcriptScroll"
+    /// Within this many points of the bottom counts as "pinned".
+    private let bottomThreshold: CGFloat = 40
 
     static let panelWidth: CGFloat = 720
     static let panelHeight: CGFloat = 560
@@ -3829,10 +4399,12 @@ struct ChatView: View {
             Divider().opacity(0.4)
             inputBar
         }
-        .frame(width: Self.panelWidth, height: Self.panelHeight)
-        .background(VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+        // Size to the window's content size (published + updated on resize). This
+        // makes the user-resizable window reflow cleanly — see `panelSize`.
+        .frame(width: max(viewModel.panelSize.width, GlassWindow.ChatGeometry.minSize.width),
+               height: max(viewModel.panelSize.height, GlassWindow.ChatGeometry.minSize.height))
+        .background(LiquidGlassBackground(cornerRadius: 22))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     // MARK: Header
@@ -3894,32 +4466,99 @@ struct ChatView: View {
 
     private var transcript: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    if let sel = viewModel.session.selectedText, !sel.isEmpty {
-                        contextChip(sel)
+            // Measure the visible viewport height so we can tell, from the bottom
+            // sentinel's position in the scroll coordinate space, whether the user
+            // is pinned to the bottom.
+            GeometryReader { viewport in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        if let sel = viewModel.session.selectedText, !sel.isEmpty {
+                            contextChip(sel)
+                        }
+                        ForEach(viewModel.visibleMessages, id: \.id) { msg in
+                            MessageBubble(
+                                message: msg,
+                                toolCards: viewModel.cardsByMessage[msg.id] ?? [])
+                            .id(msg.id)
+                        }
+                        // The still-generating turn (streaming text + running tool
+                        // cards + caret) renders as its own trailing block.
+                        if viewModel.isGenerating {
+                            generatingBlock
+                                .id("__generating__")
+                        }
+                        // Invisible bottom sentinel: its maxY in the scroll space,
+                        // minus the viewport height, is the user's distance from
+                        // the bottom (≤ threshold ⇒ pinned).
+                        Color.clear
+                            .frame(height: 1)
+                            .id("__bottom__")
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: BottomDistanceKey.self,
+                                        value: geo.frame(in: .named(scrollSpaceName)).maxY
+                                            - viewport.size.height)
+                                })
                     }
-                    ForEach(viewModel.visibleMessages, id: \.id) { msg in
-                        MessageBubble(
-                            message: msg,
-                            toolCards: viewModel.cardsByMessage[msg.id] ?? [])
-                        .id(msg.id)
-                    }
-                    // The still-generating turn (streaming text + running tool
-                    // cards + caret) renders as its own trailing block.
-                    if viewModel.isGenerating {
-                        generatingBlock
-                            .id("__generating__")
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .coordinateSpace(name: scrollSpaceName)
+                .onPreferenceChange(BottomDistanceKey.self) { distance in
+                    // distance ≈ 0 when the sentinel sits at the viewport's bottom.
+                    let pinned = distance <= bottomThreshold
+                    if pinned != isAtBottom {
+                        withAnimation(.easeOut(duration: 0.18)) { isAtBottom = pinned }
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 16)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // Smart auto-scroll: follow the bottom only while the user is pinned.
+                .onChange(of: viewModel.visibleMessages.count) { _, _ in autoScroll(proxy) }
+                .onChange(of: viewModel.streamingText) { _, _ in autoScroll(proxy) }
+                .onChange(of: viewModel.liveToolCards.count) { _, _ in autoScroll(proxy) }
+                .onChange(of: viewModel.pendingConfirmations.count) { _, _ in autoScroll(proxy) }
+                .overlay(alignment: .bottomTrailing) {
+                    if !isAtBottom {
+                        jumpToLatestButton(proxy)
+                            .padding(.trailing, 14)
+                            .padding(.bottom, 10)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
             }
-            .onChange(of: viewModel.visibleMessages.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: viewModel.streamingText) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: viewModel.liveToolCards.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: viewModel.pendingConfirmations.count) { _, _ in scrollToBottom(proxy) }
+        }
+    }
+
+    /// A floating "jump to latest" button shown when the user has scrolled up.
+    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            isAtBottom = true
+            withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("__bottom__", anchor: .bottom) }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Latest").font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(Capsule().fill(ChatPalette.blue))
+            .shadow(color: ChatPalette.blue.opacity(0.4), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .help("Scroll to the latest message")
+    }
+
+    /// Auto-scroll to the bottom, but ONLY while the user is pinned there. Never
+    /// yanks the view down while they're reading scrolled-up content.
+    private func autoScroll(_ proxy: ScrollViewProxy) {
+        guard isAtBottom else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo("__bottom__", anchor: .bottom)
+            }
         }
     }
 
@@ -3991,18 +4630,6 @@ struct ChatView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.15)) {
-                if viewModel.isGenerating {
-                    proxy.scrollTo("__generating__", anchor: .bottom)
-                } else if let last = viewModel.visibleMessages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            }
-        }
-    }
-
     // MARK: Input bar
 
     private var inputBar: some View {
@@ -4014,7 +4641,8 @@ struct ChatView: View {
                     .lineLimit(1...5)
                     .focused($inputFocused)
                     .onSubmit(submit)
-                    .disabled(viewModel.isGenerating)
+                    // Item 7: input stays ENABLED during generation — a message
+                    // sent mid-stream is queued and run as a follow-up turn.
 
                 Button(action: submit) {
                     Image(systemName: "arrow.up")
@@ -4036,8 +4664,19 @@ struct ChatView: View {
             HStack(spacing: 8) {
                 toolChip("globe", "Web", on: viewModel.webEnabled)
                 toolChip("wand.and.stars", "Actions", on: false)
+                if viewModel.queuedCount > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "tray.full").font(.system(size: 9))
+                        Text("queued \(viewModel.queuedCount)")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.orange.opacity(0.14)))
+                }
                 Spacer()
-                Text(viewModel.isGenerating ? "Streaming…" : "Enter to send")
+                Text(viewModel.isGenerating ? "Streaming… you can keep typing" : "Enter to send · ↑ to recall")
                     .font(.system(size: 10))
                     .foregroundColor(ChatPalette.ink3)
             }
@@ -4059,13 +4698,20 @@ struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !viewModel.isGenerating &&
+        // Sending mid-generation is allowed (queued as a follow-up) — only an
+        // empty draft blocks the button.
         !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func submit() {
         guard canSend else { return }
         viewModel.send(viewModel.draft)
+    }
+
+    /// Up-arrow in an empty input recalls the last sent user message (item 8).
+    fileprivate func recallLastMessage() {
+        guard viewModel.draft.isEmpty, !viewModel.lastSentUserMessage.isEmpty else { return }
+        viewModel.draft = viewModel.lastSentUserMessage
     }
 
     private func minimize() {
@@ -4403,14 +5049,12 @@ class PopupWindowController: NSWindowController {
             defer: false
         )
         window.level = .floating
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.hasShadow = true
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.becomesKeyOnlyIfNeeded = false  // Always become key when shown
+        // Fully transparent so the SwiftUI Liquid-Glass pane (action menu / chat)
+        // shows through with its own frost, rounding, and soft shadow.
+        GlassWindow.makeTransparent(window)
 
         super.init(window: window)
 
@@ -4423,13 +5067,43 @@ class PopupWindowController: NSWindowController {
             name: NSWindow.didResignKeyNotification,
             object: window
         )
+        // Track live resize so the chat content reflows to the window size.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResize),
+            name: NSWindow.didResizeNotification,
+            object: window
+        )
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
-        // Keep the chat on screen when it loses focus so the user can keep
-        // working alongside it; only transient states auto-dismiss on blur.
+        // The chat is a PERSISTENT window: the user can click away into other apps
+        // and keep it on screen alongside their work. It only goes away on explicit
+        // minimize-to-bubble, copy, or close. The transient action menu still
+        // auto-dismisses on blur.
         if case .chat = state { return }
         dismiss()
+    }
+
+    /// Keep the chat content sized to the (user-resizable) window. Only relevant
+    /// in chat state; harmless otherwise. Skipped during programmatic resizes so
+    /// it doesn't feed a panelSize→content-size→window-size loop.
+    @objc private func windowDidResize(_ notification: Notification) {
+        guard case .chat = state, !isProgrammaticResize, let window = window else { return }
+        chatViewModel?.panelSize = window.frame.size
+    }
+
+    /// True while we're setting the chat window frame ourselves, so the resize
+    /// notification doesn't echo back into `panelSize`.
+    private var isProgrammaticResize = false
+
+    /// Run `body` with programmatic-resize suppression so any resulting
+    /// `windowDidResize` doesn't overwrite the size we just chose.
+    private func withProgrammaticResize(_ body: () -> Void) {
+        isProgrammaticResize = true
+        body()
+        // Clear on the next runloop tick, after the resize notification fires.
+        DispatchQueue.main.async { [weak self] in self?.isProgrammaticResize = false }
     }
 
     required init?(coder: NSCoder) {
@@ -4469,9 +5143,9 @@ class PopupWindowController: NSWindowController {
             hostingView?.rootView = view
         }
 
-        // PR8: the chat uses a FIXED-size panel with its own internal ScrollView —
-        // the `fittingSize` auto-resize hack below fights a growing transcript, so
-        // skip it entirely in chat mode (the size is set once in `enterChat`).
+        // PR8: the chat sizes itself from the window's content size (published on
+        // the view model, updated on resize) and owns an internal ScrollView, so
+        // it skips the `fittingSize` auto-resize used by the quick action menu.
         if case .chat = state { return }
 
         // Defer resize to next run loop so SwiftUI can finish layout
@@ -4601,6 +5275,7 @@ class PopupWindowController: NSWindowController {
             return
         }
         Logger.shared.info("showAtMouseLocation: showing action menu (selection=\(!clipboardText.isEmpty), bubble=\(bubbleEnabled))")
+        resetPanelForMenu()
         state = .actionList
         updateView()
 
@@ -4715,6 +5390,9 @@ class PopupWindowController: NSWindowController {
     func dismiss() {
         // PR8: stop any in-flight agent run before tearing down.
         chatViewModel?.cancel()
+        // Persist the chat window's size/position so it reopens where the user
+        // left it (UI overhaul: resizable + movable chat).
+        saveChatGeometryIfChat()
         // PR5: persist the session on minimize/dismiss too (idempotent with copy —
         // a session already flushed by copyResult won't be written twice, and an
         // empty/aborted session is skipped by hasMeaningfulExchange).
@@ -4768,6 +5446,14 @@ class PopupWindowController: NSWindowController {
             if case .chat = self.state {
                 if event.keyCode == 53 { // Escape
                     self.dismiss()
+                    return nil
+                }
+                // Item 8: Up arrow with an EMPTY input recalls the last sent
+                // message into the input (shell-history style). When the input has
+                // text we pass it through so caret movement still works.
+                if event.keyCode == 126, let vm = self.chatViewModel,
+                   vm.draft.isEmpty, !vm.lastSentUserMessage.isEmpty {
+                    vm.draft = vm.lastSentUserMessage
                     return nil
                 }
                 return event
@@ -5036,13 +5722,184 @@ class PopupWindowController: NSWindowController {
         if autoRun { vm.run() }
     }
 
-    /// Resize + recenter the window to the fixed chat panel, clamped to screen.
+    // MARK: - Debug show (item 9)
+
+    /// Show the REAL on-screen action menu populated with the default actions, at
+    /// the center of the main screen, for a `--debug-show menu` screen capture.
+    func debugShowMenu() {
+        resetPanelForMenu()
+        clipboardText = "Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average."
+        searchText = ""
+        selectedIndex = 0
+        state = .actionList
+        updateView()
+        centerOnMainScreen(defaultSize: NSSize(width: 360, height: 420))
+        window?.makeKeyAndOrderFront(nil)
+        startKeyboardMonitoring()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Show the REAL on-screen chat window seeded with a representative
+    /// conversation (user msg, assistant Markdown answer incl. a ```mermaid
+    /// block, a finished tool-call card, a thinking disclosure, plus a queued
+    /// follow-up) at a deliberately non-default size for a `--debug-show chat`
+    /// capture.
+    func debugShowChat() {
+        let session = PopupWindowController.sampleDebugSession()
+        let vm = AgentChatViewModel(session: session, store: sessionStore)
+        chatViewModel = vm
+        currentSession = session
+        didSaveCurrentSession = false
+        presentedMessageCount = session.messages.count
+        state = .chat
+        // Pick a deliberately NON-default size to prove the window is resizable,
+        // and publish it BEFORE building the content so `ChatView` renders at that
+        // size and the hosting view sizes the window to match (no size fight).
+        let size = NSSize(width: 620, height: 640)
+        vm.panelSize = size
+        updateView()
+
+        if let window = window {
+            window.styleMask.insert(.resizable)
+            window.isMovableByWindowBackground = true
+            window.minSize = GlassWindow.ChatGeometry.minSize
+            let vf = primaryVisibleFrame()
+            let origin = NSPoint(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2)
+            withProgrammaticResize {
+                window.setFrame(NSRect(origin: origin, size: size), display: true)
+            }
+        }
+
+        // Seed a queued follow-up so the "queued (N)" affordance + a pending user
+        // bubble are visible in the capture, and keep the streaming caret alive.
+        vm.debugSeedQueuedFollowup("And add a section on rollback strategy.")
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// The visible frame of the primary (menu-bar) display, i.e. the one whose
+    /// origin is (0,0). Reliable for debug captures regardless of mouse position.
+    private func primaryVisibleFrame() -> NSRect {
+        let primary = NSScreen.screens.first { $0.frame.origin == .zero }
+            ?? NSScreen.main ?? NSScreen.screens[0]
+        return primary.visibleFrame
+    }
+
+    /// Center the shared panel on the primary screen at `defaultSize`.
+    private func centerOnMainScreen(defaultSize: NSSize) {
+        guard let window = window else { return }
+        let vf = primaryVisibleFrame()
+        let origin = NSPoint(x: vf.midX - defaultSize.width / 2,
+                             y: vf.midY - defaultSize.height / 2)
+        window.setFrame(NSRect(origin: origin, size: defaultSize), display: true)
+    }
+
+    /// Build a rich sample chat session that exercises every chat affordance:
+    /// a selected-text context, a user message, a finished tool call, a thinking
+    /// disclosure, and an assistant answer with full Markdown + a Mermaid diagram.
+    static func sampleDebugSession() -> ChatSession {
+        let now = Date().timeIntervalSince1970
+        let answer = """
+        Here's a tighter rewrite — and I verified the **40% deployment-time** claim via the search result below.
+
+        ## Suggested rewrite
+        > Our platform helps teams ship faster — customers cut deployment time by **40%** on average, with onboarding in days.
+
+        ### Why it's stronger
+        1. Leads with the outcome (*ship faster*).
+        2. Keeps the verified **40%** stat front and center.
+        3. Trims filler ("usually takes just a couple of").
+
+        | Metric | Before | After |
+        | --- | --- | --- |
+        | Words | 31 | 18 |
+        | Reading grade | 9.4 | 6.1 |
+
+        A quick view of the rollout flow:
+
+        ```mermaid
+        flowchart LR
+            A[Selected text] --> B{Action}
+            B -->|Ask Agent| C[Chat + tools]
+            B -->|Grammar| D[Quick fix]
+            C --> E[Copy result]
+            D --> E
+        ```
+
+        And the equivalent in code:
+
+        ```swift
+        func rewrite(_ text: String) -> String {
+            text.condensed(target: .marketing)
+        }
+        ```
+        """
+        let searchResult = """
+        [{"title":"Enterprise SaaS pricing benchmark 2026","url":"https://example.com/saas-benchmark","snippet":"Teams adopting modern deployment pipelines report a 38–42% reduction in average deployment time."}]
+        """
+        let messages: [ChatMessage] = [
+            ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
+            ChatMessage(role: "user",
+                        content: "Make this more concise, and double-check the 40% pricing claim.",
+                        createdAt: now),
+            ChatMessage(role: "assistant", content: "",
+                        toolCalls: [
+                            ChatToolCall(id: "call_1", name: "web_search",
+                                         arguments: "{\"query\":\"enterprise SaaS pricing benchmark 2026\"}"),
+                        ], createdAt: now),
+            ChatMessage(role: "tool", content: searchResult, toolCallId: "call_1", createdAt: now),
+            ChatMessage(role: "assistant", content: answer,
+                        thinking: "The user wants a tighter rewrite and asked me to verify the 40% deployment-time figure. I searched for a 2026 SaaS benchmark, found a source reporting 38–42%, which supports ~40%, then condensed the copy while keeping that stat.",
+                        createdAt: now),
+        ]
+        var session = ChatSession(
+            createdAt: now, updatedAt: now, model: "Qwen3.5-4B · local",
+            selectedText: "Our platform helps teams ship faster. We've seen customers reduce their deployment time by 40% on average, and onboarding usually takes just a couple of days.",
+            messages: messages)
+        session.refreshTitle()
+        return session
+    }
+
+    /// Size the chat panel and make it user-resizable + movable. Restores the
+    /// last saved size/position (clamped to screen) if the user moved it before,
+    /// otherwise falls back to the default size pinned near the cursor.
+    /// Make the chat hosting view WINDOW-driven (not intrinsic-size-driven) so a
+    /// `setFrame` opens the panel at the size we ask for and the user can drag it
+    /// larger/smaller. Without this, NSHostingView re-asserts its fitting size and
+    /// our `setFrame` is immediately overridden.
+    private func prepareChatHostingView() {
+        guard let host = hostingView else { return }
+        host.translatesAutoresizingMaskIntoConstraints = true
+        host.autoresizingMask = [.width, .height]
+    }
+
     private func sizeWindowForChat() {
         guard let window = window else { return }
+        // Make the shared panel resizable + movable while in chat mode (the quick
+        // action menu resets these in `resetPanelForMenu`).
+        window.styleMask.insert(.resizable)
+        window.isMovableByWindowBackground = true
+        window.minSize = GlassWindow.ChatGeometry.minSize
+        prepareChatHostingView()
+
+        let screen = currentScreen()
+        let screenFrame = screen.visibleFrame
+
+        if let saved = GlassWindow.ChatGeometry.load() {
+            // Restore, clamped so it can't open fully offscreen.
+            var f = saved
+            f.size.width = min(f.size.width, screenFrame.width - 20)
+            f.size.height = min(f.size.height, screenFrame.height - 20)
+            f.origin.x = min(max(f.origin.x, screenFrame.minX + 10), screenFrame.maxX - f.width - 10)
+            f.origin.y = min(max(f.origin.y, screenFrame.minY + 10), screenFrame.maxY - f.height - 10)
+            chatViewModel?.panelSize = f.size
+            withProgrammaticResize { window.setFrame(f, display: true) }
+            return
+        }
+
+        // First open: default size pinned near the cursor.
         let size = NSSize(width: ChatView.panelWidth, height: ChatView.panelHeight)
         let mouseLocation = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
-        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         var origin = NSPoint(
             x: mouseLocation.x - size.width / 2,
             y: mouseLocation.y - size.height - 10)
@@ -5054,7 +5911,30 @@ class PopupWindowController: NSWindowController {
         if origin.y + size.height > screenFrame.maxY - 10 {
             origin.y = screenFrame.maxY - size.height - 10
         }
-        window.setFrame(NSRect(origin: origin, size: size), display: true)
+        chatViewModel?.panelSize = size
+        withProgrammaticResize { window.setFrame(NSRect(origin: origin, size: size), display: true) }
+    }
+
+    private func currentScreen() -> NSScreen {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens[0]
+    }
+
+    /// Reset the shared panel back to the fixed, cursor-anchored quick-menu form
+    /// (the action menu must not be resizable/movable). Called before showing the
+    /// action list.
+    private func resetPanelForMenu() {
+        guard let window = window else { return }
+        window.styleMask.remove(.resizable)
+        window.isMovableByWindowBackground = false
+    }
+
+    /// Persist the chat window's current size + position (call before tearing the
+    /// chat down) so it reopens where the user left it.
+    private func saveChatGeometryIfChat() {
+        guard case .chat = state, let window = window else { return }
+        GlassWindow.ChatGeometry.save(window.frame)
     }
 
     // MARK: - Session recording (PR5)
@@ -5243,13 +6123,65 @@ class PopupWindowController: NSWindowController {
 
 // MARK: - Settings Window
 
+/// One segment of the Settings tab bar: an icon + label, filled system-blue when
+/// selected, with a hover highlight otherwise. A `Button` so it's keyboard- and
+/// pointer-clickable, but plain-styled so it reads as a tab not a push button.
+private struct SettingsTabButton: View {
+    let tab: SettingsView.SettingsTab
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: tab.icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(tab.shortLabel)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+            }
+            .foregroundColor(isSelected ? .white : ChatPalette.ink2)
+            .padding(.vertical, 7)
+            .padding(.horizontal, 13)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isSelected ? AnyShapeStyle(ChatPalette.blue)
+                          : (hovering ? AnyShapeStyle(ChatPalette.blue.opacity(0.10))
+                             : AnyShapeStyle(Color.clear))))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
 struct SettingsView: View {
     enum SettingsTab: String, CaseIterable {
         case general = "General"
-        case actions = "Actions"
         case models = "Models"
+        case actions = "Actions"
         case mcp = "MCP"
         case tts = "Text-to-Speech"
+
+        /// SF Symbol shown beside the tab label in the segmented tab bar.
+        var icon: String {
+            switch self {
+            case .general: return "gearshape.fill"
+            case .models: return "cpu.fill"
+            case .actions: return "wand.and.stars"
+            case .mcp: return "server.rack"
+            case .tts: return "speaker.wave.2.fill"
+            }
+        }
+
+        /// Short label for the compact segmented control.
+        var shortLabel: String {
+            switch self {
+            case .tts: return "Voice"
+            default: return rawValue
+            }
+        }
     }
 
     @State private var selectedTab: SettingsTab = .general
@@ -5396,64 +6328,49 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Tab bar
-            HStack(spacing: 0) {
-                ForEach(SettingsTab.allCases, id: \.self) { tab in
-                    Button(action: { selectedTab = tab }) {
-                        Text(tab.rawValue)
-                            .font(.system(size: 12, weight: selectedTab == tab ? .semibold : .regular))
-                            .foregroundColor(selectedTab == tab ? .accentColor : .secondary)
-                            .padding(.vertical, 8)
-                            .padding(.horizontal, 16)
-                            .background(
-                                selectedTab == tab ?
-                                Color.accentColor.opacity(0.1) : Color.clear
-                            )
-                            .cornerRadius(6)
+            titleBar
+            tabBar
+            Divider().opacity(0.4)
+
+            // Tab content — scrolls if a tab grows beyond the window.
+            ScrollView {
+                Group {
+                    switch selectedTab {
+                    case .general:
+                        generalSettingsTab
+                    case .actions:
+                        actionsSettingsTab
+                    case .models:
+                        modelsSettingsTab
+                    case .mcp:
+                        MCPSettingsView(servers: $mcpServers)
+                    case .tts:
+                        ttsSettingsTab
                     }
-                    .buttonStyle(.plain)
                 }
-                Spacer()
+                .padding(.horizontal, 18)
+                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
+            .frame(maxHeight: .infinity)
 
-            Divider()
-                .padding(.top, 8)
+            Divider().opacity(0.4)
 
-            // Tab content - fixed height container
-            Group {
-                switch selectedTab {
-                case .general:
-                    generalSettingsTab
-                case .actions:
-                    actionsSettingsTab
-                case .models:
-                    modelsSettingsTab
-                case .mcp:
-                    MCPSettingsView(servers: $mcpServers)
-                case .tts:
-                    ttsSettingsTab
-                }
-            }
-            .frame(height: 340)
-
-            Divider()
-
+            // Footer actions.
             HStack(spacing: 12) {
-                Button("Cancel") {
-                    onCancel()
-                }
-                .keyboardShortcut(.cancelAction)
-
-                Button("Save") {
-                    saveSettings()
-                }
-                .keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { saveSettings() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
             }
-            .padding(16)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
         }
-        .frame(width: 500, height: 580)
+        .frame(width: 560, height: 620)
+        .background(LiquidGlassBackground(cornerRadius: 16, shadow: false))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .onAppear {
             loadCurrentConfig()
             if selectedProvider == .ollama {
@@ -5465,6 +6382,52 @@ struct SettingsView: View {
                 fetchOllamaModels()
             }
         }
+    }
+
+    /// A small title row with the brand orb + "Settings" — reads as a window
+    /// title since the real titlebar chrome is hidden for the glass look.
+    private var titleBar: some View {
+        HStack(spacing: 9) {
+            Group {
+                if let orb = AppAssets.bubbleOrb {
+                    Image(nsImage: orb).resizable().scaledToFit()
+                } else {
+                    Circle().fill(LinearGradient(
+                        colors: [ChatPalette.blue, Color(red: 0.78, green: 0.61, blue: 1.0)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                }
+            }
+            .frame(width: 20, height: 20)
+            Text("PopDraft Settings")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(ChatPalette.ink)
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
+    }
+
+    /// A clearly-visible, capsule-segmented tab bar (System-Settings style):
+    /// each tab is an icon + label, the selected one filled system-blue.
+    private var tabBar: some View {
+        HStack(spacing: 4) {
+            ForEach(SettingsTab.allCases, id: \.self) { tab in
+                SettingsTabButton(
+                    tab: tab,
+                    isSelected: selectedTab == tab,
+                    action: { withAnimation(.easeOut(duration: 0.16)) { selectedTab = tab } })
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(ChatPalette.ink.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(ChatPalette.hairline.opacity(0.5), lineWidth: 0.5))
+        .padding(.horizontal, 18)
+        .padding(.bottom, 12)
     }
 
     // MARK: - General Settings Tab
@@ -7381,12 +8344,15 @@ class SettingsWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
+            styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "PopDraft Settings"
+        window.isMovableByWindowBackground = true
+        // Transparent so the SwiftUI Liquid-Glass settings surface shows through.
+        GlassWindow.makeTransparent(window)
         window.center()
 
         super.init(window: window)
@@ -9560,6 +10526,230 @@ enum WebJS {
     """#
 }
 
+// MARK: - Bundled JS for interactive browsing (Playwright-style)
+
+/// JavaScript injected into the persistent session webview to DRIVE a page:
+/// build an accessibility summary, find + click an element by text/selector,
+/// and focus + type into an input. Every function is a self-contained, bundled
+/// string — agent-supplied strings are passed ONLY as a JSON `args` object that
+/// the Swift side builds with `BrowserTargets.argLiteral` (JSON-encoded), so the
+/// page never contributes a raw string to the evaluated script.
+enum BrowserJS {
+    /// Shared prelude: helpers to read visible text, compute a stable selector for
+    /// an element, test visibility, and find the best match for a target. Prepended
+    /// to each action script. `__ARGS__` is replaced by a JSON object literal.
+    private static let prelude = #"""
+    function __pdText(n){ return (n && (n.innerText || n.textContent) || '').replace(/\s+/g,' ').trim(); }
+    function __pdVisible(n){
+      if(!n) return false;
+      var s = window.getComputedStyle(n);
+      if(!s || s.display==='none' || s.visibility==='hidden' || parseFloat(s.opacity||'1')===0) return false;
+      var r = n.getBoundingClientRect();
+      return (r.width>1 && r.height>1);
+    }
+    function __pdSelector(n){
+      if(!n || n.nodeType!==1) return '';
+      if(n.id){ return '#'+CSS.escape(n.id); }
+      var tag = n.tagName.toLowerCase();
+      // name attr is stable + common on inputs.
+      var nm = n.getAttribute && n.getAttribute('name');
+      if(nm){ return tag+'[name="'+nm.replace(/"/g,'\\"')+'"]'; }
+      // Build an nth-of-type path (short, deterministic).
+      var path=[]; var el=n; var depth=0;
+      while(el && el.nodeType===1 && depth<5 && el.tagName.toLowerCase()!=='html'){
+        var t=el.tagName.toLowerCase();
+        var parent=el.parentNode;
+        if(!parent){ path.unshift(t); break; }
+        var sibs=[]; var c=parent.firstElementChild;
+        for(; c; c=c.nextElementSibling){ if(c.tagName===el.tagName) sibs.push(c); }
+        if(sibs.length>1){ var idx=sibs.indexOf(el)+1; path.unshift(t+':nth-of-type('+idx+')'); }
+        else { path.unshift(t); }
+        el=parent; depth++;
+      }
+      return path.join(' > ');
+    }
+    function __pdLabel(n){
+      var t = __pdText(n);
+      if(t) return t.slice(0,120);
+      var v = n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('placeholder') || n.value || n.getAttribute('name') || n.getAttribute('title'));
+      return (v||'').toString().replace(/\s+/g,' ').trim().slice(0,120);
+    }
+    function __pdRole(n){
+      var tag=n.tagName.toLowerCase();
+      if(tag==='a') return 'link';
+      if(tag==='button') return 'button';
+      if(tag==='textarea') return 'textarea';
+      if(tag==='select') return 'select';
+      if(tag==='input'){
+        var ty=(n.getAttribute('type')||'text').toLowerCase();
+        if(ty==='submit'||ty==='button') return 'button';
+        return 'input';
+      }
+      var role=n.getAttribute && n.getAttribute('role');
+      if(role==='button') return 'button';
+      if(role==='link') return 'link';
+      return 'button';
+    }
+    // Candidate clickable / typeable elements (visible only).
+    function __pdClickables(){
+      var sel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [onclick]';
+      var nodes = Array.prototype.slice.call(document.querySelectorAll(sel));
+      return nodes.filter(__pdVisible);
+    }
+    // Find the best element for a target. If asSelector, querySelector first.
+    // Else: exact visible-text match, then case-insensitive contains, over
+    // clickable candidates; falls back to querySelector if the text looks usable.
+    function __pdFind(args){
+      var target=(args.target||'').trim();
+      if(!target) return null;
+      if(args.asSelector){
+        try{ var q=document.querySelector(target); if(q) return q; }catch(e){}
+      }
+      var cands=__pdClickables();
+      var lt=target.toLowerCase();
+      // 1) exact text/label match.
+      for(var i=0;i<cands.length;i++){ if(__pdText(cands[i]).toLowerCase()===lt) return cands[i]; }
+      for(var i2=0;i2<cands.length;i2++){
+        var lab=(__pdLabel(cands[i2])||'').toLowerCase();
+        if(lab===lt) return cands[i2];
+      }
+      // 2) contains.
+      for(var j=0;j<cands.length;j++){ if(__pdText(cands[j]).toLowerCase().indexOf(lt)>=0) return cands[j]; }
+      for(var j2=0;j2<cands.length;j2++){
+        var lab2=(__pdLabel(cands[j2])||'').toLowerCase();
+        if(lab2.indexOf(lt)>=0) return cands[j2];
+      }
+      // 3) last resort: try it as a selector even if it didn't "look like" one.
+      try{ var q2=document.querySelector(target); if(q2) return q2; }catch(e){}
+      return null;
+    }
+    // Find the best INPUT/textarea for a target (placeholder/label/name/aria/selector).
+    function __pdFindInput(args){
+      var target=(args.target||'').trim();
+      if(args.asSelector){
+        try{ var q=document.querySelector(target); if(q) return q; }catch(e){}
+      }
+      var inputs=Array.prototype.slice.call(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(__pdVisible);
+      // Skip hidden/checkbox/radio/submit inputs for typing.
+      inputs=inputs.filter(function(n){
+        if(n.tagName.toLowerCase()!=='input') return true;
+        var ty=(n.getAttribute('type')||'text').toLowerCase();
+        return ['hidden','checkbox','radio','submit','button','image','file','range','color'].indexOf(ty)<0;
+      });
+      if(!target){ return inputs.length?inputs[0]:null; }
+      var lt=target.toLowerCase();
+      function attrMatch(n){
+        var a=[n.getAttribute('placeholder'), n.getAttribute('aria-label'), n.getAttribute('name'), n.getAttribute('title'), n.getAttribute('id')];
+        for(var k=0;k<a.length;k++){ if(a[k] && a[k].toLowerCase().indexOf(lt)>=0) return true; }
+        // <label for=id> text.
+        if(n.id){ var lbl=document.querySelector('label[for="'+CSS.escape(n.id)+'"]'); if(lbl && __pdText(lbl).toLowerCase().indexOf(lt)>=0) return true; }
+        return false;
+      }
+      for(var i=0;i<inputs.length;i++){ if(attrMatch(inputs[i])) return inputs[i]; }
+      // selector fallback.
+      try{ var q2=document.querySelector(target); if(q2) return q2; }catch(e){}
+      return inputs.length?inputs[0]:null;
+    }
+    var __pdArgs = __ARGS__;
+    """#
+
+    /// Build the DOM-accessibility summary: title, a short readable text snapshot,
+    /// and up to `cap` clickable/typeable elements with role/label/selector.
+    /// Returns a JSON string `{title, summary, elements:[{role,label,selector}]}`.
+    static func summaryScript(cap: Int) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: "{}") + #"""
+            var CAP = \#(cap);
+            var els = [];
+            var cands = __pdClickables();
+            var seen = {};
+            for(var i=0;i<cands.length && els.length<CAP;i++){
+              var n=cands[i];
+              var label=__pdLabel(n);
+              if(!label) continue;
+              var role=__pdRole(n);
+              var sel=__pdSelector(n);
+              var key=role+'|'+label;
+              if(seen[key]) continue; seen[key]=1;
+              els.push({role:role, label:label, selector:sel});
+            }
+            var body = (document.body ? (document.body.innerText||'') : '').replace(/\s+/g,' ').trim();
+            return JSON.stringify({
+              title: (document.title||'').trim(),
+              summary: body.slice(0, 800),
+              elements: els
+            });
+          }catch(e){ return JSON.stringify({title:(document.title||''), summary:'', elements:[], error:String(e)}); }
+        })();
+        """#
+    }
+
+    /// Click script. `argLiteral` is `{target, asSelector}` from `BrowserTargets`.
+    /// Returns `{ok, clicked, role}` JSON. Splices in no page-derived string.
+    static func clickScript(argLiteral: String) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: argLiteral) + #"""
+            var el = __pdFind(__pdArgs);
+            if(!el){ return JSON.stringify({ok:false, error:'not-found'}); }
+            var label = __pdLabel(el) || __pdText(el);
+            var role = __pdRole(el);
+            try{ el.scrollIntoView({block:'center'}); }catch(e){}
+            try{ el.focus(); }catch(e){}
+            // Prefer a native click (fires navigation for <a>/<button>).
+            if(typeof el.click==='function'){ el.click(); }
+            else {
+              var ev=document.createEvent('MouseEvents');
+              ev.initEvent('click', true, true);
+              el.dispatchEvent(ev);
+            }
+            return JSON.stringify({ok:true, clicked:label, role:role});
+          }catch(e){ return JSON.stringify({ok:false, error:String(e)}); }
+        })();
+        """#
+    }
+
+    /// Type script. `argLiteral` is `{target, asSelector, text}`. `submit` triggers
+    /// an Enter keydown + form.submit() fallback. Returns `{ok, typedInto, submitted}`.
+    static func typeScript(argLiteral: String, submit: Bool) -> String {
+        return #"""
+        (function(){
+          try{
+        """# + prelude.replacingOccurrences(of: "__ARGS__", with: argLiteral) + #"""
+            var SUBMIT = \#(submit ? "true" : "false");
+            var el = __pdFindInput(__pdArgs);
+            if(!el){ return JSON.stringify({ok:false, error:'no-input'}); }
+            var label = __pdLabel(el);
+            try{ el.scrollIntoView({block:'center'}); }catch(e){}
+            try{ el.focus(); }catch(e){}
+            var text = (__pdArgs.text!=null) ? String(__pdArgs.text) : '';
+            if(el.isContentEditable){ el.textContent = text; }
+            else { el.value = text; }
+            try{ el.dispatchEvent(new Event('input', {bubbles:true})); }catch(e){}
+            try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}
+            var submitted=false;
+            if(SUBMIT){
+              try{
+                var kd=new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+                el.dispatchEvent(kd);
+                var ku=new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+                el.dispatchEvent(ku);
+              }catch(e){}
+              // Fallback: submit the enclosing form if no navigation kicked off.
+              var f = el.form || (el.closest && el.closest('form'));
+              if(f){ try{ if(typeof f.requestSubmit==='function'){ f.requestSubmit(); } else { f.submit(); } submitted=true; }catch(e){} }
+              else { submitted=true; }
+            }
+            return JSON.stringify({ok:true, typedInto:label||'(input)', submitted:submitted});
+          }catch(e){ return JSON.stringify({ok:false, error:String(e)}); }
+        })();
+        """#
+    }
+}
+
 // MARK: - Content blocking ruleset
 
 /// Compiles small `WKContentRuleList`s once at startup and caches them. Two
@@ -10686,6 +11876,296 @@ private final class ProxyConnection: @unchecked Sendable {
     }
 }
 
+// MARK: - Persistent browsing session (Playwright-style)
+
+/// ONE long-lived offscreen `WKWebView` the agent DRIVES across tool calls
+/// (open → type → click → read), distinct from the one-shot read/screenshot
+/// `RendererPool` (which recreates a fresh webview per job and never persists
+/// state). The session keeps cookies/history/scroll position alive so a flow
+/// like "search → click a result → read it" works.
+///
+/// SSRF: every navigation (initial load, click-triggered nav, redirect, response
+/// host, and Back) is gated by the SAME `policyCheck`/`responseHostCheck` the
+/// pool uses — supplied by `WebEngine` — and, on macOS 14+, routed through the
+/// `PinningProxy`. The session webview uses a NON-persistent data store so it
+/// leaves nothing on disk, but keeps that store alive for the session's lifetime.
+@MainActor
+final class BrowserSession {
+    /// The live webview (lazily created on first use). A persistent navigation
+    /// delegate stays attached so click-initiated navigations are still SSRF-gated
+    /// (the per-call `NavigationBridge` only spans an explicit load).
+    private var webView: WKWebView?
+    private let frame = NSRect(x: 0, y: 0, width: 1280, height: 2000)
+    private let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+    /// SSRF policy + byte cap supplied by `WebEngine`. `policyCheck` runs on every
+    /// navigation action (incl. click-triggered + redirects); `responseHostCheck`
+    /// re-validates the committed response URL; `maxBytes` caps the body.
+    private let policyCheck: @MainActor (URL) -> Bool
+    private let responseHostCheck: @MainActor (URL) -> Bool
+    private let maxBytes: Int
+    private let navTimeoutMs: Int
+    private let settleMs: Int
+
+    /// The persistent delegate enforcing SSRF on background (click) navigations.
+    private let guardDelegate: SessionGuardDelegate
+
+    init(policyCheck: @escaping @MainActor (URL) -> Bool,
+         responseHostCheck: @escaping @MainActor (URL) -> Bool,
+         maxBytes: Int, navTimeoutMs: Int, settleMs: Int) {
+        self.policyCheck = policyCheck
+        self.responseHostCheck = responseHostCheck
+        self.maxBytes = maxBytes
+        self.navTimeoutMs = navTimeoutMs
+        self.settleMs = settleMs
+        self.guardDelegate = SessionGuardDelegate(
+            policyCheck: policyCheck, responseHostCheck: responseHostCheck, maxBytes: maxBytes)
+    }
+
+    /// Whether a page has ever been loaded into the session.
+    var hasPage: Bool { (webView?.url) != nil }
+
+    /// Lazily build the session webview (non-persistent store, proxy on 14+).
+    private func ensureWebView() -> WKWebView {
+        if let wv = webView { return wv }
+        let config = WKWebViewConfiguration()
+        let dataStore = WKWebsiteDataStore.nonPersistent()
+        if #available(macOS 14.0, *) {
+            let proxyPort = PinningProxy.shared.startIfNeeded()
+            if proxyPort != 0, let nwPort = NWEndpoint.Port(rawValue: proxyPort) {
+                let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: nwPort)
+                let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
+                dataStore.proxyConfigurations = [proxy]
+            }
+        }
+        config.websiteDataStore = dataStore
+        let wv = WKWebView(frame: frame, configuration: config)
+        wv.customUserAgent = userAgent
+        // Ads-only ruleset (interactive pages need their images/layout).
+        if let list = ContentBlocker.shared.adsOnlyList() {
+            wv.configuration.userContentController.add(list)
+        }
+        OffscreenRenderHost.shared.attach(wv, frame: frame)
+        webView = wv
+        return wv
+    }
+
+    /// Tear down the session webview (called on engine reload / app teardown).
+    func reset() {
+        if let wv = webView {
+            wv.stopLoading()
+            wv.navigationDelegate = nil
+            OffscreenRenderHost.shared.detach(wv)
+        }
+        webView = nil
+    }
+
+    /// Navigate to `url`, wait for load + a bounded settle. SSRF-gated on the
+    /// initial request, every redirect, and the response host. Throws on
+    /// blocked host / nav failure / timeout.
+    @discardableResult
+    func load(_ url: URL) async throws -> Int {
+        let wv = ensureWebView()
+        return try await runNavigation(wv) {
+            wv.load(URLRequest(url: url))
+        }
+    }
+
+    /// Run `body` (a navigation trigger) under a fresh `NavigationBridge` so we
+    /// get a precise load completion + SSRF gate + timeout, then restore the
+    /// persistent guard delegate so background navigations stay gated.
+    private func runNavigation(_ wv: WKWebView, _ body: @escaping @MainActor () -> Void) async throws -> Int {
+        let bridge = NavigationBridge()
+        bridge.policyCheck = { [policyCheck] u in policyCheck(u) }
+        bridge.responseHostCheck = { [responseHostCheck] u in responseHostCheck(u) }
+        bridge.maxBytes = maxBytes
+        wv.navigationDelegate = bridge
+        defer { wv.navigationDelegate = guardDelegate }
+
+        let timeoutNs = UInt64(max(1000, navTimeoutMs)) * 1_000_000
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { @MainActor in
+                try await bridge.wait { body() }
+            }
+            group.addTask { @MainActor [wv] in
+                try await Task.sleep(nanoseconds: timeoutNs)
+                wv.stopLoading()
+                throw WebEngineError.timeout
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+        try await settle(wv)
+        return bridge.httpStatus
+    }
+
+    /// Poll readyState==complete (bounded) then apply the bounded settle delay.
+    private func settle(_ wv: WKWebView) async throws {
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            let state = (try? await wv.evaluateJavaScript(WebJS.readyStateScript)) as? String
+            if state == "complete" { break }
+            try await Task.sleep(nanoseconds: 80_000_000)
+        }
+        let settleNs = UInt64(max(0, settleMs)) * 1_000_000
+        if settleNs > 0 { try await Task.sleep(nanoseconds: settleNs) }
+    }
+
+    /// Evaluate a click. If the click triggers a navigation, wait for it (bounded)
+    /// and re-settle; otherwise just settle. Returns the JS result JSON string.
+    /// `argLiteral` is built by `BrowserTargets.argLiteral` (JSON-encoded).
+    func click(argLiteral: String) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        let script = BrowserJS.clickScript(argLiteral: argLiteral)
+        let urlBefore = wv.url?.absoluteString ?? ""
+        let raw = (try? await wv.evaluateJavaScript(script) as? String) ?? "{}"
+        // Give a click-triggered navigation a moment to start, then settle either
+        // way. We do NOT throw on no-navigation (many clicks mutate the DOM in
+        // place). SSRF on any nav is enforced by the persistent guard delegate.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        try await waitForNavIfLoading(wv, urlBefore: urlBefore)
+        return raw
+    }
+
+    /// Type into an input; same navigation-aware settle as `click` (submit may
+    /// navigate). Returns the JS result JSON string.
+    func type(argLiteral: String, submit: Bool) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        let script = BrowserJS.typeScript(argLiteral: argLiteral, submit: submit)
+        let urlBefore = wv.url?.absoluteString ?? ""
+        let raw = (try? await wv.evaluateJavaScript(script) as? String) ?? "{}"
+        if submit {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            try await waitForNavIfLoading(wv, urlBefore: urlBefore)
+        } else {
+            try await settle(wv)
+        }
+        return raw
+    }
+
+    /// Go back one history entry. Returns the resulting HTTP status (0 unknown).
+    /// Throws when there's no back entry.
+    @discardableResult
+    func back() async throws -> Int {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        guard wv.canGoBack else { throw WebEngineError.navigationFailed("no back history") }
+        return try await runNavigation(wv) { wv.goBack() }
+    }
+
+    /// Bounded wait while the webview is mid-load (after a click/submit that
+    /// kicked off navigation), then settle. SSRF on the navigation is enforced by
+    /// the persistent `guardDelegate`. Tolerant: a stuck load just falls through
+    /// after the timeout instead of hanging.
+    private func waitForNavIfLoading(_ wv: WKWebView, urlBefore: String) async throws {
+        let deadline = Date().addingTimeInterval(Double(max(1000, navTimeoutMs)) / 1000.0)
+        // Wait until it stops loading OR the URL changed and readyState completes.
+        while Date() < deadline {
+            if Task.isCancelled { break }
+            if !wv.isLoading {
+                let state = (try? await wv.evaluateJavaScript(WebJS.readyStateScript)) as? String
+                if state == "complete" { break }
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await settle(wv)
+    }
+
+    /// Current URL/title for result assembly.
+    func currentURL() -> String { webView?.url?.absoluteString ?? "" }
+    func currentTitle() async -> String {
+        guard let wv = webView else { return "" }
+        return (try? await wv.evaluateJavaScript("document.title") as? String) ?? ""
+    }
+
+    /// Run an arbitrary BUNDLED script on the current page (no page-derived input)
+    /// and return its string result. Used for the accessibility summary + read.
+    func evaluate(_ script: String) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        return (try? await wv.evaluateJavaScript(script) as? String) ?? ""
+    }
+
+    /// Take a snapshot PNG of the current page (delegates frame sizing to caller).
+    func snapshot(fullPage: Bool, scrollHeightScript: String) async throws -> (Data, Int) {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        var targetHeight = 2000
+        if fullPage {
+            let raw = try? await wv.evaluateJavaScript(scrollHeightScript)
+            let maxH = 12000
+            if let h = raw as? Int { targetHeight = min(max(h, 400), maxH) }
+            else if let hd = raw as? Double { targetHeight = min(max(Int(hd), 400), maxH) }
+            else if let hn = raw as? NSNumber { targetHeight = min(max(hn.intValue, 400), maxH) }
+            wv.frame = NSRect(x: 0, y: 0, width: 1280, height: targetHeight)
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        let snapConfig = WKSnapshotConfiguration()
+        if fullPage { snapConfig.rect = NSRect(x: 0, y: 0, width: 1280, height: targetHeight) }
+        let image: NSImage = try await withCheckedThrowingContinuation { cont in
+            wv.takeSnapshot(with: snapConfig) { img, err in
+                if let img = img { cont.resume(returning: img) }
+                else { cont.resume(throwing: err ?? WebEngineError.noContent) }
+            }
+        }
+        // Restore the default viewport height after a full-page resize.
+        if fullPage { wv.frame = frame }
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            throw WebEngineError.noContent
+        }
+        return (png, targetHeight)
+    }
+}
+
+/// The persistent navigation delegate the session webview keeps attached when no
+/// explicit `NavigationBridge` is in flight. It exists solely to keep SSRF
+/// enforcement on background navigations a click/script can trigger (a redirect
+/// to an internal IP after the click resolved). It does NOT bridge a
+/// continuation — it just allows/cancels per the same policy closures.
+@MainActor
+final class SessionGuardDelegate: NSObject, WKNavigationDelegate {
+    private let policyCheck: @MainActor (URL) -> Bool
+    private let responseHostCheck: @MainActor (URL) -> Bool
+    private let maxBytes: Int
+
+    init(policyCheck: @escaping @MainActor (URL) -> Bool,
+         responseHostCheck: @escaping @MainActor (URL) -> Bool,
+         maxBytes: Int) {
+        self.policyCheck = policyCheck
+        self.responseHostCheck = responseHostCheck
+        self.maxBytes = maxBytes
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        if let url = navigationAction.request.url,
+           url.absoluteString.lowercased() != "about:blank",
+           policyCheck(url) == false {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
+        let response = navigationResponse.response
+        let expected = response.expectedContentLength
+        if expected > 0, SizeGuard.rejectByContentLength(Int(expected), max: maxBytes) {
+            decisionHandler(.cancel)
+            return
+        }
+        if let url = response.url, url.absoluteString.lowercased() != "about:blank",
+           responseHostCheck(url) == false {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+}
+
 // MARK: - WebEngine (public async API)
 
 /// The public façade. Owns the renderer pool, search router, content blocker,
@@ -10700,6 +12180,10 @@ final class WebEngine {
     private let cache: WebCache
     private let shotsDir: String
     private var config: AppConfig
+    /// The persistent interactive browsing session (created on first browser_*
+    /// call). Distinct from the one-shot renderer pool; survives across tool
+    /// calls so a search → click → read flow keeps the same page/history.
+    private var browserSessionStore: BrowserSession?
 
     private init() {
         let cfg = AppConfig.load(dir: LLMConfig.configDir)
@@ -10713,12 +12197,28 @@ final class WebEngine {
     }
 
     /// Re-read config (renderer cap, timeouts, search keys) and rebuild the pool
-    /// and router. Call after the user changes settings.
+    /// and router. Call after the user changes settings. Also drops the live
+    /// browsing session so it picks up the new timeouts/byte cap on next use.
     func reloadConfig() {
         let cfg = AppConfig.load(dir: LLMConfig.configDir)
         config = cfg
         pool = RendererPool(maxRenderers: cfg.webMaxRenderers, navTimeoutMs: cfg.webNavTimeoutMs)
         router = SearchRouter(apiKeys: cfg.webSearch.apiKeys, preferred: cfg.webSearch.provider)
+        browserSessionStore?.reset()
+        browserSessionStore = nil
+    }
+
+    /// The persistent session, lazily created with the current SSRF policy + caps.
+    private var browserSession: BrowserSession {
+        if let s = browserSessionStore { return s }
+        let s = BrowserSession(
+            policyCheck: { [weak self] u in self?.redirectAllowed(u) ?? false },
+            responseHostCheck: { [weak self] u in self?.redirectAllowed(u) ?? false },
+            maxBytes: config.webMaxBytes,
+            navTimeoutMs: config.webNavTimeoutMs,
+            settleMs: config.webSettleMs)
+        browserSessionStore = s
+        return s
     }
 
     /// Compile content-blocking rules at startup (call once from AppDelegate).
@@ -11041,6 +12541,155 @@ final class WebEngine {
         return ExtractResult(finalURL: read.finalURL, title: read.title, instruction: instruction, chunks: ranked)
     }
 
+    // MARK: - Interactive browsing session (Playwright-style)
+
+    /// Max clickable/typeable elements surfaced in a `BrowserState`.
+    private static let browserElementCap = 25
+
+    /// Read the DOM-accessibility summary (title, short text, clickable elements)
+    /// off the current session page and assemble a `BrowserState`.
+    private func browserSnapshotState(action: String) async throws -> BrowserState {
+        let session = browserSession
+        let finalURL = session.currentURL()
+        let raw = try await session.evaluate(BrowserJS.summaryScript(cap: Self.browserElementCap))
+        var title = ""
+        var summary = ""
+        var elements: [BrowserElement] = []
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            title = (obj["title"] as? String) ?? ""
+            summary = (obj["summary"] as? String) ?? ""
+            if let arr = obj["elements"] as? [[String: Any]] {
+                for e in arr {
+                    let role = (e["role"] as? String) ?? "button"
+                    let label = (e["label"] as? String) ?? ""
+                    let sel = (e["selector"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    if label.isEmpty { continue }
+                    elements.append(BrowserElement(role: role, label: label, selector: sel))
+                }
+            }
+        }
+        if title.isEmpty { title = await session.currentTitle() }
+        return BrowserState(finalURL: finalURL, title: title, action: action,
+                            summary: summary, elements: elements)
+    }
+
+    /// `browser_open` — navigate the session to `url`, wait for load+settle,
+    /// return a `BrowserState`. SSRF-gated up-front + on every redirect.
+    func browserOpen(_ url: URL) async throws -> BrowserState {
+        try guardURL(url)
+        _ = try await browserSession.load(url)
+        return try await browserSnapshotState(action: "opened \(browserSession.currentURL())")
+    }
+
+    /// `browser_click` — click an element (by visible text or CSS selector) on the
+    /// current page. Throws `noContent` with a helpful message when nothing matches
+    /// (the tool layer turns this into a non-fatal error result).
+    func browserClick(target: String) async throws -> BrowserState {
+        let argLiteral = BrowserTargets.argLiteral(target: target)
+        let raw = try await browserSession.click(argLiteral: argLiteral)
+        let (ok, info, errMsg) = Self.parseActionResult(raw)
+        if !ok {
+            let reason = (errMsg == "not-found")
+                ? "No clickable element matched \"\(target)\". Try a different visible text or a CSS selector; the page's clickable elements are listed in the previous result."
+                : "Click failed: \(errMsg)"
+            throw WebEngineError.navigationFailed(reason)
+        }
+        let what = info["clicked"] ?? target
+        let role = info["role"].map { "\($0) " } ?? ""
+        return try await browserSnapshotState(action: "clicked \(role)\"\(what)\"")
+    }
+
+    /// `browser_type` — focus an input (by label/placeholder/name/selector), type
+    /// `text`, optionally submit. Throws when no input matches.
+    func browserType(target: String, text: String, submit: Bool) async throws -> BrowserState {
+        let argLiteral = BrowserTargets.argLiteral(target: target, text: text)
+        let raw = try await browserSession.type(argLiteral: argLiteral, submit: submit)
+        let (ok, info, errMsg) = Self.parseActionResult(raw)
+        if !ok {
+            let reason = (errMsg == "no-input")
+                ? "No input field matched \"\(target)\". Try the field's placeholder/label/name or a CSS selector."
+                : "Type failed: \(errMsg)"
+            throw WebEngineError.navigationFailed(reason)
+        }
+        let into = info["typedInto"] ?? target
+        let submitted = (info["submitted"] == "true" || info["submitted"] == "1")
+        let action = submitted
+            ? "typed into \"\(into)\" and submitted"
+            : "typed into \"\(into)\""
+        return try await browserSnapshotState(action: action)
+    }
+
+    /// `browser_read` — Readability-extract the CURRENT session page to Markdown.
+    /// Reuses the same extract script as `web_read` (no re-navigation).
+    func browserRead(maxChars: Int) async throws -> ReadResult {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let cap = maxChars > 0 ? maxChars : config.webReadMaxChars
+        let finalURL = session.currentURL()
+        let script = WebJS.extractScript(dropImages: true)
+        let raw = try await session.evaluate(script)
+        guard let jdata = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: jdata) as? [String: Any] else {
+            throw WebEngineError.noContent
+        }
+        if let err = obj["error"] as? String, !err.isEmpty, obj["markdown"] == nil {
+            throw WebEngineError.navigationFailed("extract: \(err)")
+        }
+        let title = (obj["title"] as? String) ?? ""
+        let byline = (obj["byline"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let siteName = (obj["siteName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        var markdown = (obj["markdown"] as? String) ?? ""
+        markdown = MarkdownSanitizer.collapseWhitespace(markdown)
+        let (capped, truncated) = MarkdownSanitizer.truncate(markdown, maxChars: cap)
+        return ReadResult(
+            finalURL: finalURL, status: 200, title: title,
+            byline: byline, siteName: siteName,
+            markdown: capped, charCount: capped.count, truncated: truncated)
+    }
+
+    /// `browser_screenshot` — snapshot the CURRENT session page to a PNG on disk.
+    func browserScreenshot(fullPage: Bool) async throws -> ShotResult {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let finalURL = session.currentURL()
+        let hashName = WebCache.key(method: "GET", url: "session:\(finalURL)", variant: "shot:\(fullPage)")
+        let path = (shotsDir as NSString).appendingPathComponent("\(hashName).png")
+        let (png, height) = try await session.snapshot(fullPage: fullPage, scrollHeightScript: WebJS.scrollHeightScript)
+        try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+        let img = NSImage(data: png)
+        let w = Int(img?.size.width ?? 1280)
+        let h = Int(img?.size.height ?? CGFloat(height))
+        return ShotResult(finalURL: finalURL, path: path, width: w, height: h, fullPage: fullPage)
+    }
+
+    /// `browser_back` — history back, then return a fresh `BrowserState`.
+    func browserBack() async throws -> BrowserState {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        _ = try await session.back()
+        return try await browserSnapshotState(action: "went back to \(session.currentURL())")
+    }
+
+    /// Decode a `{ok, ...}` JSON result from a bundled action script into
+    /// (ok, stringified-fields, error). All values are flattened to strings so the
+    /// caller can read them uniformly. `nonisolated` + pure (no engine state).
+    nonisolated private static func parseActionResult(_ raw: String) -> (ok: Bool, info: [String: String], err: String) {
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (false, [:], "no result")
+        }
+        let ok = (obj["ok"] as? Bool) ?? ((obj["ok"] as? NSNumber)?.boolValue ?? false)
+        var info: [String: String] = [:]
+        for (k, v) in obj {
+            if let s = v as? String { info[k] = s }
+            else if let b = v as? Bool { info[k] = b ? "true" : "false" }
+            else if let n = v as? NSNumber { info[k] = n.stringValue }
+        }
+        let err = (obj["error"] as? String) ?? ""
+        return (ok, info, err)
+    }
+
     // MARK: Tool schemas (re-exported for PR7)
 
     static let webSearchToolSchema = WebToolSchemas.webSearch
@@ -11048,6 +12697,12 @@ final class WebEngine {
     static let webReadToolSchema = WebToolSchemas.webRead
     static let webScreenshotToolSchema = WebToolSchemas.webScreenshot
     static let webExtractToolSchema = WebToolSchemas.webExtract
+    static let browserOpenToolSchema = WebToolSchemas.browserOpen
+    static let browserClickToolSchema = WebToolSchemas.browserClick
+    static let browserTypeToolSchema = WebToolSchemas.browserType
+    static let browserReadToolSchema = WebToolSchemas.browserRead
+    static let browserScreenshotToolSchema = WebToolSchemas.browserScreenshot
+    static let browserBackToolSchema = WebToolSchemas.browserBack
 }
 
 // =====================================================================
@@ -11160,6 +12815,95 @@ struct WebExtractTool: AgentTool {
         let r = try await WebEngine.shared.extract(url, instruction: instruction)
         if r.chunks.isEmpty { return "No content on \(r.finalURL) matched: \(instruction)" }
         return toolJSON(r)
+    }
+}
+
+// MARK: - Interactive browser tools (Playwright-style, session-backed)
+
+/// Render a `BrowserState` into a compact, model-friendly string: a header with
+/// the action + current page, a short page summary, and a numbered list of the
+/// elements the agent can act on next (with a stable selector hint). Kept terse
+/// so it doesn't blow up the context on every step.
+private func formatBrowserState(_ s: BrowserState) -> String {
+    var out = "\(s.action)\nNow on: \(s.title.isEmpty ? "(untitled)" : s.title)\nURL: \(s.finalURL)"
+    if !s.summary.isEmpty {
+        let trimmed = String(s.summary.prefix(600))
+        out += "\n\nPage summary:\n\(trimmed)"
+    }
+    if !s.elements.isEmpty {
+        out += "\n\nClickable elements / inputs you can act on:"
+        for (i, e) in s.elements.prefix(20).enumerated() {
+            let sel = e.selector.map { "  [\($0)]" } ?? ""
+            out += "\n\(i + 1). (\(e.role)) \(e.label)\(sel)"
+        }
+    }
+    return out
+}
+
+/// `browser_open` — navigate the persistent session to a URL.
+struct BrowserOpenTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserOpen, fallbackName: "browser_open", fallbackDescription: "Open a URL in the browsing session.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let url = try toolURL(args.dictionary["url"])
+        return formatBrowserState(try await WebEngine.shared.browserOpen(url))
+    }
+}
+
+/// `browser_click` — click by visible text or CSS selector.
+struct BrowserClickTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserClick, fallbackName: "browser_click", fallbackDescription: "Click an element on the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let target = (args.dictionary["target"] as? String) ?? ""
+        guard !target.isEmpty else { return "Error: 'target' is required (visible text or CSS selector)." }
+        return formatBrowserState(try await WebEngine.shared.browserClick(target: target))
+    }
+}
+
+/// `browser_type` — focus an input, type text, optionally submit.
+struct BrowserTypeTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserType, fallbackName: "browser_type", fallbackDescription: "Type text into an input on the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let target = (d["target"] as? String) ?? ""
+        let text = (d["text"] as? String) ?? ""
+        guard !target.isEmpty else { return "Error: 'target' is required (input label/placeholder/name or CSS selector)." }
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        let submit = (d["submit"] as? Bool) ?? ((d["submit"] as? NSNumber)?.boolValue ?? false)
+        return formatBrowserState(try await WebEngine.shared.browserType(target: target, text: text, submit: submit))
+    }
+}
+
+/// `browser_read` — read the current session page as Markdown.
+struct BrowserReadTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserRead, fallbackName: "browser_read", fallbackDescription: "Read the current page as Markdown.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        var maxChars = 0
+        if let n = d["max_chars"] as? Int { maxChars = n }
+        else if let n = d["max_chars"] as? NSNumber { maxChars = n.intValue }
+        let r = try await WebEngine.shared.browserRead(maxChars: maxChars)
+        var header = "# \(r.title)\nURL: \(r.finalURL)"
+        if let byline = r.byline, !byline.isEmpty { header += "\nBy: \(byline)" }
+        if r.truncated { header += "\n(truncated to \(r.charCount) chars)" }
+        return header + "\n\n" + r.markdown
+    }
+}
+
+/// `browser_screenshot` — screenshot the current session page.
+struct BrowserScreenshotTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserScreenshot, fallbackName: "browser_screenshot", fallbackDescription: "Screenshot the current page.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let fullPage = (d["full_page"] as? Bool) ?? ((d["full_page"] as? NSNumber)?.boolValue ?? false)
+        return toolJSON(try await WebEngine.shared.browserScreenshot(fullPage: fullPage))
+    }
+}
+
+/// `browser_back` — history back in the session.
+struct BrowserBackTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserBack, fallbackName: "browser_back", fallbackDescription: "Go back in the browsing session.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        return formatBrowserState(try await WebEngine.shared.browserBack())
     }
 }
 
@@ -11782,12 +13526,12 @@ struct PopDraftAgent {
     /// Default system prompt seeding the agent.
     static let systemPrompt = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
-    and read the web and to transform text. You can also connect to external \
-    services (email, calendar, Slack, Notion, files, GitHub, …) through MCP \
-    servers the user has configured — each connected server's tools appear to you \
-    namespaced as `<server>__<tool>`. Think step by step. Prefer to verify facts \
-    with the web tools when a question needs current or external information; \
-    otherwise answer directly.
+    and read the web, to DRIVE a live browser (navigate, click, type, read), and \
+    to transform text. You can also connect to external services (email, calendar, \
+    Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
+    each connected server's tools appear to you namespaced as `<server>__<tool>`. \
+    Think step by step. Prefer to verify facts with the web tools when a question \
+    needs current or external information; otherwise answer directly.
 
     WHEN TO USE TOOLS — read this first. Prefer the FEWEST tools necessary, and \
     NEVER call a tool when you can answer directly.
@@ -11812,6 +13556,13 @@ struct PopDraftAgent {
 
     How to use tools well:
     - When you call a tool, wait for its result before continuing.
+    - For a quick lookup, use web_search + web_read. To interact with a page \
+    (run a search box, click into results, work through a multi-step flow), use \
+    the browser_* tools: browser_open a site, browser_type into a field (with \
+    submit:true to search), browser_click a link/button by its visible text or a \
+    CSS selector, browser_read the page, browser_back to go back. The browser \
+    session persists across these calls, and each result lists the clickable \
+    elements you can act on next.
     - After EACH tool result, reassess: decide whether you have enough to answer, \
     or whether one more tool call is genuinely needed. Don't repeat the same \
     search over and over — if a search returns results, READ them and answer.
@@ -11858,6 +13609,12 @@ struct PopDraftAgent {
             await registry.register([
                 WebSearchTool(), WebOpenTool(), WebReadTool(),
                 WebScreenshotTool(), WebExtractTool(),
+            ])
+            // Playwright-style interactive browsing — gated on the same web master
+            // switch. The agent DRIVES a persistent session across these calls.
+            await registry.register([
+                BrowserOpenTool(), BrowserClickTool(), BrowserTypeTool(),
+                BrowserReadTool(), BrowserScreenshotTool(), BrowserBackTool(),
             ])
         }
         // PR9: confirm-gated Mac-control tools — OFF by default.
@@ -12504,10 +14261,78 @@ struct PopDraftMain {
         // and exit() the process, so a normal launch never reaches them.
         if HeadlessRunner.handleIfRequested() { return }
 
+        // Item 9: `--debug-show <bubble|menu|chat|settings>` shows the REAL
+        // on-screen window for that state populated with sample data, then stays
+        // up so a coordinator can `screencapture` it. Strictly gated behind the
+        // flag — a normal launch never enters this path.
+        let args = CommandLine.arguments
+        if let state = CLIArgs.value("--debug-show", in: args) {
+            let app = NSApplication.shared
+            let delegate = DebugShowDelegate(state: state)
+            app.delegate = delegate
+            app.setActivationPolicy(.regular)  // foreground so the window is captured
+            app.run()
+            return
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
         app.run()
+    }
+}
+
+/// Item 9: an app delegate used ONLY for `--debug-show <state>`. On launch it
+/// creates the real window controller for the requested state, seeds it with
+/// representative sample data, and shows it on screen (no menu bar item, no
+/// hotkeys, no onboarding). It stays up until the process is killed.
+final class DebugShowDelegate: NSObject, NSApplicationDelegate {
+    private let state: String
+    private var popup: PopupWindowController?
+    private var settings: SettingsWindowController?
+    private var bubble: BubbleWindowController?
+
+    init(state: String) { self.state = state }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.activate(ignoringOtherApps: true)
+        switch state {
+        case "bubble":
+            let b = BubbleWindowController()
+            b.show(animated: false)
+            bubble = b
+            centerOnPrimary(b.window)
+        case "menu":
+            let p = PopupWindowController()
+            p.debugShowMenu()
+            popup = p
+        case "chat":
+            let p = PopupWindowController()
+            p.debugShowChat()
+            popup = p
+            centerOnPrimary(p.window)
+        case "settings":
+            let s = SettingsWindowController()
+            s.showWindow()
+            settings = s
+            centerOnPrimary(s.window)
+        default:
+            FileHandle.standardError.write(Data(
+                "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings)\n".utf8))
+            exit(2)
+        }
+    }
+
+    /// Move a window to the center of the primary (menu-bar) display so the
+    /// screen capture lands on a known screen.
+    private func centerOnPrimary(_ window: NSWindow?) {
+        guard let window = window else { return }
+        let primary = NSScreen.screens.first { $0.frame.origin == .zero }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        guard let vf = primary?.visibleFrame else { return }
+        let f = window.frame
+        let origin = NSPoint(x: vf.midX - f.width / 2, y: vf.midY - f.height / 2)
+        window.setFrameOrigin(origin)
     }
 }
