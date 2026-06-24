@@ -799,6 +799,12 @@ class PopupWindowController: NSWindowController {
         // Defer resize to next run loop so SwiftUI can finish layout
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let hostingView = self.hostingView, let window = self.window else { return }
+            // If we've since switched to chat, do NOT fire this fitting-size
+            // resize: the chat window is window-driven (its SwiftUI content is
+            // flexible with no fitting height), so a stale fitting-size resize
+            // scheduled by an earlier action-menu `updateView()` would collapse
+            // the chat window. Chat owns its own sizing in `sizeWindowForChat`.
+            if case .chat = self.state { return }
             var size = hostingView.fittingSize
             size.height = min(size.height, 400)  // Maximum height
             window.setContentSize(size)
@@ -1403,7 +1409,9 @@ class PopupWindowController: NSWindowController {
         // Pick a deliberately NON-default size to prove the window is resizable,
         // and publish it BEFORE building the content so `ChatView` renders at that
         // size and the hosting view sizes the window to match (no size fight).
-        let size = NSSize(width: 620, height: 640)
+        // Tall enough to show the image, the live HTML block, and the RTL turn in
+        // one capture.
+        let size = NSSize(width: 620, height: 900)
         vm.panelSize = size
         updateView()
 
@@ -1416,6 +1424,9 @@ class PopupWindowController: NSWindowController {
             withProgrammaticResize {
                 window.setFrame(NSRect(origin: origin, size: size), display: true)
             }
+            // Same hosting-view prep as the real chat (AFTER setFrame) so this
+            // debug window is genuinely drag-resizable and doesn't collapse to 0×0.
+            prepareChatHostingView()
         }
 
         // Seed a queued follow-up so the "queued (N)" affordance + a pending user
@@ -1444,14 +1455,28 @@ class PopupWindowController: NSWindowController {
 
     /// Build a rich sample chat session that exercises every chat affordance:
     /// a selected-text context, a user message, a finished tool call, a thinking
-    /// disclosure, and an assistant answer with full Markdown + a Mermaid diagram.
+    /// disclosure, an assistant answer with full Markdown + a Mermaid diagram + an
+    /// inline image, a live ```html (CSS+JS) block, and a Hebrew (RTL) exchange —
+    /// plus enough turns to eyeball the long-conversation layout + scrolling.
     static func sampleDebugSession() -> ChatSession {
         let now = Date().timeIntervalSince1970
+        // A small self-contained SVG image (base64 data: URI) so the capture
+        // renders an image OFFLINE — proves Markdown `![alt](data:image/…)`
+        // displays. base64 (not raw `utf8,`) keeps the URL free of spaces / <> / #
+        // that would otherwise break Markdown's `![](url)` parsing.
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='90'>"
+            + "<rect width='320' height='90' rx='12' fill='#0A84FF'/>"
+            + "<text x='160' y='52' font-family='sans-serif' font-size='22' fill='white' "
+            + "text-anchor='middle'>Inline image renders</text></svg>"
+        let svgB64 = Data(svg.utf8).base64EncodedString()
+        let imgDataURI = "data:image/svg+xml;base64," + svgB64
         let answer = """
         Here's a tighter rewrite — and I verified the **40% deployment-time** claim via the search result below.
 
         ## Suggested rewrite
         > Our platform helps teams ship faster — customers cut deployment time by **40%** on average, with onboarding in days.
+
+        ![A demo banner](\(imgDataURI))
 
         ### Why it's stronger
         1. Leads with the outcome (*ship faster*).
@@ -1482,6 +1507,45 @@ class PopupWindowController: NSWindowController {
         }
         ```
         """
+        // A fenced ```html block: its CSS styles AND its JS run inside the
+        // sandboxed message webview, so the agent can "show stuff" — styled,
+        // interactive content / charts.
+        let htmlAnswer = """
+        Sure — here's a small interactive widget rendered from a fenced `html` block (its CSS + JS run in the sandbox):
+
+        ```html
+        <div style="font-family:-apple-system,sans-serif;border-radius:12px;padding:14px;
+                    background:linear-gradient(135deg,#0A84FF,#7E5BEF);color:#fff;">
+          <div style="font-size:15px;font-weight:600;">Deployment time</div>
+          <div style="display:flex;gap:6px;align-items:flex-end;height:60px;margin-top:10px;">
+            <div style="width:28px;background:rgba(255,255,255,.45);height:100%;border-radius:4px;"></div>
+            <div style="width:28px;background:rgba(255,255,255,.95);height:60%;border-radius:4px;"></div>
+          </div>
+          <div id="cap" style="margin-top:8px;font-size:12px;opacity:.9;">computing…</div>
+        </div>
+        <script>
+          (function(){
+            var before = 31, after = 18;
+            var pct = Math.round((before - after) / before * 100);
+            document.getElementById('cap').textContent = pct + '% faster (JS-computed)';
+          })();
+        </script>
+        ```
+
+        The bar on the right is shorter because the rewrite is ~40% tighter.
+        """
+        // A Hebrew (right-to-left) exchange to prove RTL alignment.
+        let hebrewUser = "תוכל לכתוב את זה גם בעברית, בבקשה?"
+        let hebrewAnswer = """
+        בוודאי! הנה גרסה מתומצתת בעברית:
+
+        > הפלטפורמה שלנו עוזרת לצוותים לשלוח מהר יותר — לקוחות מקצרים את זמן הפריסה ב‑**40%** בממוצע.
+
+        שלוש סיבות שזה חזק יותר:
+        1. מתחיל מהתוצאה (*לשלוח מהר יותר*).
+        2. שומר על הנתון המאומת של **40%**.
+        3. מסיר מילים מיותרות.
+        """
         let searchResult = """
         [{"title":"Enterprise SaaS pricing benchmark 2026","url":"https://example.com/saas-benchmark","snippet":"Teams adopting modern deployment pipelines report a 38–42% reduction in average deployment time."}]
         """
@@ -1499,6 +1563,12 @@ class PopupWindowController: NSWindowController {
             ChatMessage(role: "assistant", content: answer,
                         thinking: "The user wants a tighter rewrite and asked me to verify the 40% deployment-time figure. I searched for a 2026 SaaS benchmark, found a source reporting 38–42%, which supports ~40%, then condensed the copy while keeping that stat.",
                         createdAt: now),
+            ChatMessage(role: "user",
+                        content: "Nice. Can you show it as a little chart?",
+                        createdAt: now),
+            ChatMessage(role: "assistant", content: htmlAnswer, createdAt: now),
+            ChatMessage(role: "user", content: hebrewUser, createdAt: now),
+            ChatMessage(role: "assistant", content: hebrewAnswer, createdAt: now),
         ]
         var session = ChatSession(
             createdAt: now, updatedAt: now, model: "Qwen3.5-4B · local",
@@ -1515,10 +1585,27 @@ class PopupWindowController: NSWindowController {
     /// `setFrame` opens the panel at the size we ask for and the user can drag it
     /// larger/smaller. Without this, NSHostingView re-asserts its fitting size and
     /// our `setFrame` is immediately overridden.
+    ///
+    /// `sizingOptions = []` is the key fix: by default an `NSHostingView` imposes
+    /// its SwiftUI content's intrinsic size on the window as content-min/max
+    /// constraints. Combined with the old hard `.frame(width:height:)` in
+    /// `ChatView`, that PINNED the chat window so dragging an edge couldn't grow or
+    /// shrink it. Clearing the option lets the content (now `maxWidth/maxHeight:
+    /// .infinity`) simply fill whatever frame the window + autoresizing give it.
+    ///
+    /// Call this AFTER the window frame is set: with `sizingOptions = []` the host
+    /// no longer auto-fits, so we pin its frame to the content view's bounds once
+    /// (then `autoresizingMask` keeps it filling the window through every
+    /// user drag). Pinning the frame here is what stops the panel collapsing to
+    /// 0×0 (the host's fitting size with flexible SwiftUI content is zero).
     private func prepareChatHostingView() {
         guard let host = hostingView else { return }
+        host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = true
         host.autoresizingMask = [.width, .height]
+        if let bounds = window?.contentView?.bounds, bounds.width > 0, bounds.height > 0 {
+            host.frame = bounds
+        }
     }
 
     private func sizeWindowForChat() {
@@ -1528,11 +1615,11 @@ class PopupWindowController: NSWindowController {
         window.styleMask.insert(.resizable)
         window.isMovableByWindowBackground = true
         window.minSize = GlassWindow.ChatGeometry.minSize
-        prepareChatHostingView()
 
         let screen = currentScreen()
         let screenFrame = screen.visibleFrame
 
+        let target: NSRect
         if let saved = GlassWindow.ChatGeometry.load() {
             // Restore, clamped so it can't open fully offscreen.
             var f = saved
@@ -1540,27 +1627,31 @@ class PopupWindowController: NSWindowController {
             f.size.height = min(f.size.height, screenFrame.height - 20)
             f.origin.x = min(max(f.origin.x, screenFrame.minX + 10), screenFrame.maxX - f.width - 10)
             f.origin.y = min(max(f.origin.y, screenFrame.minY + 10), screenFrame.maxY - f.height - 10)
-            chatViewModel?.panelSize = f.size
-            withProgrammaticResize { window.setFrame(f, display: true) }
-            return
+            target = f
+        } else {
+            // First open: default size pinned near the cursor.
+            let size = NSSize(width: ChatView.panelWidth, height: ChatView.panelHeight)
+            let mouseLocation = NSEvent.mouseLocation
+            var origin = NSPoint(
+                x: mouseLocation.x - size.width / 2,
+                y: mouseLocation.y - size.height - 10)
+            if origin.x < screenFrame.minX + 10 { origin.x = screenFrame.minX + 10 }
+            if origin.x + size.width > screenFrame.maxX - 10 { origin.x = screenFrame.maxX - size.width - 10 }
+            if origin.y < screenFrame.minY + 10 {
+                origin.y = screenFrame.midY - size.height / 2
+            }
+            if origin.y + size.height > screenFrame.maxY - 10 {
+                origin.y = screenFrame.maxY - size.height - 10
+            }
+            target = NSRect(origin: origin, size: size)
         }
 
-        // First open: default size pinned near the cursor.
-        let size = NSSize(width: ChatView.panelWidth, height: ChatView.panelHeight)
-        let mouseLocation = NSEvent.mouseLocation
-        var origin = NSPoint(
-            x: mouseLocation.x - size.width / 2,
-            y: mouseLocation.y - size.height - 10)
-        if origin.x < screenFrame.minX + 10 { origin.x = screenFrame.minX + 10 }
-        if origin.x + size.width > screenFrame.maxX - 10 { origin.x = screenFrame.maxX - size.width - 10 }
-        if origin.y < screenFrame.minY + 10 {
-            origin.y = screenFrame.midY - size.height / 2
-        }
-        if origin.y + size.height > screenFrame.maxY - 10 {
-            origin.y = screenFrame.maxY - size.height - 10
-        }
-        chatViewModel?.panelSize = size
-        withProgrammaticResize { window.setFrame(NSRect(origin: origin, size: size), display: true) }
+        chatViewModel?.panelSize = target.size
+        withProgrammaticResize { window.setFrame(target, display: true) }
+        // AFTER the window has its final size: pin the hosting view to the content
+        // bounds + enable autoresize-fill (see prepareChatHostingView). Doing this
+        // post-setFrame is what prevents the 0×0 collapse.
+        prepareChatHostingView()
     }
 
     private func currentScreen() -> NSScreen {
