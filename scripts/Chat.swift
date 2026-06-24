@@ -549,10 +549,15 @@ enum ToolResultDecoder {
 enum MarkdownBlock: Identifiable {
     case prose(index: Int, String)
     case code(index: Int, language: String?, code: String)
+    /// A renderable drawing/markup block (svg/html) shown as a graphic via a small
+    /// inline web view — NOT as highlighted code. Produced for ```svg/```html/```xml
+    /// fences and for raw inline `<svg>…</svg>` lifted out of a prose block.
+    case markup(index: Int, String)
     var id: Int {
         switch self {
         case .prose(let index, _): return index
         case .code(let index, _, _): return index
+        case .markup(let index, _): return index
         }
     }
 }
@@ -569,11 +574,30 @@ enum MarkdownParser {
 
         func flushProse() {
             let joined = prose.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !joined.isEmpty { out.append(.prose(index: out.count, joined)) }
+            if !joined.isEmpty {
+                // Lift any raw inline <svg>…</svg> AND any Markdown data-URI image
+                // (![alt](data:image/…)) out so each renders as a graphic instead
+                // of being shown as escaped text. Surrounding text stays prose, in
+                // order.
+                for piece in splitInlineGraphics(joined) {
+                    switch piece {
+                    case .text(let t):
+                        let tt = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !tt.isEmpty { out.append(.prose(index: out.count, tt)) }
+                    case .markup(let s):
+                        out.append(.markup(index: out.count, s))
+                    }
+                }
+            }
             prose = []
         }
         func flushCode() {
-            out.append(.code(index: out.count, language: lang, code: code.joined(separator: "\n")))
+            let body = code.joined(separator: "\n")
+            if isRenderableMarkup(language: lang, code: body) {
+                out.append(.markup(index: out.count, body))
+            } else {
+                out.append(.code(index: out.count, language: lang, code: body))
+            }
             code = []
             lang = nil
         }
@@ -596,6 +620,119 @@ enum MarkdownParser {
         }
         if inCode { flushCode() } else { flushProse() }
         return out
+    }
+
+    /// A fragment of a prose block: ordinary `.text`, or `.markup` — a graphic
+    /// (raw `<svg>` element or an `<img>` built from a `![alt](data:…)` image) to
+    /// be rendered via `RawMarkupBody` instead of shown as escaped text.
+    enum ProsePiece { case text(String); case markup(String) }
+
+    /// Split a prose block into ordered text / graphic fragments, scanning left to
+    /// right. A complete inline `<svg …>…</svg>` becomes a `.markup` SVG; a
+    /// Markdown data-URI image `![alt](data:image/…)` becomes a `.markup` `<img>`
+    /// (the data URI's literal spaces are percent-encoded so it loads). Surrounding
+    /// text stays `.text`. A partial (unterminated) graphic is left as text so
+    /// nothing disappears mid-stream.
+    static func splitInlineGraphics(_ text: String) -> [ProsePiece] {
+        var out: [ProsePiece] = []
+        var pendingText = ""
+        let scalars = Array(text)
+        var i = 0
+        let n = scalars.count
+
+        func flushPending() {
+            if !pendingText.isEmpty { out.append(.text(pendingText)); pendingText = "" }
+        }
+
+        while i < n {
+            // Try an inline <svg>…</svg> at i.
+            if let svg = matchInlineSVG(scalars, at: i) {
+                flushPending()
+                out.append(.markup(svg.markup))
+                i = svg.end
+                continue
+            }
+            // Try a Markdown data-URI image ![alt](data:image/…) at i.
+            if let img = matchDataImage(scalars, at: i) {
+                flushPending()
+                out.append(.markup(img.imgTag))
+                i = img.end
+                continue
+            }
+            pendingText.append(scalars[i])
+            i += 1
+        }
+        flushPending()
+        return out.isEmpty ? [.text(text)] : out
+    }
+
+    /// If a complete `<svg …>…</svg>` starts at `at`, return its raw markup and the
+    /// index just past `</svg>`; else nil.
+    private static func matchInlineSVG(_ s: [Character], at: Int) -> (markup: String, end: Int)? {
+        let openTag = Array("<svg")
+        guard at + openTag.count <= s.count else { return nil }
+        for k in 0..<openTag.count where Character(s[at + k].lowercased()) != openTag[k] { return nil }
+        // Require an element boundary right after "<svg".
+        let bIdx = at + openTag.count
+        guard bIdx < s.count, [" ", ">", "\n", "\t", "/"].contains(String(s[bIdx])) else { return nil }
+        let closeTag = Array("</svg>")
+        var j = bIdx
+        while j + closeTag.count <= s.count {
+            var hit = true
+            for k in 0..<closeTag.count where Character(s[j + k].lowercased()) != closeTag[k] {
+                hit = false; break
+            }
+            if hit {
+                let end = j + closeTag.count
+                return (String(s[at..<end]), end)
+            }
+            j += 1
+        }
+        return nil
+    }
+
+    /// If a Markdown image `![alt](data:image/…)` starts at `at`, return an `<img>`
+    /// tag (with the data URI's literal spaces/quotes/angle-brackets encoded so it
+    /// loads) and the index just past the closing `)`; else nil. The URL is taken
+    /// up to the LAST `)` on the logical line, so an SVG `transform='rotate(45 …)'`
+    /// inside the data URI doesn't terminate the image early.
+    private static func matchDataImage(_ s: [Character], at: Int) -> (imgTag: String, end: Int)? {
+        guard at + 1 < s.count, s[at] == "!", s[at + 1] == "[" else { return nil }
+        // alt runs to "](".
+        var k = at + 2
+        var altEnd = -1
+        while k + 1 < s.count {
+            if s[k] == "]" && s[k + 1] == "(" { altEnd = k; break }
+            k += 1
+        }
+        guard altEnd >= 0 else { return nil }
+        let urlStart = altEnd + 2
+        let dataPrefix = Array("data:image/")
+        guard urlStart + dataPrefix.count <= s.count else { return nil }
+        for k2 in 0..<dataPrefix.count where Character(s[urlStart + k2].lowercased()) != dataPrefix[k2] {
+            return nil
+        }
+        // Find end of logical line, then the last ')' before it.
+        var lineEnd = urlStart
+        while lineEnd < s.count, s[lineEnd] != "\n" { lineEnd += 1 }
+        var close = -1
+        var p = lineEnd - 1
+        while p >= urlStart {
+            if s[p] == ")" { close = p; break }
+            p -= 1
+        }
+        guard close >= urlStart else { return nil }
+        let url = String(s[urlStart..<close])
+        let alt = String(s[(at + 2)..<altEnd])
+        let safeURL = url.replacingOccurrences(of: " ", with: "%20")
+            .replacingOccurrences(of: "\"", with: "%22")
+            .replacingOccurrences(of: "<", with: "%3C")
+            .replacingOccurrences(of: ">", with: "%3E")
+        let safeAlt = alt.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        return ("<img src=\"\(safeURL)\" alt=\"\(safeAlt)\">", close + 1)
     }
 
     /// Render an inline-Markdown prose block as an AttributedString (headings,
@@ -636,6 +773,29 @@ enum MarkdownParser {
             result.append(inlineAttributed(line))
         }
         return result
+    }
+
+    /// Is this fenced code block actually a renderable DRAWING/markup rather than
+    /// code to highlight? True for ```svg, ```html, and a ```xml fence whose body
+    /// is an `<svg>`. These render as a graphic (via `RawMarkupBody`) on BOTH the
+    /// rich and native paths instead of showing escaped, copyable code.
+    static func isRenderableMarkup(language: String?, code: String) -> Bool {
+        let lang = (language ?? "").lowercased()
+        if lang == "svg" || lang == "html" { return true }
+        if (lang == "xml" || lang.isEmpty) && containsSVG(code) { return true }
+        return false
+    }
+
+    /// Does the text contain a raw `<svg …>` element? Used to route both ```xml
+    /// fences and inline message-body SVG to the graphic renderer.
+    static func containsSVG(_ text: String) -> Bool {
+        guard let r = text.range(of: "<svg", options: .caseInsensitive) else { return false }
+        // Require the next char to be whitespace or '>' so we don't match e.g. a
+        // word like "<svgfoo"; cheap and good enough for agent-emitted markup.
+        let after = text.index(r.upperBound, offsetBy: 0)
+        if after == text.endIndex { return false }
+        let c = text[after]
+        return c == ">" || c == " " || c == "\n" || c == "\t" || c == "/"
     }
 
     private static func headingLevel(_ line: String) -> Int? {
@@ -1284,6 +1444,11 @@ struct MarkdownWebView: NSViewRepresentable {
         /* Agent-emitted raw HTML block (```html or inline HTML): give it its own
            isolated box so its CSS/JS render without disturbing the chat chrome. */
         .htmlblock{margin:0.6em 0;direction:ltr;text-align:left;}
+        /* Agent-emitted drawing (```svg fence or raw inline <svg>): render the
+           vector graphic inline on the chat's transparent background, capped to the
+           bubble width so it never overflows the message. */
+        .svgblock{margin:0.6em 0;direction:ltr;text-align:left;background:transparent;}
+        .svgblock svg, svg{max-width:100%;height:auto;}
         .codewrap{position:relative;margin:0.6em 0;border:1px solid \(border);
              border-radius:10px;overflow:hidden;background:\(codeBg);direction:ltr;text-align:left;}
         .codewrap .bar{display:flex;align-items:center;justify-content:space-between;
@@ -1301,6 +1466,45 @@ struct MarkdownWebView: NSViewRepresentable {
         <script>
         (function(){
           var md = \(json)[0];
+          // FIX: an agent drawing is often emitted as a Markdown image with an
+          // SVG data URI: ![alt](data:image/svg+xml,<url-encoded-svg>). When that
+          // URL-encoded SVG contains LITERAL SPACES (from attributes like
+          // width='200' height='200'), marked's ![](url) parser stops the URL at
+          // the first space, fails to match, and dumps the RAW markdown as text —
+          // the "shows raw source, no image" bug. We pre-rewrite every
+          // ![alt](data:image/…) into a real <img> (encoding spaces/quotes so the
+          // data URI loads), BEFORE marked runs, so the drawing renders. base64
+          // and fully-encoded data URIs already parse — rewriting them is a no-op-
+          // equivalent and harmless.
+          function rewriteDataImages(s){
+            var out=''; var i=0;
+            while(i < s.length){
+              var open = s.indexOf('![', i);
+              if(open < 0){ out += s.slice(i); break; }
+              var altEnd = s.indexOf('](', open);
+              if(altEnd < 0){ out += s.slice(i); break; }
+              var urlStart = altEnd + 2;
+              if(s.substr(urlStart, 11).toLowerCase() !== 'data:image/'){
+                out += s.slice(i, open + 2); i = open + 2; continue;
+              }
+              // The data URI runs to the LAST ')' on this logical line, so an SVG
+              // transform like rotate(45 100 100) doesn't end the image early.
+              var lineEnd = s.indexOf('\\n', urlStart); if(lineEnd < 0) lineEnd = s.length;
+              var line = s.slice(urlStart, lineEnd);
+              var close = line.lastIndexOf(')');
+              if(close < 0){ out += s.slice(i, open + 2); i = open + 2; continue; }
+              var url = line.slice(0, close);
+              var alt = s.slice(open + 2, altEnd);
+              var safe = url.replace(/ /g,'%20').replace(/"/g,'%22')
+                            .replace(/</g,'%3C').replace(/>/g,'%3E');
+              var altSafe = alt.replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+                               .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+              out += s.slice(i, open) + '<img src="' + safe + '" alt="' + altSafe + '">';
+              i = urlStart + close + 1;
+            }
+            return out;
+          }
+          try { md = rewriteDataImages(md); } catch(e){}
           try {
             // gfm + inline HTML pass-through (sanitize:false) so the agent can emit
             // raw HTML in a message and have it render with its CSS/JS — see the
@@ -1342,6 +1546,17 @@ struct MarkdownWebView: NSViewRepresentable {
               var box = document.createElement('div'); box.className='htmlblock';
               execHTML(box, code.textContent);
               pre.replaceWith(box);
+              return;
+            }
+            // ```svg (or a ```xml fence whose body is an <svg> drawing): the agent
+            // emitted a vector graphic. Render the markup inline as an IMAGE — strip
+            // the fence and inject the raw <svg> into the DOM — instead of showing
+            // escaped, syntax-highlighted code. SVG is safe static markup.
+            var rawCode = code.textContent || '';
+            if(lang === 'svg' || ((lang === 'xml' || lang === '') && /<svg[\\s>]/i.test(rawCode))){
+              var svgbox = document.createElement('div'); svgbox.className='svgblock';
+              execHTML(svgbox, rawCode);
+              pre.replaceWith(svgbox);
               return;
             }
             var wrap = document.createElement('div'); wrap.className='codewrap';
@@ -1466,6 +1681,119 @@ struct MarkdownWebView: NSViewRepresentable {
                 decisionHandler(.allow)
             }
         }
+    }
+}
+
+/// Renders one block of agent-emitted raw markup — an SVG drawing or an `html`
+/// block — inline as a GRAPHIC, in a self-measuring `WKWebView`, with NO marked.js
+/// dependency. This is what lets the NATIVE markdown fallback (used when the web
+/// assets that power `MarkdownWebView` aren't bundled) still SHOW a drawing instead
+/// of dumping its markup as code. The markup is injected verbatim into a sandboxed,
+/// non-persistent web view (no file/app access) on the chat's transparent
+/// background; `<script>`s in an html block are re-created so they run.
+@MainActor
+struct RawMarkupWebView: NSViewRepresentable {
+    /// The raw markup to render (an `<svg>…</svg>` string, or an html-block body).
+    let markup: String
+    @Binding var measuredHeight: CGFloat
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let controller = WKUserContentController()
+        controller.add(context.coordinator, name: "heightChanged")
+        config.userContentController = controller
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.websiteDataStore = .nonPersistent()
+        let webView = ScrollForwardingWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.setContentHuggingPriority(.required, for: .vertical)
+        context.coordinator.webView = webView
+        load(into: webView, context: context)
+        return webView
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        if context.coordinator.lastMarkup != markup { load(into: webView, context: context) }
+    }
+
+    private func load(into webView: WKWebView, context: Context) {
+        context.coordinator.lastMarkup = markup
+        webView.loadHTMLString(Self.document(markup: markup), baseURL: nil)
+    }
+
+    /// A minimal, self-contained page that injects `markup` verbatim, executes any
+    /// `<script>` it contains, caps any SVG/image to the bubble width, and posts its
+    /// rendered height back to Swift so the SwiftUI parent can size the row exactly.
+    static func document(markup: String) -> String {
+        let json = (try? JSONSerialization.data(withJSONObject: [markup]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
+        return """
+        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <style>html,body{margin:0;padding:0;background:transparent;}
+        body{font:13px/1.5 -apple-system,system-ui,sans-serif;overflow:hidden;}
+        #c svg,#c img{max-width:100%;height:auto;}</style></head>
+        <body><div id="c"></div><script>
+        (function(){
+          var c=document.getElementById('c');
+          c.innerHTML=\(json)[0];
+          c.querySelectorAll('script').forEach(function(old){
+            var s=document.createElement('script');
+            Array.prototype.forEach.call(old.attributes,function(a){s.setAttribute(a.name,a.value);});
+            s.textContent=old.textContent; old.parentNode.replaceChild(s,old);
+          });
+          // Only https:/data:image sources may load (defense in depth on top of
+          // the no-file-access sandbox); report height as each image settles.
+          c.querySelectorAll('img').forEach(function(i){
+            var src=(i.getAttribute('src')||'').trim().toLowerCase();
+            if(!(src.indexOf('https:')===0 || src.indexOf('data:image/')===0)){
+              i.removeAttribute('src'); i.setAttribute('alt', i.getAttribute('alt')||'[blocked image]');
+            }
+            i.addEventListener('load',report); i.addEventListener('error',report);});
+          function report(){var h=Math.ceil(c.getBoundingClientRect().height);
+            try{window.webkit.messageHandlers.heightChanged.postMessage(h);}catch(e){}}
+          report(); new ResizeObserver(report).observe(c);
+        })();
+        </script></body></html>
+        """
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        let parent: RawMarkupWebView
+        weak var webView: WKWebView?
+        var lastMarkup: String = "\u{0}"
+        init(_ parent: RawMarkupWebView) { self.parent = parent }
+
+        func userContentController(_ uc: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "heightChanged", let n = message.body as? NSNumber {
+                let h = CGFloat(truncating: n)
+                if abs(h - parent.measuredHeight) > 0.5 { parent.measuredHeight = max(h, 1) }
+            }
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor nav: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if nav.navigationType == .linkActivated, let url = nav.request.url {
+                NSWorkspace.shared.open(url); decisionHandler(.cancel)
+            } else { decisionHandler(.allow) }
+        }
+    }
+}
+
+/// SwiftUI host for `RawMarkupWebView` at its self-measured height — the native
+/// fallback's "render this drawing/html as a graphic" row.
+struct RawMarkupBody: View {
+    let markup: String
+    @State private var height: CGFloat = 1
+    var body: some View {
+        GeometryReader { _ in
+            RawMarkupWebView(markup: markup, measuredHeight: $height)
+        }
+        .frame(height: max(height, 1))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1605,6 +1933,9 @@ struct MessageBubble: View {
                         .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
                 case .code(_, let lang, let code):
                     CodeBlockView(language: lang, code: code)
+                case .markup(_, let markup):
+                    // svg/html drawing → render as a graphic, never as code.
+                    RawMarkupBody(markup: markup)
                 }
             }
         }

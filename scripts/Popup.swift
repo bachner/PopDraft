@@ -1506,6 +1506,28 @@ class PopupWindowController: NSWindowController {
             text.condensed(target: .marketing)
         }
         ```
+
+        You asked me to draw a monkey — here it is, emitted as a Markdown image \
+        with a URL-encoded SVG data URI (the form the agent actually produces):
+
+        ![Monkey](data:image/svg+xml,%3Csvg width='200' height='200' xmlns='http://www.w3.org/2000/svg'%3E%3Cellipse cx='100' cy='112' rx='72' ry='64' fill='%238B5A2B'/%3E%3Ccircle cx='40' cy='78' r='26' fill='%238B5A2B'/%3E%3Ccircle cx='160' cy='78' r='26' fill='%238B5A2B'/%3E%3Ccircle cx='40' cy='78' r='13' fill='%23C8A06A'/%3E%3Ccircle cx='160' cy='78' r='13' fill='%23C8A06A'/%3E%3Cellipse cx='100' cy='132' rx='46' ry='42' fill='%23E8C9A0'/%3E%3Ccircle cx='76' cy='96' r='12' fill='white'/%3E%3Ccircle cx='124' cy='96' r='12' fill='white'/%3E%3Ccircle cx='76' cy='98' r='6' fill='black'/%3E%3Ccircle cx='124' cy='98' r='6' fill='black'/%3E%3Cellipse cx='88' cy='138' rx='5' ry='7' fill='black'/%3E%3Cellipse cx='112' cy='138' rx='5' ry='7' fill='black'/%3E%3Cpath d='M84 154 Q100 168 116 154' stroke='black' stroke-width='3' fill='none'/%3E%3C/svg%3E)
+
+        Here's a quick sketch as a fenced ```svg drawing — it renders as a graphic:
+
+        ```svg
+        <svg width="200" height="100" viewBox="0 0 200 100"><rect x="20" y="20" width="160" height="60" rx="10" fill="none" stroke="#0A84FF" stroke-width="3"/><circle cx="100" cy="50" r="18" fill="#30D158"/></svg>
+        ```
+
+        And the same idea as a RAW inline `<svg>` dropped straight into the text:
+
+        <svg width="220" height="70" viewBox="0 0 220 70"><rect width="220" height="70" rx="14" fill="#7E5BEF"/><text x="110" y="44" font-family="sans-serif" font-size="20" fill="white" text-anchor="middle">inline svg</text></svg>
+
+        A normal ```python block, by contrast, stays highlighted code with Copy:
+
+        ```python
+        def rewrite(text: str) -> str:
+            return condense(text, target="marketing")
+        ```
         """
         // A fenced ```html block: its CSS styles AND its JS run inside the
         // sandboxed message webview, so the agent can "show stuff" — styled,
