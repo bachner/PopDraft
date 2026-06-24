@@ -25,6 +25,7 @@ TESTS=(
   "tests/test-mcp.swift scripts/Core.swift"
   "tests/test-vision.swift scripts/Core.swift"
   "tests/test-localactions.swift scripts/Core.swift scripts/MacControl.swift scripts/LocalActionTools.swift"
+  "tests/test-filetools.swift scripts/Core.swift scripts/MacControl.swift scripts/FileTools.swift"
 )
 
 OVERALL_EXIT=0

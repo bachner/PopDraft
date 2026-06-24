@@ -48,3 +48,5 @@ generated_imgs/
 
 # Eval run outputs (the corpus IS committed; runs are not)
 tests/eval/runs/
+.claude/
+build/
