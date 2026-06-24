@@ -1086,6 +1086,7 @@ enum BuiltinTools {
         TextTools.register()       // summarize_text / extract_text / suggest_integration
         WebTools.register()        // web_* + browser_*  (gated on enableWebSearch)
         MacControlTools.register() // run_shell / run_applescript (gated on enableMacControl)
+        LocalActionTools.register() // current_datetime / calculator / clipboard_* / current_context / open_app_or_url
     }
 
     /// Arm the catalog's install hook. Safe to call multiple times; the catalog
@@ -1105,7 +1106,12 @@ struct PopDraftAgent {
     static let systemPrompt = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
     and read the web, to DRIVE a live browser (navigate, click, type, read), and \
-    to transform text. You can also connect to external services (email, calendar, \
+    to transform text. You also have local OS tools: get the current date/time \
+    (current_datetime), do exact math (calculator), read/write the clipboard \
+    (clipboard_read / clipboard_write), see the frontmost app + the user's text \
+    selection (current_context), and open an app or URL (open_app_or_url) — the \
+    clipboard write and open actions ask the user to confirm before they run. \
+    You can also connect to external services (email, calendar, \
     Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
     each connected server's tools appear to you namespaced as `<server>__<tool>`. \
     Think step by step. Prefer to verify facts with the web tools when a question \
