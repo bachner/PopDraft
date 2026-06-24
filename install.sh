@@ -53,6 +53,14 @@ else
     fi
 fi
 
+# Copy bundled web assets for the chat's Markdown + Mermaid renderer so a
+# source install (binary in ~/.popdraft) can find them via AppAssets.webResource.
+if [ -d "$SCRIPT_DIR/resources/web" ]; then
+    mkdir -p "$CONFIG_DIR/web"
+    cp "$SCRIPT_DIR"/resources/web/* "$CONFIG_DIR/web/" 2>/dev/null
+    echo "  [OK] Chat web assets installed"
+fi
+
 # Copy TTS server script
 echo ""
 echo "Setting up TTS server..."
