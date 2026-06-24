@@ -288,6 +288,61 @@ enum WebJS {
       return JSON.stringify(out.slice(0,15));
     })();
     """#
+
+    /// Extract IMAGE results from a rendered image-search results page (the
+    /// WKWebView render fallback for `image_search`). Walks `<img>` elements,
+    /// resolves the best full-size source (data-src / srcset / src), the nearest
+    /// enclosing link as the source page, and the alt/title as a caption. Returns
+    /// a JSON array of `{image, thumbnail, source, title}` (https only). Mirrors
+    /// `serpExtractScript`'s output-contract style for `ImageSearchParser`.
+    static let imageExtractScript = #"""
+    (function(){
+      function abs(u){ try { return new URL(u, location.href).href; } catch(e){ return ''; } }
+      // Pick the largest candidate from a srcset string ("url 320w, url 640w").
+      function fromSrcset(ss){
+        if(!ss) return '';
+        var best='', bestW=-1;
+        ss.split(',').forEach(function(part){
+          var seg=part.trim().split(/\s+/); if(!seg.length) return;
+          var u=seg[0]; var w=0;
+          if(seg[1]){ var m=seg[1].match(/(\d+)w/); if(m) w=parseInt(m[1],10); }
+          if(w>bestW){ bestW=w; best=u; }
+        });
+        return best;
+      }
+      function bigSrc(img){
+        // Prefer explicit full-res hints, then srcset, then src. Many image SERPs
+        // lazy-load via data-src / data-iurl and keep a tiny placeholder in src.
+        var cands=[img.getAttribute('data-iurl'), img.getAttribute('data-src'),
+                   fromSrcset(img.getAttribute('srcset')||img.getAttribute('data-srcset')),
+                   img.getAttribute('src')];
+        for(var i=0;i<cands.length;i++){ if(cands[i]) return abs(cands[i]); }
+        return '';
+      }
+      function srcPage(img){
+        var a=img.closest ? img.closest('a[href]') : null;
+        return a ? abs(a.getAttribute('href')) : '';
+      }
+      var out=[]; var seen={};
+      var imgs=document.querySelectorAll('img');
+      for(var i=0;i<imgs.length;i++){
+        var img=imgs[i];
+        var u=bigSrc(img);
+        if(!u || u.indexOf('https://')!==0) continue;       // chat renders https only
+        // Skip obvious sprites / icons / 1px trackers.
+        var w=img.naturalWidth||img.width||0, h=img.naturalHeight||img.height||0;
+        if((w&&w<60)||(h&&h<60)) continue;
+        var key=u.split('#')[0];
+        if(seen[key]) continue; seen[key]=1;
+        var thumb=abs(img.getAttribute('src')||'') ;
+        if(thumb.indexOf('https://')!==0) thumb=u;
+        var title=(img.getAttribute('alt')||img.getAttribute('title')||'').replace(/\s+/g,' ').trim();
+        out.push({image:u, thumbnail:thumb, source:srcPage(img), title:title});
+        if(out.length>=40) break;
+      }
+      return JSON.stringify(out);
+    })();
+    """#
 }
 
 // MARK: - Bundled JS for interactive browsing (Playwright-style)
@@ -1930,6 +1985,36 @@ final class SessionGuardDelegate: NSObject, WKNavigationDelegate {
     }
 }
 
+// MARK: - Download redirect SSRF guard (URLSession)
+
+/// A `URLSessionTaskDelegate` that re-runs the SSRF host check on EVERY redirect
+/// the server tries, so a download URL that 30x-bounces to an internal IP (e.g.
+/// `http://169.254.169.254/...`) is blocked mid-flight. Cancels the request
+/// (returns a nil redirect request) when the next hop fails the check.
+///
+/// `@unchecked Sendable`: `allow` is an immutable `@Sendable` closure captured at
+/// init; there is no mutable state. The delegate is called on the URLSession's
+/// own delegate queue (off-main), so it must NOT be MainActor-isolated.
+final class DownloadRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let allow: @Sendable (URL) -> Bool
+    init(allow: @escaping @Sendable (URL) -> Bool) { self.allow = allow }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        guard let url = request.url else { completionHandler(nil); return }
+        // Only http(s) redirects, and only to hosts that pass the SSRF check.
+        let scheme = url.scheme?.lowercased() ?? ""
+        if (scheme == "http" || scheme == "https"), allow(url) {
+            completionHandler(request)
+        } else {
+            // Block: cancel the redirect (the data task then fails).
+            completionHandler(nil)
+        }
+    }
+}
+
 // MARK: - WebEngine (public async API)
 
 /// The public façade. Owns the renderer pool, search router, content blocker,
@@ -2011,6 +2096,13 @@ final class WebEngine {
     /// is TOCTOU. Mitigated by re-checking redirects + the response URL and
     /// capping redirects; full per-socket IP pinning is a tracked follow-up.
     private func ssrfBlockReason(for url: URL) -> String? {
+        return WebEngine.ssrfBlockReasonPure(for: url)
+    }
+
+    /// Pure (nonisolated) form of `ssrfBlockReason` — uses only `SafetyGuard` +
+    /// `DNSResolver` (both nonisolated), so it can run off-main inside the
+    /// download redirect guard's `@Sendable` closure. Same fail-closed rules.
+    nonisolated static func ssrfBlockReasonPure(for url: URL) -> String? {
         guard SafetyGuard.isSchemeAllowed(url) else { return "scheme \(url.scheme ?? "(none)")" }
         guard let host = url.host, !host.isEmpty else { return "no host" }
         if SafetyGuard.isTestLoopback(host: host, port: url.port) { return nil }
@@ -2149,6 +2241,210 @@ final class WebEngine {
             }
         }
         return []
+    }
+
+    // MARK: image search
+
+    /// Search the web for IMAGES. Reuses the same two-tier pattern as
+    /// `web_search`: first a keyless scrape of a reliable source (DuckDuckGo's
+    /// `vqd`-gated `i.js` JSON), then — if that's empty/blocked — render an
+    /// image-results page (Bing Images) in the offscreen, SSRF-gated WKWebView
+    /// and extract `<img>` sources via injected JS. Results are cached 5 min.
+    func imageSearch(_ q: SearchQuery) async throws -> [ImageResult] {
+        let key = WebCache.key(method: "GET", url: "image:\(q.query)", variant: "n=\(q.maxResults)")
+        let query = q
+        let data = try await cache.value(forKey: key, ttl: 300) {
+            // 1) Keyless DuckDuckGo image API (vqd → i.js JSON). A plain ephemeral
+            //    session like the web_search keyless scrape (DDG 202-blocks the
+            //    localhost proxy, so we go direct over public HTTPS — low SSRF risk).
+            var results = (try? await self.ddgImageSearch(query)) ?? []
+            // 2) Render-the-SERP fallback (SSRF-gated, like browseSERP).
+            if results.isEmpty {
+                Logger.shared.info("image_search: DDG scrape empty for \"\(query.query)\" — browsing image SERP fallback")
+                results = (try? await self.browseImageSERP(query)) ?? []
+                if results.isEmpty {
+                    Logger.shared.error("image_search: SERP fallback also empty for \"\(query.query)\"")
+                    throw WebEngineError.searchFailed("no image results (scrape + SERP fallback both empty)")
+                }
+                Logger.shared.info("image_search: SERP fallback returned \(results.count) images")
+            }
+            return (try? JSONEncoder().encode(results)) ?? Data("[]".utf8)
+        }
+        return (try? JSONDecoder().decode([ImageResult].self, from: data)) ?? []
+    }
+
+    /// Body cap for the DDG image-search HTTP responses (HTML token page + i.js).
+    private static let imageSearchMaxBytes = 4 * 1024 * 1024
+
+    /// DuckDuckGo image search: GET the results page to obtain the per-session
+    /// `vqd` token, then GET `i.js` (its JSON image endpoint) with that token.
+    /// Parsing is pure (`ImageSearchParser`). Plain ephemeral session + desktop UA.
+    private func ddgImageSearch(_ q: SearchQuery) async throws -> [ImageResult] {
+        let trimmed = q.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+        let session = URLSession(configuration: .ephemeral)
+
+        func get(_ urlString: String, referer: String?) async throws -> (Data, Int) {
+            guard let url = URL(string: urlString) else { throw WebEngineError.invalidURL(urlString) }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 12
+            req.setValue(ua, forHTTPHeaderField: "User-Agent")
+            req.setValue("text/html,application/json,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+            if let r = referer { req.setValue(r, forHTTPHeaderField: "Referer") }
+            let (data, response) = try await session.data(for: req)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if let len = (response as? HTTPURLResponse)?.expectedContentLength, len > 0,
+               SizeGuard.rejectByContentLength(Int(len), max: Self.imageSearchMaxBytes) {
+                throw WebEngineError.tooLarge(Int(len))
+            }
+            if SizeGuard.exceeds(received: data.count, max: Self.imageSearchMaxBytes) {
+                throw WebEngineError.tooLarge(data.count)
+            }
+            return (data, status)
+        }
+
+        // Step 1: the token page.
+        let tokenURL = "https://duckduckgo.com/?q=\(encoded)&iax=images&ia=images"
+        let (htmlData, htmlStatus) = try await get(tokenURL, referer: nil)
+        guard htmlStatus == 200, let html = String(data: htmlData, encoding: .utf8),
+              let vqd = ImageSearchParser.parseVQD(html) else {
+            return []
+        }
+        // Step 2: the i.js JSON endpoint (US English, off-strict-safe-search).
+        let apiURL = "https://duckduckgo.com/i.js?l=us-en&o=json&q=\(encoded)&vqd=\(vqd)&f=,,,,,&p=1"
+        let (jsonData, jsonStatus) = try await get(apiURL, referer: tokenURL)
+        guard jsonStatus == 200, let json = String(data: jsonData, encoding: .utf8) else { return [] }
+        return ImageSearchParser.parseDDGImageJSON(json, maxResults: q.maxResults)
+    }
+
+    /// Render-the-SERP image fallback: load Bing Images (then DDG images) in the
+    /// offscreen WKWebView (through the SSRF guard + pinning proxy), let it paint,
+    /// and extract `<img>` sources via `WebJS.imageExtractScript`.
+    private func browseImageSERP(_ q: SearchQuery) async throws -> [ImageResult] {
+        let encoded = q.query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q.query
+        let serps = [
+            "https://www.bing.com/images/search?q=\(encoded)",
+            "https://duckduckgo.com/?q=\(encoded)&iax=images&ia=images",
+        ]
+        for serp in serps {
+            guard let url = URL(string: serp) else { continue }
+            do { try guardURL(url) } catch {
+                Logger.shared.error("image_search SERP guard blocked \(serp): \(error)")
+                continue
+            }
+            do {
+                let results = try await pool.withRenderer(readMode: false) { webView in
+                    try await self.loadAndSettle(webView, url: url)
+                    // Let a client-rendered image grid paint its thumbnails.
+                    try await Task.sleep(nanoseconds: 900_000_000)
+                    let raw = (try? await webView.evaluateJavaScript(WebJS.imageExtractScript) as? String) ?? "[]"
+                    return ImageSearchParser.parseImageSERPJSON(raw, maxResults: q.maxResults)
+                }
+                if !results.isEmpty { return results }
+            } catch {
+                Logger.shared.error("image_search SERP render failed for \(serp): \(error)")
+                continue
+            }
+        }
+        return []
+    }
+
+    // MARK: download
+
+    /// Default directory downloads land in. The user's ~/Downloads.
+    private static var defaultDownloadsDir: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return (home as NSString).appendingPathComponent("Downloads")
+    }
+
+    /// Download an https file to disk (default ~/Downloads). SSRF-gated on the
+    /// initial URL AND every redirect hop (`DownloadRedirectGuard`), size-capped
+    /// (`config.webMaxBytes`), and writes atomically. The CONFIRM gate + dry-run
+    /// are enforced by the TOOL before this is reached — this method does the I/O.
+    /// Returns the saved `DownloadResult`.
+    func downloadFile(url: URL, filename: String?) async throws -> DownloadResult {
+        try guardURL(url)   // scheme + initial-host SSRF check (fail-closed)
+
+        // Re-validate the host on every redirect: a 30x to an internal IP is
+        // blocked. Uses the nonisolated pure check (the delegate runs off-main).
+        let guardDelegate = DownloadRedirectGuard(allow: { u in
+            WebEngine.ssrfBlockReasonPure(for: u) == nil
+        })
+        let session = URLSession(configuration: .ephemeral, delegate: guardDelegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        req.setValue("PopDraft/1.0", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await session.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw WebEngineError.searchFailed("no HTTP response")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw WebEngineError.searchFailed("HTTP \(http.statusCode)")
+        }
+        // Size cap (declared + actual).
+        let declaredLen = http.expectedContentLength
+        if declaredLen > 0, SizeGuard.rejectByContentLength(Int(declaredLen), max: config.webMaxBytes) {
+            throw WebEngineError.tooLarge(Int(declaredLen))
+        }
+        if SizeGuard.exceeds(received: data.count, max: config.webMaxBytes) {
+            throw WebEngineError.tooLarge(data.count)
+        }
+
+        let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").components(separatedBy: ";").first?
+            .trimmingCharacters(in: .whitespaces) ?? ""
+        // The URL we actually ended on (after redirects) seeds the derived name.
+        let finalURLString = http.url?.absoluteString ?? url.absoluteString
+        let defaultExt = WebEngine.extensionForContentType(contentType)
+        let name = DownloadPlanner.resolveFilename(requested: filename, url: finalURLString, defaultExt: defaultExt)
+
+        let dir = WebEngine.defaultDownloadsDir
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        var dest = DownloadPlanner.destination(baseDir: dir, filename: name)
+        dest = WebEngine.uniquePath(dest)   // never clobber an existing file
+        try data.write(to: URL(fileURLWithPath: dest), options: .atomic)
+
+        return DownloadResult(url: finalURLString, path: dest, bytes: data.count, contentType: contentType)
+    }
+
+    /// A short default file extension for a MIME type (only when the URL/filename
+    /// has none). Best-effort; empty string means "leave the name as-is".
+    nonisolated static func extensionForContentType(_ ct: String) -> String {
+        switch ct.lowercased() {
+        case "image/jpeg", "image/jpg": return "jpg"
+        case "image/png": return "png"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/svg+xml": return "svg"
+        case "application/pdf": return "pdf"
+        case "text/plain": return "txt"
+        case "application/zip": return "zip"
+        case "application/json": return "json"
+        default: return ""
+        }
+    }
+
+    /// If `path` exists, append " (n)" before the extension until it doesn't.
+    nonisolated static func uniquePath(_ path: String) -> String {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return path }
+        let ns = path as NSString
+        let dir = ns.deletingLastPathComponent
+        let ext = ns.pathExtension
+        let stem = (ns.lastPathComponent as NSString).deletingPathExtension
+        var n = 1
+        while n < 1000 {
+            let candidateName = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
+            let candidate = (dir as NSString).appendingPathComponent(candidateName)
+            if !fm.fileExists(atPath: candidate) { return candidate }
+            n += 1
+        }
+        return path
     }
 
     // MARK: open
@@ -2461,6 +2757,8 @@ final class WebEngine {
     static let webReadToolSchema = WebToolSchemas.webRead
     static let webScreenshotToolSchema = WebToolSchemas.webScreenshot
     static let webExtractToolSchema = WebToolSchemas.webExtract
+    static let imageSearchToolSchema = WebToolSchemas.imageSearch
+    static let downloadFileToolSchema = WebToolSchemas.downloadFile
     static let browserOpenToolSchema = WebToolSchemas.browserOpen
     static let browserClickToolSchema = WebToolSchemas.browserClick
     static let browserTypeToolSchema = WebToolSchemas.browserType
@@ -2584,6 +2882,85 @@ struct WebExtractTool: AgentTool {
     }
 }
 
+/// `image_search` — search the web for IMAGES, return [{imageURL, thumbnailURL,
+/// sourcePage, title}]. The agent is prompted to then present the top results as
+/// inline Markdown images so the user actually sees them.
+struct ImageSearchTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.imageSearch, fallbackName: "image_search", fallbackDescription: "Search the web for images.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let query = (d["query"] as? String) ?? ""
+        guard !query.isEmpty else { return "Error: 'query' is required." }
+        var count = 8
+        if let n = d["count"] as? Int { count = n }
+        else if let n = d["count"] as? NSNumber { count = n.intValue }
+        count = min(12, max(1, count))
+        let results = try await WebEngine.shared.imageSearch(SearchQuery(query: query, maxResults: count))
+        if results.isEmpty { return "No images found for \"\(query)\"." }
+        // Compact JSON the model reads; it then emits ![title](imageURL) for each.
+        return toolJSON(results)
+    }
+}
+
+/// `download_file` — download an https file to ~/Downloads. CONFIRM-gated through
+/// the SAME `MacControlConfirmer` seam as run_shell (writing to disk is an
+/// action). In headless/dry-run it records "would download" and writes nothing.
+/// `enableWebSearch`-gated at registration; this struct gates the WRITE per call.
+struct DownloadFileTool: AgentTool, @unchecked Sendable {
+    // `@unchecked Sendable`: `confirmer` is a MainActor-isolated class touched only
+    // via `await`; `settings` is a Sendable value. No mutable shared state.
+    let confirmer: (any MacControlConfirmer)?
+    let settings: AgentSettings
+
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.downloadFile, fallbackName: "download_file", fallbackDescription: "Download a file to disk (user must approve).") }
+
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let url = try toolURL(d["url"])
+        guard url.scheme?.lowercased() == "https" else {
+            return "Error: 'url' must be an https URL to download."
+        }
+        let filename = (d["filename"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+        // What the user will see on the confirm card + dry-run line.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let derivedName = DownloadPlanner.resolveFilename(requested: filename, url: url.absoluteString)
+        let destPreview = ((home as NSString).appendingPathComponent("Downloads") as NSString)
+            .appendingPathComponent(derivedName)
+        let summary = "Download \(url.absoluteString)\n  → \(destPreview)"
+
+        // (1) Dry-run / headless: never write; record "would download".
+        if settings.macControlDryRun {
+            Logger.shared.info("[download_file] DRY-RUN would download: \(url.absoluteString) → \(destPreview)")
+            return "Dry-run: would download (awaiting confirm): \(summary)\n(Dry-run mode is on, so nothing was written.)"
+        }
+
+        // (2) Confirm-gate through the Mac-control seam. No confirmer → deny.
+        guard let confirmer = confirmer else {
+            return "Error: no confirmation UI is available, so this file was NOT downloaded."
+        }
+        let req = ConfirmationRequest(
+            id: UUID().uuidString, kind: .download, command: summary,
+            explanation: "Download this file to your Downloads folder.")
+        let decision = await confirmer.requestConfirmation(req)
+        switch decision {
+        case .deny:
+            return "The user declined the download. The file was NOT downloaded. Ask what they'd prefer or continue without it."
+        case .approve, .edit:
+            break   // Edit isn't offered for downloads; treat like approve.
+        }
+
+        // (3) Perform the SSRF-gated, size-capped download.
+        do {
+            let r = try await WebEngine.shared.downloadFile(url: url, filename: filename)
+            Logger.shared.info("[download_file] saved \(r.bytes)B \(r.contentType) → \(r.path)")
+            return "Downloaded \(r.bytes) bytes (\(r.contentType.isEmpty ? "unknown type" : r.contentType)) to:\n\(r.path)"
+        } catch {
+            return "Error: download failed — \(error.localizedDescription)"
+        }
+    }
+}
+
 // MARK: - Interactive browser tools (Playwright-style, session-backed)
 
 /// Render a `BrowserState` into a compact, model-friendly string: a header with
@@ -2681,11 +3058,18 @@ enum WebTools {
     static func register() {
         AgentToolCatalog.register(BuiltinToolGroup(
             gate: { $0.agentSettings.enableWebSearch },
-            make: { _, _ in
-                [
+            make: { config, confirmer in
+                // download_file writes to disk → confirm-gated via the same seam
+                // as run_shell (the type-erased Mac-control confirmer).
+                let c = confirmer as? (any MacControlConfirmer)
+                return [
                     // web_* (single-shot fetch/search)
                     WebSearchTool(), WebOpenTool(), WebReadTool(),
                     WebScreenshotTool(), WebExtractTool(),
+                    // image_search (return image URLs to render inline)
+                    ImageSearchTool(),
+                    // download_file (confirm-gated write to ~/Downloads)
+                    DownloadFileTool(confirmer: c, settings: config.agentSettings),
                     // browser_* (Playwright-style persistent session)
                     BrowserOpenTool(), BrowserClickTool(), BrowserTypeTool(),
                     BrowserReadTool(), BrowserScreenshotTool(), BrowserBackTool(),

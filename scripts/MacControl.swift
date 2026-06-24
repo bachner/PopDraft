@@ -253,6 +253,7 @@ struct MacControlGate: @unchecked Sendable {
         switch kind {
         case .shell: return "Run this shell command on your Mac."
         case .applescript: return "Run this AppleScript on your Mac."
+        case .download: return "Download this file to your Mac."
         }
     }
 }

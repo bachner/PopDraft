@@ -298,6 +298,55 @@ func runTests() async {
         R.check(false, "browser_open loopback blocked but non-WebEngineError: \(error)")
     }
 
+    // =====================================================================
+    // download_file: SSRF-gated fetch + write to disk (uses the loopback fixture
+    // via the test-loopback escape hatch). The CONFIRM gate is a separate seam
+    // exercised by the unit tests + the real --agent-once run; here we drive the
+    // engine's `downloadFile` method directly (the I/O half).
+    // =====================================================================
+    do {
+        let r = try await engine.downloadFile(url: URL(string: "\(b)/afile.png")!, filename: "fixture-download.png")
+        R.check(FileManager.default.fileExists(atPath: r.path), "download_file: file written to \(r.path)")
+        R.check(r.bytes > 0, "download_file: non-empty (\(r.bytes) bytes)")
+        R.check(r.contentType == "image/png", "download_file: content-type captured (\(r.contentType))")
+        R.check((r.path as NSString).lastPathComponent == "fixture-download.png",
+                "download_file: requested filename honored (\(r.path))")
+        // Clean up the artifact from ~/Downloads.
+        try? FileManager.default.removeItem(atPath: r.path)
+    } catch {
+        R.check(false, "download_file threw: \(error)")
+    }
+
+    // --- download_file: filename derived from the URL when none given ---
+    do {
+        let r = try await engine.downloadFile(url: URL(string: "\(b)/afile.png")!, filename: nil)
+        R.check((r.path as NSString).lastPathComponent.hasPrefix("afile"),
+                "download_file: filename derived from URL (\(r.path))")
+        try? FileManager.default.removeItem(atPath: r.path)
+    } catch {
+        R.check(false, "download_file (derived name) threw: \(error)")
+    }
+
+    // --- download_file SSRF: a 302 to a loopback IP must be blocked mid-flight ---
+    do {
+        _ = try await engine.downloadFile(url: URL(string: "\(b)/file-redirect-internal")!, filename: nil)
+        R.check(false, "download_file SSRF redirect-to-internal should have thrown")
+    } catch {
+        // The redirect guard cancels the hop → URLSession surfaces a cancel error.
+        R.check(true, "download_file SSRF redirect blocked (\(error))")
+    }
+
+    // --- download_file SSRF: a direct loopback file URL is blocked up-front ---
+    do {
+        _ = try await engine.downloadFile(url: URL(string: "http://127.0.0.1:1/x.bin")!, filename: nil)
+        R.check(false, "download_file of a loopback URL should have thrown")
+    } catch let e as WebEngineError {
+        if case .blockedHost = e { R.check(true, "download_file loopback blocked (SSRF)") }
+        else { R.check(true, "download_file loopback blocked (\(e))") }
+    } catch {
+        R.check(false, "download_file loopback blocked but non-WebEngineError: \(error)")
+    }
+
     print("\n========================================")
     print("GUI Results: \(R.pass) passed, \(R.fail) failed")
     print("========================================")

@@ -1169,6 +1169,31 @@ struct SearchQuery: Equatable {
     }
 }
 
+/// One image result from `WebEngine.imageSearch`. `imageURL` is the full-size
+/// https image; `thumbnailURL` a (usually smaller) preview; `sourcePage` the
+/// page the image was found on; `title` the alt/caption text.
+struct ImageResult: Codable, Equatable {
+    var imageURL: String
+    var thumbnailURL: String
+    var sourcePage: String
+    var title: String
+
+    init(imageURL: String, thumbnailURL: String, sourcePage: String, title: String) {
+        self.imageURL = imageURL
+        self.thumbnailURL = thumbnailURL
+        self.sourcePage = sourcePage
+        self.title = title
+    }
+}
+
+/// Result of `WebEngine.downloadFile` — a file written to disk.
+struct DownloadResult: Codable, Equatable {
+    var url: String          // the (final) source URL fetched
+    var path: String         // absolute path on disk
+    var bytes: Int
+    var contentType: String
+}
+
 /// Result of `WebEngine.open` — a light "did it load, what is it" probe.
 struct OpenResult: Codable, Equatable {
     var finalURL: String
@@ -1866,6 +1891,172 @@ enum DDGParser {
     }
 }
 
+// MARK: - Image search result parsing
+
+/// Pure parsers for the image-search sources, mirroring `DDGParser` for the web
+/// search. Two scrape paths + one render path, all Foundation-only so they are
+/// golden-tested without WebKit/network:
+///   - `parseVQD`            — pull DuckDuckGo's `vqd` token out of the SERP HTML
+///                             (needed to call its `i.js` image endpoint).
+///   - `parseDDGImageJSON`   — decode the DuckDuckGo `i.js` JSON image response.
+///   - `parseImageSERPJSON`  — decode the JSON array emitted by the injected
+///                             `WebJS.imageExtractScript` (the WKWebView render
+///                             fallback, like `parseSERPJSON` for web search).
+enum ImageSearchParser {
+    /// DuckDuckGo gates its image API behind a per-session `vqd` token embedded in
+    /// the results page. It appears in a few shapes across builds:
+    ///   `vqd='4-123...'`  `vqd="4-123..."`  `vqd=4-123...&`  `&vqd=4-123...`
+    /// Return the first match, else nil. Tolerant of quoting + surrounding markup.
+    static func parseVQD(_ html: String) -> String? {
+        // Quoted form first (most reliable), then the bare query-param form.
+        let patterns = [
+            "vqd\\s*=\\s*['\"]([0-9][\\w-]*)['\"]",
+            "[?&]vqd=([0-9][\\w-]+)",
+        ]
+        let ns = html as NSString
+        for p in patterns {
+            guard let re = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) else { continue }
+            if let m = re.firstMatch(in: html, options: [], range: NSRange(location: 0, length: ns.length)),
+               m.numberOfRanges >= 2 {
+                let v = ns.substring(with: m.range(at: 1))
+                if !v.isEmpty { return v }
+            }
+        }
+        return nil
+    }
+
+    /// Parse the DuckDuckGo `i.js` JSON image response into `[ImageResult]`.
+    /// Shape: `{ "results": [ { "image": "...", "thumbnail": "...", "url": "...",
+    /// "title": "..." }, ... ] }`. Keeps only https `image` URLs (the chat can
+    /// only render https inline), normalizes, dedupes by image URL, caps to
+    /// `maxResults`. Tolerant: bad/empty input yields [].
+    static func parseDDGImageJSON(_ json: String, maxResults: Int = 8) -> [ImageResult] {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["results"] as? [[String: Any]] else {
+            return []
+        }
+        return normalize(arr.map { o in
+            (image: o["image"] as? String,
+             thumb: o["thumbnail"] as? String,
+             page: o["url"] as? String,
+             title: o["title"] as? String)
+        }, maxResults: maxResults)
+    }
+
+    /// Parse the JSON array produced by `WebJS.imageExtractScript` (the WKWebView
+    /// render fallback). Each entry: `{image, thumbnail, source, title}`.
+    static func parseImageSERPJSON(_ json: String, maxResults: Int = 8) -> [ImageResult] {
+        guard let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return normalize(arr.map { o in
+            (image: o["image"] as? String,
+             thumb: o["thumbnail"] as? String,
+             page: o["source"] as? String,
+             title: o["title"] as? String)
+        }, maxResults: maxResults)
+    }
+
+    /// Shared post-processing: require an https `image` URL, fill in sensible
+    /// fallbacks, strip tracking params, dedupe by image URL, cap.
+    private static func normalize(
+        _ raw: [(image: String?, thumb: String?, page: String?, title: String?)],
+        maxResults: Int
+    ) -> [ImageResult] {
+        var out: [ImageResult] = []
+        var seen = Set<String>()
+        for r in raw {
+            guard let img = r.image, img.hasPrefix("https://") else { continue }
+            let imageURL = URLCleaner.strip(img)
+            if seen.contains(imageURL) { continue }
+            seen.insert(imageURL)
+            // Thumbnail must also be https for inline rendering; else reuse image.
+            let rawThumb = r.thumb ?? ""
+            let thumb = rawThumb.hasPrefix("https://") ? URLCleaner.strip(rawThumb) : imageURL
+            let page = (r.page ?? "").hasPrefix("http") ? URLCleaner.strip(r.page!) : ""
+            let title = DDGParser.stripTags(r.title ?? "")
+            out.append(ImageResult(imageURL: imageURL, thumbnailURL: thumb, sourcePage: page, title: title))
+            if out.count >= maxResults { break }
+        }
+        return out
+    }
+}
+
+// MARK: - Download filename / destination planning
+
+/// Pure helpers for `download_file`: sanitize a filename and derive a safe
+/// absolute destination path under a base directory. No FS access — golden-tested.
+enum DownloadPlanner {
+    /// Characters never allowed in a saved filename (path separators, NUL, control
+    /// chars, and a handful that confuse shells / Finder).
+    private static let illegal = CharacterSet(charactersIn: "/\\:\0\n\r\t").union(.controlCharacters)
+
+    /// Turn an arbitrary candidate into a SAFE single path component:
+    ///   - strip any directory part (defeats `../`, absolute, and nested paths),
+    ///   - drop illegal chars, collapse whitespace runs to one space,
+    ///   - trim leading dots/spaces (no hidden / leading-space files),
+    ///   - cap length, and fall back to a default if nothing usable remains.
+    static func sanitizeFilename(_ raw: String, fallback: String = "download") -> String {
+        // Keep only the last path component so "../../etc/passwd" → "passwd".
+        let lastComponent = (raw as NSString).lastPathComponent
+        let scalars = lastComponent.unicodeScalars.map { illegal.contains($0) ? " " : Character($0) }
+        var cleaned = String(scalars)
+        cleaned = cleaned.split(whereSeparator: { $0 == " " }).joined(separator: " ")
+        cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: " .").union(.whitespacesAndNewlines))
+        // Cap to a sane length, preserving the extension if present.
+        let maxLen = 200
+        if cleaned.count > maxLen {
+            let ext = (cleaned as NSString).pathExtension
+            let stem = (cleaned as NSString).deletingPathExtension
+            let keep = max(1, maxLen - (ext.isEmpty ? 0 : ext.count + 1))
+            cleaned = String(stem.prefix(keep)) + (ext.isEmpty ? "" : "." + ext)
+        }
+        if cleaned.isEmpty || cleaned == "." || cleaned == ".." { return fallback }
+        return cleaned
+    }
+
+    /// Derive a filename from a URL's last path component (decoded, sanitized).
+    /// Returns nil when the URL has no usable filename part.
+    static func filenameFromURL(_ url: String) -> String? {
+        guard let comps = URLComponents(string: url) else { return nil }
+        // comps.path is already percent-DECODED.
+        let last = (comps.path as NSString).lastPathComponent
+        let trimmed = last.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, trimmed != "/" else { return nil }
+        let safe = sanitizeFilename(trimmed, fallback: "")
+        return safe.isEmpty ? nil : safe
+    }
+
+    /// Decide the final saved filename: an explicit (sanitized) name wins; else
+    /// derive from the URL; else a timestamped default. A default extension is
+    /// appended only when the chosen name has none AND `defaultExt` is non-empty.
+    static func resolveFilename(requested: String?, url: String, defaultExt: String = "") -> String {
+        let chosen: String
+        if let req = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !req.isEmpty {
+            chosen = sanitizeFilename(req)
+        } else if let fromURL = filenameFromURL(url) {
+            chosen = fromURL
+        } else {
+            chosen = "download-\(Int(Date().timeIntervalSince1970))"
+        }
+        if (chosen as NSString).pathExtension.isEmpty, !defaultExt.isEmpty {
+            let ext = defaultExt.hasPrefix(".") ? String(defaultExt.dropFirst()) : defaultExt
+            return chosen + "." + ext
+        }
+        return chosen
+    }
+
+    /// Build the absolute destination path under `baseDir`, guaranteeing the
+    /// result stays directly inside `baseDir` (the filename is already a single
+    /// safe component, so no traversal is possible).
+    static func destination(baseDir: String, filename: String) -> String {
+        let safe = sanitizeFilename(filename)
+        return (baseDir as NSString).appendingPathComponent(safe)
+    }
+}
+
 // MARK: - Markdown truncation / sanitization
 
 enum MarkdownSanitizer {
@@ -2149,8 +2340,44 @@ enum WebToolSchemas {
     }
     """
 
+    static let imageSearch = """
+    {
+      "type": "function",
+      "function": {
+        "name": "image_search",
+        "description": "Search the web for IMAGES (photos / pictures) and return a list of {imageURL, thumbnailURL, sourcePage, title}. Use this — NOT web_search — whenever the user asks to find / show / see a photo, picture, image, or what something or someone LOOKS LIKE. After it returns, present the top results to the user as inline Markdown images so they actually SEE them: ![title](imageURL) on its own line for each.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "description": "What to find an image of (e.g. 'Eiffel Tower at night', 'a red panda')." },
+            "count": { "type": "integer", "description": "How many images to return (1-12).", "default": 8 }
+          },
+          "required": ["query"]
+        }
+      }
+    }
+    """
+
+    static let downloadFile = """
+    {
+      "type": "function",
+      "function": {
+        "name": "download_file",
+        "description": "Download a file (image, PDF, or any document) from an https URL and SAVE it to disk (default: the user's ~/Downloads folder). Use when the user asks to download / save a file or an image to their Mac. The user must APPROVE the download before it runs; in headless mode it is a dry-run. Returns the saved file path on success.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The absolute https URL of the file to download." },
+            "filename": { "type": "string", "description": "Optional name to save the file as. If omitted, it is derived from the URL." }
+          },
+          "required": ["url"]
+        }
+      }
+    }
+    """
+
     /// All schemas, in registration order.
-    static let all: [String] = [webSearch, webOpen, webRead, webScreenshot, webExtract]
+    static let all: [String] = [webSearch, webOpen, webRead, webScreenshot, webExtract, imageSearch, downloadFile]
 
     // MARK: Interactive browser session tools (Playwright-style)
 
@@ -3874,6 +4101,7 @@ enum MacControlPolicy {
 enum ConfirmationKind: String, Equatable, Sendable {
     case shell
     case applescript
+    case download
 }
 
 /// The user's decision on a pending confirmation. `.edit` carries the possibly

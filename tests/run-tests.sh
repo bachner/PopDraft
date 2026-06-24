@@ -16,6 +16,7 @@ TESTS=(
   "tests/test-model-validation.swift scripts/Core.swift"
   "tests/test-session.swift scripts/Core.swift"
   "tests/test-webengine-core.swift scripts/Core.swift"
+  "tests/test-imagesearch.swift scripts/Core.swift"
   "tests/test-toolrunner.swift scripts/Core.swift"
   "tests/test-agentloop.swift scripts/Core.swift"
   "tests/test-compaction.swift scripts/Core.swift"

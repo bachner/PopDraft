@@ -381,7 +381,8 @@ test("Web tool JSON-Schema constants are valid JSON") {
         assert((fn?["name"] as? String)?.isEmpty == false, "schema \(i) has a name")
         assert(fn?["parameters"] is [String: Any], "schema \(i) has parameters object")
     }
-    assert(WebToolSchemas.all.count == 5, "five tool schemas")
+    // web_search, web_open, web_read, web_screenshot, web_extract, image_search, download_file
+    assert(WebToolSchemas.all.count == 7, "seven tool schemas")
 }
 
 // MARK: - Interactive browser tool schemas are valid JSON

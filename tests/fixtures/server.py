@@ -120,6 +120,31 @@ PORTAL_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+# An image-results-style page: several <img> elements (some with data-src lazy
+# loading, some with a real src) pointing at https URLs, each wrapped in a source
+# link. Exercises WebJS.imageExtractScript + ImageSearchParser.parseImageSERPJSON.
+# The <img> URLs are https (so the parser keeps them) but never fetched by the
+# test — only their src/data-src attributes are read out of the rendered DOM.
+IMAGE_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Image Results</title></head>
+<body>
+  <h1>Image Results</h1>
+  <a href="https://commons.example.org/eiffel"><img
+      data-src="https://images.example.com/eiffel_full.jpg"
+      src="https://images.example.com/eiffel_thumb.jpg"
+      width="300" height="200" alt="Eiffel Tower at dusk"></a>
+  <a href="https://commons.example.org/tower2"><img
+      src="https://images.example.com/tower2.png"
+      width="320" height="240" title="Another tower view"></a>
+  <!-- a tiny tracking pixel that must be filtered out (too small) -->
+  <img src="https://images.example.com/pixel.gif" width="1" height="1" alt="">
+  <!-- a non-https image that must be dropped -->
+  <img src="http://insecure.example.com/nope.jpg" width="300" height="200" alt="insecure">
+</body>
+</html>"""
+
+
 def search_results_html(query):
     """Server-side 'search results' page; echoes the query into its body so a
     typed query + submit lands on content that contains the query (proving the
@@ -188,6 +213,28 @@ def make_handler():
                 chunk = "<p>" + ("x" * 1000) + "</p>\n"
                 body = "<!DOCTYPE html><html><body>" + chunk * 12000 + "</body></html>"
                 self._send(200, body)
+            elif path == "/imagepage":
+                self._send(200, IMAGE_PAGE_HTML)
+            elif path == "/afile.png":
+                # A tiny binary "file" with an image content-type — exercises
+                # download_file (SSRF-gated fetch + write + content-type capture).
+                # Minimal 1x1 PNG.
+                png = bytes([
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+                    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+                    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+                    0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+                    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+                    0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+                    0x42, 0x60, 0x82,
+                ])
+                self._send(200, png, ctype="image/png")
+            elif path == "/file-redirect-internal":
+                # A download whose 302 points at a loopback IP — the download
+                # redirect SSRF guard must block the hop.
+                self._send(302, "", extra={"Location": "http://127.0.0.1:1/secret.bin"})
             elif path == "/missing":
                 self._send(404, "<html><body><h1>404 Not Found</h1></body></html>")
             else:
