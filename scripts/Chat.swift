@@ -162,6 +162,108 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         return "\(LLMClient.shared.currentModel) · \(suffix)"
     }
 
+    // MARK: In-chat model selector (header pill dropdown)
+
+    /// Build the grouped list of model choices for the header dropdown from the
+    /// SAME source of truth Settings → Models uses (`LLMConfig`): the local
+    /// "Local Model", the configured Ollama model, the OpenAI catalog, the
+    /// Claude catalog, plus any user-added models. The currently-active
+    /// provider+model is marked, and cloud providers with no API key are flagged
+    /// `needsKey` so the menu can disable them (never silently switch to a broken
+    /// provider). Pure read of config — does not mutate anything.
+    static func modelChoiceGroups() -> [ModelChoiceGroup] {
+        let cfg = LLMConfig.load()
+        let activeProvider = cfg.provider
+
+        func isActive(_ p: LLMConfig.Provider, _ model: String) -> Bool {
+            guard p == activeProvider else { return false }
+            switch p {
+            case .llamacpp: return true                     // single local slot
+            case .ollama:   return model == cfg.ollamaModel
+            case .openai:   return model == cfg.openaiModel
+            case .claude:   return model == cfg.claudeModel
+            }
+        }
+
+        var groups: [ModelChoiceGroup] = []
+
+        // llama.cpp — one local slot. Always available (no key needed).
+        groups.append(ModelChoiceGroup(provider: .llamacpp, needsKey: false, choices: [
+            ModelChoice(provider: .llamacpp, model: "Local Model",
+                        label: "Local Model", isActive: isActive(.llamacpp, "Local Model"))
+        ]))
+
+        // Ollama — the configured local model (no key needed).
+        let ollamaModel = cfg.ollamaModel
+        groups.append(ModelChoiceGroup(provider: .ollama, needsKey: false, choices: [
+            ModelChoice(provider: .ollama, model: ollamaModel,
+                        label: ollamaModel, isActive: isActive(.ollama, ollamaModel))
+        ]))
+
+        // OpenAI — catalog (minus the "Custom…" sentinel) + any user/configured
+        // models; disabled when no key is set.
+        let openaiKey = (cfg.openaiAPIKey.isEmpty ? (cfg.providerKeys["openai"] ?? "") : cfg.openaiAPIKey)
+        var openaiModels = LLMConfig.openaiModels.filter { $0 != "Custom..." }
+        for m in cfg.userModels where m.provider == "openai" && !openaiModels.contains(m.name) {
+            openaiModels.append(m.name)
+        }
+        if !openaiModels.contains(cfg.openaiModel) { openaiModels.insert(cfg.openaiModel, at: 0) }
+        groups.append(ModelChoiceGroup(
+            provider: .openai, needsKey: openaiKey.isEmpty,
+            choices: openaiModels.map { m in
+                ModelChoice(provider: .openai, model: m, label: m, isActive: isActive(.openai, m))
+            }))
+
+        // Claude — catalog (minus "Custom…") + any user/configured models;
+        // disabled when no key is set.
+        let claudeKey = (cfg.claudeAPIKey.isEmpty ? (cfg.providerKeys["anthropic"] ?? "") : cfg.claudeAPIKey)
+        var claudeModels = LLMConfig.claudeModels.filter { $0 != "Custom..." }
+        for m in cfg.userModels where m.provider == "claude" && !claudeModels.contains(m.name) {
+            claudeModels.append(m.name)
+        }
+        if !claudeModels.contains(cfg.claudeModel) { claudeModels.insert(cfg.claudeModel, at: 0) }
+        groups.append(ModelChoiceGroup(
+            provider: .claude, needsKey: claudeKey.isEmpty,
+            choices: claudeModels.map { m in
+                ModelChoice(provider: .claude, model: m, label: m, isActive: isActive(.claude, m))
+            }))
+
+        return groups
+    }
+
+    /// Switch the active provider+model live, persisting through the SAME path
+    /// Settings uses (`LLMConfig.save()` → `LLMClient.shared.reloadConfig()`) so
+    /// the change affects the very next message in this chat. Updates the header
+    /// pill immediately. No-op if the choice is already active.
+    func switchModel(to choice: ModelChoice) {
+        var cfg = LLMConfig.load()
+        if cfg.provider == choice.provider, AgentChatViewModel.choiceMatchesActive(cfg, choice) {
+            return
+        }
+
+        cfg.provider = choice.provider
+        switch choice.provider {
+        case .llamacpp: break                       // local slot has no model id to set
+        case .ollama:   cfg.ollamaModel = choice.model
+        case .openai:   cfg.openaiModel = choice.model
+        case .claude:   cfg.claudeModel = choice.model
+        }
+        cfg.save()
+        LLMClient.shared.reloadConfig()
+        modelLabel = AgentChatViewModel.makeModelLabel()
+    }
+
+    /// True when `choice` already matches the active model in `cfg` (provider
+    /// already verified equal by the caller).
+    private static func choiceMatchesActive(_ cfg: LLMConfig, _ choice: ModelChoice) -> Bool {
+        switch choice.provider {
+        case .llamacpp: return true
+        case .ollama:   return cfg.ollamaModel == choice.model
+        case .openai:   return cfg.openaiModel == choice.model
+        case .claude:   return cfg.claudeModel == choice.model
+        }
+    }
+
     /// Recompute `visibleMessages` + per-message cards from `session.messages`.
     ///
     /// One agent turn can be MULTIPLE messages on the wire: an assistant message
@@ -2008,6 +2110,94 @@ struct StreamingCaret: View {
     }
 }
 
+// MARK: - Chat UI: in-chat model selector (header pill dropdown)
+
+/// One selectable provider+model in the header dropdown. `model` is the value
+/// persisted onto `LLMConfig` for that provider (for llama.cpp it's the fixed
+/// "Local Model" label, which has no on-disk model id). `isActive` marks the
+/// currently-selected entry so the menu can show a checkmark.
+struct ModelChoice: Identifiable, Equatable {
+    let provider: LLMConfig.Provider
+    let model: String
+    let label: String
+    let isActive: Bool
+    var id: String { "\(provider.rawValue)::\(model)" }
+}
+
+/// A provider section in the dropdown (e.g. all OpenAI models). `needsKey` is
+/// true for a cloud provider with no API key configured — its rows render
+/// disabled with a "needs key in Settings" hint instead of silently switching
+/// to a provider that can't make a request.
+struct ModelChoiceGroup: Identifiable {
+    let provider: LLMConfig.Provider
+    let needsKey: Bool
+    let choices: [ModelChoice]
+    var id: String { provider.rawValue }
+}
+
+/// The clickable header pill that opens the frosted model dropdown. Shows the
+/// current "Model · provider" label plus a chevron; tapping it reveals a
+/// `Menu` grouped by provider with the active model checked. Selecting an
+/// enabled item calls back to switch the active model live.
+struct ModelMenuPill: View {
+    let label: String
+    let didCompact: Bool
+    let onSelect: (ModelChoice) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(AgentChatViewModel.modelChoiceGroups()) { group in
+                Section(group.provider.displayName) {
+                    ForEach(group.choices) { choice in
+                        Button {
+                            onSelect(choice)
+                        } label: {
+                            if choice.isActive {
+                                Label(choice.label, systemImage: "checkmark")
+                            } else {
+                                Text(group.needsKey ? "\(choice.label) — needs key in Settings"
+                                                     : choice.label)
+                            }
+                        }
+                        // A cloud provider with no key can't make a request — keep
+                        // it visible (so the user knows it exists) but un-pickable.
+                        .disabled(group.needsKey && !choice.isActive)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Circle().fill(ChatPalette.green).frame(width: 7, height: 7)
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(ChatPalette.ink2)
+                    .lineLimit(1)
+                // Tiny, non-blocking note when older messages were compacted to fit
+                // the context window (the full transcript is still shown below).
+                if didCompact {
+                    Text("· compacted earlier messages")
+                        .font(.system(size: 10))
+                        .foregroundColor(ChatPalette.ink3)
+                        .lineLimit(1)
+                        .help("Older messages were summarized so the conversation fits the model's context window. The full transcript is preserved here.")
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(ChatPalette.ink3)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(ChatPalette.cardFill)
+            .clipShape(Capsule())
+            .contentShape(Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Switch the active model / provider")
+    }
+}
+
 // MARK: - Chat UI: ChatView (PR8)
 
 /// The full Claude-style agent chat surface (Liquid Glass). A header (title +
@@ -2094,26 +2284,13 @@ struct ChatView: View {
 
             Spacer()
 
-            HStack(spacing: 5) {
-                Circle().fill(ChatPalette.green).frame(width: 7, height: 7)
-                Text(viewModel.modelLabel)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(ChatPalette.ink2)
-                    .lineLimit(1)
-                // Tiny, non-blocking note when older messages were compacted to fit
-                // the context window (the full transcript is still shown below).
-                if viewModel.didCompact {
-                    Text("· compacted earlier messages")
-                        .font(.system(size: 10))
-                        .foregroundColor(ChatPalette.ink3)
-                        .lineLimit(1)
-                        .help("Older messages were summarized so the conversation fits the model's context window. The full transcript is preserved here.")
-                }
+            // The model pill is now a live dropdown: switch the active
+            // provider+model on the fly (persists like Settings → Models and
+            // reloads LLMClient, so the next message uses the new model).
+            ModelMenuPill(label: viewModel.modelLabel,
+                          didCompact: viewModel.didCompact) { choice in
+                viewModel.switchModel(to: choice)
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(ChatPalette.cardFill)
-            .clipShape(Capsule())
 
             Button(action: minimize) {
                 Image(systemName: "minus")
