@@ -58,6 +58,7 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
     private var popup: PopupWindowController?
     private var settings: SettingsWindowController?
     private var bubble: BubbleWindowController?
+    private var history: HistoryWindowController?
 
     init(state: String) { self.state = state }
 
@@ -83,9 +84,18 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
             s.showWindow()
             settings = s
             centerOnPrimary(s.window)
+        case "history":
+            let h = HistoryWindowController()
+            // No AppDelegate/popup in --debug-show; just log instead of reopening.
+            h.onOpenSession = { id in
+                FileHandle.standardError.write(Data("debug-show history: would open \(id)\n".utf8))
+            }
+            h.showWindow()
+            history = h
+            centerOnPrimary(h.window)
         default:
             FileHandle.standardError.write(Data(
-                "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings)\n".utf8))
+                "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings|history)\n".utf8))
             exit(2)
         }
     }
