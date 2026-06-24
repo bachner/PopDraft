@@ -44,16 +44,32 @@ Selected Text -> Ctrl+Option+Shortcut -> Direct Action -> LLM API -> Result Prev
 
 ### Files
 
-**Main App:**
-- `scripts/PopDraft.swift` - Complete macOS app including:
-  - Menu bar with sparkles icon
-  - Popup window for text processing
-  - HotkeyManager for global keyboard shortcuts
-  - OnboardingWindowController for first-run setup
-  - TTSServerManager for TTS subprocess
-  - LaunchAtLoginManager for auto-start
-  - Multi-provider LLM support (llama.cpp, Ollama, OpenAI, Claude)
-  - Settings window with General/LLM/TTS tabs
+**Main App:** the macOS app is split across focused, co-compiled `scripts/*.swift`
+files (one Swift target, NO module boundaries — they share a namespace). The build
+globs `scripts/*.swift`, so adding a file needs no build-line change. Key files:
+- `scripts/Main.swift` - `@main` entry (`PopDraftMain`) + `--debug-show` harness
+- `scripts/App.swift` - AppDelegate, menu bar, DependencyManager, UpdateManager, LaunchAtLogin
+- `scripts/Hotkeys.swift` - Carbon HotkeyManager / global shortcuts
+- `scripts/Popup.swift` - PopupView + PopupWindowController (action menu state machine)
+- `scripts/Bubble.swift` - corner bubble (lives in `Chat.swift`)
+- `scripts/Chat.swift` - ChatView, AgentChatViewModel, markdown/tool-call cards, BubbleView
+- `scripts/Settings.swift` - SettingsView + tabs (General/Models/Actions/MCP/Voice), MCP settings
+- `scripts/Onboarding.swift` - first-run onboarding
+- `scripts/Agent.swift` - LLMClient (llama.cpp/Ollama/OpenAI/Claude), PopDraftAgent, text tools, **tool self-registration bootstrap** (`BuiltinTools`)
+- `scripts/WebEngine.swift` - WebEngine, RendererPool, PinningProxy, web/browser tools
+- `scripts/MacControl.swift` - confirm-gated run_shell / run_applescript tools
+- `scripts/MCP.swift` - MCPClient / MCPManager
+- `scripts/TTS.swift`, `scripts/LlamaServer.swift`, `scripts/ActionManager.swift`,
+  `scripts/Models.swift`, `scripts/UIKitGlass.swift`, `scripts/Headless.swift` - supporting concerns
+- `scripts/Core.swift` - pure/unit-tested core (config, agent loop, tool registry, `AgentToolCatalog`)
+
+**Agent tool self-registration:** built-in tools are NOT listed in a shared
+function. Each feature file declares a `BuiltinToolGroup` (gate + factory) and
+registers it into `AgentToolCatalog` (in `Core.swift`) via its `register()`;
+`BuiltinTools.installAll()` in `Agent.swift` is the single bootstrap, armed by
+`BuiltinTools.arm()` at startup. `PopDraftAgent.buildRegistry` and
+`BuiltinToolNames.reserved` are both DERIVED from the catalog — adding a tool is a
+change to one feature file, not an edit to a shared list.
 
 **TTS Server:**
 - `scripts/llm-tts-server.py` - Kokoro TTS HTTP server

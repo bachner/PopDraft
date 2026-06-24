@@ -1,0 +1,1283 @@
+// PopDraft - Popup Menu App
+// A menu bar app that shows a floating action popup for text processing
+//
+// Built by co-compiling with scripts/Core.swift:
+//   swiftc -O scripts/PopDraft.swift scripts/Core.swift \
+//       -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation
+
+import Cocoa
+import SwiftUI
+import Carbon.HIToolbox
+import WebKit
+import CryptoKit
+import Network
+
+// MARK: - LLM Client
+
+class LLMClient {
+    static let llamaServerDownError = "LLAMA_SERVER_DOWN"
+    static let shared = LLMClient()
+    private var config: LLMConfig
+    private var activeProvider: LLMConfig.Provider?
+    private var activeStreamDelegate: OllamaStreamDelegate?
+    private var activeLlamaCppStreamDelegate: LlamaCppStreamDelegate?
+
+    init() {
+        config = LLMConfig.load()
+    }
+
+    func reloadConfig() {
+        config = LLMConfig.load()
+        activeProvider = nil
+    }
+
+    var providerName: String {
+        return (activeProvider ?? config.provider).displayName
+    }
+
+    var currentModel: String {
+        switch activeProvider ?? config.provider {
+        case .llamacpp: return "Local Model"
+        case .ollama: return config.ollamaModel
+        case .openai: return config.openaiModel
+        case .claude: return config.claudeModel
+        }
+    }
+
+    // Check if a local backend is available
+    private func isLocalBackendAvailable(_ provider: LLMConfig.Provider) -> Bool {
+        guard provider == .llamacpp || provider == .ollama else { return true }
+
+        let urlString = provider == .llamacpp
+            ? "\(config.llamacppURL)/health"
+            : "\(config.ollamaURL)/api/tags"
+
+        guard let url = URL(string: urlString) else { return false }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.0
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var isAvailable = false
+
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                isAvailable = true
+            }
+            semaphore.signal()
+        }.resume()
+
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        return isAvailable
+    }
+
+    private func logError(_ message: String) {
+        Logger.shared.log(message)
+    }
+
+    func generate(prompt: String, systemPrompt: String? = nil, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        let provider = config.provider
+        activeProvider = provider
+
+        Logger.shared.info("Sending to \(provider.displayName) [\(currentModel)]")
+
+        // Generate with the configured provider, fallback to llama.cpp on failure
+        generateWithProvider(provider, prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress) { [weak self] result in
+            switch result {
+            case .success:
+                completion(result)
+            case .failure(let error):
+                // If not already using llama.cpp, try falling back to it
+                if provider != .llamacpp {
+                    self?.logError("Provider \(provider.displayName) failed: \(error.localizedDescription). Falling back to llama.cpp.")
+                    self?.activeProvider = .llamacpp
+                    self?.generateWithProvider(.llamacpp, prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+                } else {
+                    completion(result)
+                }
+            }
+        }
+    }
+
+    private func generateWithProvider(_ provider: LLMConfig.Provider, prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        switch provider {
+        case .llamacpp:
+            generateLlamaCpp(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress, completion: completion)
+        case .ollama:
+            generateOllama(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress, completion: completion)
+        case .openai:
+            if config.openaiAPIKey.isEmpty {
+                completion(.failure(NSError(domain: "OpenAI API key not configured", code: -1)))
+                return
+            }
+            generateOpenAI(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        case .claude:
+            if config.claudeAPIKey.isEmpty {
+                completion(.failure(NSError(domain: "Claude API key not configured", code: -1)))
+                return
+            }
+            generateClaude(prompt: prompt, systemPrompt: systemPrompt, completion: completion)
+        }
+    }
+
+    // MARK: - llama.cpp Backend (OpenAI-compatible API)
+
+    private func generateLlamaCpp(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        guard let url = URL(string: "\(config.llamacppURL)/v1/chat/completions") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        let useStreaming = onProgress != nil
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+
+        var messages: [[String: String]] = []
+        if let system = systemPrompt {
+            messages.append(["role": "system", "content": system])
+        }
+        messages.append(["role": "user", "content": prompt])
+
+        let body: [String: Any] = [
+            "messages": messages,
+            "stream": useStreaming,
+            "max_tokens": 4096
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        if useStreaming {
+            let delegate = LlamaCppStreamDelegate(
+                enableThinking: config.llamacppEnableThinking,
+                onProgress: { progress in
+                    DispatchQueue.main.async { onProgress?(progress) }
+                },
+                onCompletion: { [weak self] result in
+                    DispatchQueue.main.async {
+                        self?.activeLlamaCppStreamDelegate = nil
+                        completion(result)
+                    }
+                }
+            )
+            activeLlamaCppStreamDelegate = delegate
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.dataTask(with: request).resume()
+        } else {
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error = error {
+                    if (error as? URLError)?.code == .cannotConnectToHost {
+                        completion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+                    } else {
+                        completion(.failure(error))
+                    }
+                    return
+                }
+
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 503 {
+                    completion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+                    return
+                }
+
+                guard let data = data else {
+                    completion(.failure(NSError(domain: "No data", code: -1)))
+                    return
+                }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let choices = json["choices"] as? [[String: Any]],
+                       let first = choices.first,
+                       let message = first["message"] as? [String: Any],
+                       let content = message["content"] as? String {
+                        var cleaned = content
+                        var thinkingText: String? = nil
+                        if let range = cleaned.range(of: "</think>") {
+                            if self.config.llamacppEnableThinking, let startRange = cleaned.range(of: "<think>") {
+                                thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                            cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
+                    } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let errorObj = json["error"] as? [String: Any],
+                              let message = errorObj["message"] as? String {
+                        completion(.failure(NSError(domain: message, code: -1)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                    }
+                } catch {
+                    completion(.failure(error))
+                }
+            }.resume()
+        }
+    }
+
+    // MARK: - Ollama Backend
+
+    private func generateOllama(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        let useStreaming = config.ollamaEnableThinking && onProgress != nil
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+
+        var body: [String: Any] = [
+            "model": config.ollamaModel,
+            "prompt": prompt,
+            "stream": useStreaming
+        ]
+
+        body["think"] = config.ollamaEnableThinking
+
+        if let system = systemPrompt {
+            body["system"] = system
+        }
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        if useStreaming {
+            let delegate = OllamaStreamDelegate(
+                enableThinking: config.ollamaEnableThinking,
+                onProgress: { progress in
+                    DispatchQueue.main.async { onProgress?(progress) }
+                },
+                onCompletion: { [weak self] result in
+                    DispatchQueue.main.async {
+                        self?.activeStreamDelegate = nil
+                        completion(result)
+                    }
+                }
+            )
+            activeStreamDelegate = delegate
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.dataTask(with: request).resume()
+        } else {
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let data = data else {
+                    completion(.failure(NSError(domain: "No data", code: -1)))
+                    return
+                }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let responseText = json["response"] as? String {
+                        var cleaned = responseText
+                        var thinkingText: String? = nil
+                        // Ollama returns thinking in a separate "thinking" field
+                        if self.config.ollamaEnableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                            thinkingText = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        // Also handle <think> tags in response text as fallback
+                        if let range = cleaned.range(of: "</think>") {
+                            if self.config.ollamaEnableThinking && thinkingText == nil, let startRange = cleaned.range(of: "<think>") {
+                                thinkingText = String(cleaned[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                            cleaned = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        completion(.success(LLMResponse(text: cleaned, thinking: thinkingText)))
+                    } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let errorMsg = json["error"] as? String {
+                        completion(.failure(NSError(domain: errorMsg, code: -1)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid response", code: -1)))
+                    }
+                } catch {
+                    completion(.failure(error))
+                }
+            }.resume()
+        }
+    }
+
+    // MARK: - OpenAI Backend
+
+    private func generateOpenAI(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(config.openaiAPIKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 120
+
+        var messages: [[String: String]] = []
+        if let system = systemPrompt {
+            messages.append(["role": "system", "content": system])
+        }
+        messages.append(["role": "user", "content": prompt])
+
+        let body: [String: Any] = [
+            "model": config.openaiModel,
+            "messages": messages,
+            "max_tokens": 4096
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "No data", code: -1)))
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let message = first["message"] as? [String: Any],
+                   let content = message["content"] as? String {
+                    completion(.success(LLMResponse(text: content, thinking: nil)))
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorObj = json["error"] as? [String: Any],
+                          let message = errorObj["message"] as? String {
+                    completion(.failure(NSError(domain: "OpenAI: \(message)", code: -1)))
+                } else {
+                    completion(.failure(NSError(domain: "Invalid OpenAI response", code: -1)))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - Claude Backend
+
+    private func generateClaude(prompt: String, systemPrompt: String?, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(config.claudeAPIKey, forHTTPHeaderField: "x-api-key")
+        let useThinking = config.claudeExtendedThinking
+        request.setValue(useThinking ? "2025-04-15" : "2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.timeoutInterval = 120
+
+        let maxTokens = useThinking ? config.claudeThinkingBudget + 4096 : 4096
+        var body: [String: Any] = [
+            "model": config.claudeModel,
+            "max_tokens": maxTokens,
+            "messages": [["role": "user", "content": prompt]]
+        ]
+
+        if useThinking {
+            body["thinking"] = ["type": "enabled", "budget_tokens": config.claudeThinkingBudget]
+        }
+
+        if let system = systemPrompt {
+            body["system"] = system
+        }
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "No data", code: -1)))
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let content = json["content"] as? [[String: Any]] {
+                    var thinkingParts: [String] = []
+                    var textParts: [String] = []
+                    for block in content {
+                        let blockType = block["type"] as? String ?? ""
+                        if blockType == "thinking", let t = block["thinking"] as? String {
+                            thinkingParts.append(t)
+                        } else if blockType == "text", let t = block["text"] as? String {
+                            textParts.append(t)
+                        }
+                    }
+                    let responseText = textParts.joined(separator: "\n")
+                    let thinkingText = thinkingParts.isEmpty ? nil : thinkingParts.joined(separator: "\n")
+                    if !responseText.isEmpty {
+                        completion(.success(LLMResponse(text: responseText, thinking: thinkingText)))
+                    } else {
+                        completion(.failure(NSError(domain: "Invalid Claude response", code: -1)))
+                    }
+                } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let errorObj = json["error"] as? [String: Any],
+                          let message = errorObj["message"] as? String {
+                    completion(.failure(NSError(domain: "Claude: \(message)", code: -1)))
+                } else {
+                    completion(.failure(NSError(domain: "Invalid Claude response", code: -1)))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - PR7: chatCompletion (agent-loop primitive)
+    //
+    // A full-message-array, tool-aware chat primitive used by the agent loop.
+    // It is a SEPARATE path from the single-shot `generate()` above (which is
+    // left untouched), so the existing menu-bar behavior is unchanged. This one
+    // is async/throwing and returns an `AssistantTurn` (content + tool_calls +
+    // thinking) so the loop can iterate. Streaming is kept simple here: text is
+    // pushed to `onTextDelta` only for the local providers that already stream;
+    // tool-call detection always uses the non-streamed body.
+
+    /// One chat-completion round. `messages` is the FULL OpenAI-style message
+    /// array (system/user/assistant/tool). `tools` is the OpenAI `tools` array
+    /// (nil → no tools). Returns the assistant turn. Throws on transport / API
+    /// errors. Provider is read from the current config (no fallback here — the
+    /// loop owns retry policy).
+    func chatCompletion(
+        messages: [ChatMessage],
+        tools: [[String: Any]]? = nil,
+        stream: Bool = false,
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        forceThinkingOff: Bool = false
+    ) async throws -> AssistantTurn {
+        let provider = config.provider
+        activeProvider = provider
+        switch provider {
+        case .llamacpp:
+            return try await chatCompletionOpenAICompatible(
+                urlString: "\(config.llamacppURL)/v1/chat/completions",
+                model: nil, apiKey: nil, messages: messages, tools: tools,
+                isLlamaCpp: true, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
+        case .ollama:
+            // Ollama's native /api/generate isn't tool-capable; use its
+            // OpenAI-compatible endpoint for the agent path.
+            return try await chatCompletionOpenAICompatible(
+                urlString: "\(config.ollamaURL)/v1/chat/completions",
+                model: config.ollamaModel, apiKey: nil, messages: messages, tools: tools,
+                isLlamaCpp: false, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
+        case .openai:
+            guard !config.openaiAPIKey.isEmpty else {
+                throw NSError(domain: "OpenAI API key not configured", code: -1)
+            }
+            return try await chatCompletionOpenAICompatible(
+                urlString: "https://api.openai.com/v1/chat/completions",
+                model: config.openaiModel, apiKey: config.openaiAPIKey,
+                messages: messages, tools: tools, isLlamaCpp: false, onTextDelta: onTextDelta,
+                forceThinkingOff: forceThinkingOff)
+        case .claude:
+            guard !config.claudeAPIKey.isEmpty else {
+                throw NSError(domain: "Claude API key not configured", code: -1)
+            }
+            return try await chatCompletionClaude(messages: messages, tools: tools)
+        }
+    }
+
+    /// Build the OpenAI-style `messages` array from `ChatMessage`s, including
+    /// `tool_calls` on assistant turns and `tool_call_id` on tool messages.
+    private func openAIMessagesJSON(_ messages: [ChatMessage]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for m in messages {
+            var entry: [String: Any] = ["role": m.role]
+            switch m.role {
+            case "assistant":
+                // content may be empty when only tool_calls are present.
+                entry["content"] = m.content
+                if let calls = m.toolCalls, !calls.isEmpty {
+                    entry["tool_calls"] = calls.map { c -> [String: Any] in
+                        return [
+                            "id": c.id,
+                            "type": "function",
+                            "function": ["name": c.name, "arguments": c.arguments],
+                        ]
+                    }
+                }
+            case "tool":
+                entry["content"] = m.content
+                if let id = m.toolCallId { entry["tool_call_id"] = id }
+            default:
+                entry["content"] = m.content
+            }
+            out.append(entry)
+        }
+        return out
+    }
+
+    /// One round against any OpenAI-compatible `/v1/chat/completions` endpoint
+    /// (llama.cpp, Ollama-OpenAI, OpenAI). Non-streamed (so `tool_calls` parse
+    /// reliably); pushes the final text to `onTextDelta` once.
+    private func chatCompletionOpenAICompatible(
+        urlString: String, model: String?, apiKey: String?,
+        messages: [ChatMessage], tools: [[String: Any]]?, isLlamaCpp: Bool,
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        forceThinkingOff: Bool = false
+    ) async throws -> AssistantTurn {
+        guard let url = URL(string: urlString) else {
+            throw NSError(domain: "Invalid URL", code: -1)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let apiKey = apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        request.timeoutInterval = 180
+
+        var body: [String: Any] = [
+            "messages": openAIMessagesJSON(messages),
+            "stream": false,
+            "max_tokens": 4096,
+        ]
+        if let model = model { body["model"] = model }
+        if let tools = tools, !tools.isEmpty {
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            // `parallel_tool_calls` is an OpenAI-cloud field; only send it to the
+            // real OpenAI API (an `apiKey` is present). llama.cpp / Ollama-OpenAI
+            // generally ignore unknown keys, but a stricter server could 400 on it.
+            if apiKey != nil && !isLlamaCpp {
+                body["parallel_tool_calls"] = true
+            }
+        }
+        // Force-disable model reasoning for THIS turn (used by the agent's final
+        // answer-synthesis turn so a thinking model reliably emits plain prose and
+        // doesn't bury the whole answer inside a <think> block). Qwen/llama.cpp
+        // honor `chat_template_kwargs.enable_thinking`; OpenAI's reasoning models
+        // read `reasoning_effort`. Harmless extra keys on servers that ignore them.
+        if forceThinkingOff {
+            body["chat_template_kwargs"] = ["enable_thinking": false]
+            body["enable_thinking"] = false
+            if apiKey != nil && !isLlamaCpp { body["reasoning_effort"] = "low" }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+            }
+            throw error
+        }
+        if isLlamaCpp, let http = response as? HTTPURLResponse, http.statusCode == 503 {
+            throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
+            throw NSError(domain: message, code: -1)
+        }
+        guard let choices = json["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let message = first["message"] as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+
+        // Parse tool_calls (OpenAI / llama.cpp shape).
+        var parsedCalls: [ParsedToolCall] = []
+        if let toolCalls = message["tool_calls"] as? [[String: Any]] {
+            for (i, tc) in toolCalls.enumerated() {
+                guard let fn = tc["function"] as? [String: Any],
+                      let name = fn["name"] as? String else { continue }
+                // Normalize a blank id to a positional one: llama.cpp sometimes
+                // emits `"id":""` for parallel tool calls, and an empty id is
+                // worthless (and collides across calls). The `?? "call_\(i)"`
+                // alone only fires when the key is ABSENT, so coalesce "" too.
+                let id = (tc["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "call_\(i)"
+                // `arguments` may be a JSON string OR an object — pass raw; the
+                // loop's ToolArgs.parse tolerates both.
+                let rawArgs = fn["arguments"]
+                parsedCalls.append(ParsedToolCall(id: id, name: name, rawArguments: rawArgs))
+            }
+        }
+
+        // Parse content + <think> blocks (llama.cpp local thinking).
+        var content = (message["content"] as? String) ?? ""
+        var thinking: String? = nil
+        if let range = content.range(of: "</think>") {
+            if let startRange = content.range(of: "<think>") {
+                thinking = String(content[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            content = String(content[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if parsedCalls.isEmpty, !content.isEmpty { onTextDeltaSafe(onTextDelta, content) }
+        return AssistantTurn(content: content.isEmpty ? nil : content, toolCalls: parsedCalls, thinking: thinking)
+    }
+
+    /// One round against Anthropic `/v1/messages`, mapping `tool_use` blocks to
+    /// `ParsedToolCall` and prior `tool` messages back into Anthropic shape.
+    private func chatCompletionClaude(
+        messages: [ChatMessage], tools: [[String: Any]]?
+    ) async throws -> AssistantTurn {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            throw NSError(domain: "Invalid URL", code: -1)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(config.claudeAPIKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.timeoutInterval = 180
+
+        // Split out a leading system message; map the rest to Anthropic content.
+        var systemPrompt: String? = nil
+        var anthropicMessages: [[String: Any]] = []
+        for m in messages {
+            switch m.role {
+            case "system":
+                systemPrompt = (systemPrompt.map { $0 + "\n" } ?? "") + m.content
+            case "user":
+                anthropicMessages.append(["role": "user", "content": m.content])
+            case "assistant":
+                var blocks: [[String: Any]] = []
+                if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
+                if let calls = m.toolCalls {
+                    for c in calls {
+                        let input = (try? ToolArgs.parse(c.arguments)) ?? [:]
+                        blocks.append(["type": "tool_use", "id": c.id, "name": c.name, "input": input])
+                    }
+                }
+                anthropicMessages.append(["role": "assistant", "content": blocks])
+            case "tool":
+                // Anthropic carries tool results as a user message with a
+                // tool_result block keyed to the tool_use id. Flag failures with
+                // `is_error` so Claude knows the tool errored (OpenAI conveys this
+                // as plain text, so only the Anthropic shape needs the flag).
+                var block: [String: Any] = [
+                    "type": "tool_result",
+                    "tool_use_id": m.toolCallId ?? "",
+                    "content": m.content,
+                ]
+                if m.isError == true { block["is_error"] = true }
+                anthropicMessages.append(["role": "user", "content": [block]])
+            default:
+                break
+            }
+        }
+
+        var body: [String: Any] = [
+            "model": config.claudeModel,
+            "max_tokens": 4096,
+            "messages": anthropicMessages,
+        ]
+        if let system = systemPrompt { body["system"] = system }
+        if let tools = tools, !tools.isEmpty {
+            // Map OpenAI function tools → Anthropic tool schema.
+            body["tools"] = tools.compactMap { t -> [String: Any]? in
+                guard let fn = t["function"] as? [String: Any], let name = fn["name"] as? String else { return nil }
+                return [
+                    "name": name,
+                    "description": fn["description"] as? String ?? "",
+                    "input_schema": fn["parameters"] as? [String: Any] ?? ["type": "object"],
+                ]
+            }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Invalid Claude response", code: -1)
+        }
+        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
+            throw NSError(domain: "Claude: \(message)", code: -1)
+        }
+        guard let content = json["content"] as? [[String: Any]] else {
+            throw NSError(domain: "Invalid Claude response", code: -1)
+        }
+
+        var textParts: [String] = []
+        var thinkingParts: [String] = []
+        var parsedCalls: [ParsedToolCall] = []
+        for block in content {
+            switch block["type"] as? String {
+            case "text":
+                if let t = block["text"] as? String { textParts.append(t) }
+            case "thinking":
+                if let t = block["thinking"] as? String { thinkingParts.append(t) }
+            case "tool_use":
+                if let name = block["name"] as? String {
+                    let id = (block["id"] as? String) ?? "call_\(parsedCalls.count)"
+                    parsedCalls.append(ParsedToolCall(id: id, name: name, rawArguments: block["input"]))
+                }
+            default:
+                break
+            }
+        }
+        let text = textParts.joined(separator: "\n")
+        let thinking = thinkingParts.isEmpty ? nil : thinkingParts.joined(separator: "\n")
+        return AssistantTurn(content: text.isEmpty ? nil : text, toolCalls: parsedCalls, thinking: thinking)
+    }
+
+    private func onTextDeltaSafe(_ cb: (@Sendable (String) -> Void)?, _ text: String) {
+        cb?(text)
+    }
+}
+
+// MARK: - Ollama Stream Delegate
+
+class OllamaStreamDelegate: NSObject, URLSessionDataDelegate {
+    private var buffer = Data()
+    private var accumulatedText = ""
+    private var accumulatedThinking = ""
+    private let onProgress: (LLMStreamProgress) -> Void
+    private let onCompletion: (Result<LLMResponse, Error>) -> Void
+    private let enableThinking: Bool
+
+    init(enableThinking: Bool, onProgress: @escaping (LLMStreamProgress) -> Void, onCompletion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        self.enableThinking = enableThinking
+        self.onProgress = onProgress
+        self.onCompletion = onCompletion
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+
+        // Parse newline-delimited JSON
+        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+            guard !lineData.isEmpty,
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+
+            let done = json["done"] as? Bool ?? false
+
+            if enableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                accumulatedThinking += thinking
+                onProgress(.thinking)
+            }
+
+            if let response = json["response"] as? String, !response.isEmpty {
+                accumulatedText += response
+                onProgress(.generating(accumulatedText))
+            }
+
+            if done {
+                var finalText = accumulatedText
+                var thinkingText: String? = accumulatedThinking.isEmpty ? nil : accumulatedThinking.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Handle <think> tags in response text as fallback
+                if let range = finalText.range(of: "</think>") {
+                    if enableThinking && thinkingText == nil, let startRange = finalText.range(of: "<think>") {
+                        thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+
+                onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+                return
+            }
+        }
+
+        // Also try to parse remaining buffer if it's a complete JSON object (no trailing newline)
+        if !buffer.isEmpty, let json = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any], json["done"] as? Bool == true {
+            buffer.removeAll()
+
+            if enableThinking, let thinking = json["thinking"] as? String, !thinking.isEmpty {
+                accumulatedThinking += thinking
+            }
+            if let response = json["response"] as? String, !response.isEmpty {
+                accumulatedText += response
+            }
+
+            var finalText = accumulatedText
+            var thinkingText: String? = accumulatedThinking.isEmpty ? nil : accumulatedThinking.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let range = finalText.range(of: "</think>") {
+                if enableThinking && thinkingText == nil, let startRange = finalText.range(of: "<think>") {
+                    thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            onCompletion(.failure(error))
+        }
+    }
+}
+
+// MARK: - llama.cpp Stream Delegate (OpenAI SSE format)
+
+class LlamaCppStreamDelegate: NSObject, URLSessionDataDelegate {
+    private var buffer = Data()
+    private var accumulatedText = ""
+    private var insideThinkTag = false
+    private var accumulatedThinking = ""
+    private let onProgress: (LLMStreamProgress) -> Void
+    private let onCompletion: (Result<LLMResponse, Error>) -> Void
+    private let enableThinking: Bool
+    private var receivedHTTPError = false
+
+    init(enableThinking: Bool, onProgress: @escaping (LLMStreamProgress) -> Void, onCompletion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        self.enableThinking = enableThinking
+        self.onProgress = onProgress
+        self.onCompletion = onCompletion
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse, http.statusCode == 503 {
+            receivedHTTPError = true
+            onCompletion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+
+        // Parse SSE lines
+        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+            guard let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: CharacterSet(charactersIn: "\r")) else { continue }
+
+            // Skip empty lines and comments
+            if line.isEmpty || line.hasPrefix(":") { continue }
+
+            // Check for stream end
+            if line == "data: [DONE]" {
+                finishStream()
+                return
+            }
+
+            // Parse SSE data line
+            guard line.hasPrefix("data: ") else { continue }
+            let jsonStr = String(line.dropFirst(6))
+
+            guard let jsonData = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let first = choices.first,
+                  let delta = first["delta"] as? [String: Any],
+                  let content = delta["content"] as? String else { continue }
+
+            // Track <think> tags in streamed content
+            accumulatedText += content
+
+            // Check for think tag transitions
+            if accumulatedText.contains("<think>") && !insideThinkTag {
+                insideThinkTag = true
+            }
+
+            if insideThinkTag {
+                if accumulatedText.contains("</think>") {
+                    insideThinkTag = false
+                    // Extract text after </think> for display
+                    if let range = accumulatedText.range(of: "</think>") {
+                        let afterThink = String(accumulatedText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !afterThink.isEmpty {
+                            onProgress(.generating(afterThink))
+                        }
+                    }
+                } else if enableThinking {
+                    onProgress(.thinking)
+                }
+            } else {
+                // Outside think tags - show accumulated text without think block
+                var displayText = accumulatedText
+                if let range = displayText.range(of: "</think>") {
+                    displayText = String(displayText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if !displayText.isEmpty {
+                    onProgress(.generating(displayText))
+                }
+            }
+        }
+    }
+
+    private func finishStream() {
+        var finalText = accumulatedText
+        var thinkingText: String? = nil
+
+        if let range = finalText.range(of: "</think>") {
+            if enableThinking, let startRange = finalText.range(of: "<think>") {
+                thinkingText = String(finalText[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            finalText = String(finalText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        onCompletion(.success(LLMResponse(text: finalText, thinking: thinkingText)))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if receivedHTTPError { return }
+        if let error = error {
+            if (error as? URLError)?.code == .cannotConnectToHost {
+                onCompletion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])))
+            } else {
+                onCompletion(.failure(error))
+            }
+        } else if !accumulatedText.isEmpty {
+            // Stream ended without [DONE] - finish with what we have
+            finishStream()
+        }
+    }
+}
+
+// MARK: - Text tools (no network)
+
+private enum TextToolSchemas {
+    // Computed (not stored) so they don't count as non-Sendable shared mutable
+    // state under -strict-concurrency=complete; each access builds a fresh dict.
+    static var summarize: [String: Any] {
+        [
+            "type": "object",
+            "properties": ["text": ["type": "string", "description": "The text to summarize."]],
+            "required": ["text"],
+        ]
+    }
+    static var extractText: [String: Any] {
+        [
+            "type": "object",
+            "properties": [
+                "text": ["type": "string", "description": "The text to search."],
+                "instruction": ["type": "string", "description": "What to extract / look for."],
+            ],
+            "required": ["text", "instruction"],
+        ]
+    }
+}
+
+/// `summarize_text` — return the leading portion of provided text as a compact
+/// excerpt the model can reason over (a deterministic local transform).
+struct SummarizeTextTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(name: "summarize_text",
+                 description: "Condense provided text to a compact excerpt (first paragraphs, char-capped). Use to shrink long text you already have before reasoning over it.",
+                 parametersSchema: TextToolSchemas.summarize)
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let text = (args.dictionary["text"] as? String) ?? ""
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        let cleaned = MarkdownSanitizer.collapseWhitespace(text)
+        let (out, _) = MarkdownSanitizer.truncate(cleaned, maxChars: 2000)
+        return out
+    }
+}
+
+/// `extract_text` — return the chunks of provided text most relevant to an
+/// instruction (keyword/BM25 ranked; local, no network).
+struct ExtractTextTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(name: "extract_text",
+                 description: "Return the chunks of provided text most relevant to an instruction (keyword-ranked). Use to pull a specific answer out of long text you already have.",
+                 parametersSchema: TextToolSchemas.extractText)
+    }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let text = (d["text"] as? String) ?? ""
+        let instruction = (d["instruction"] as? String) ?? ""
+        guard !text.isEmpty else { return "Error: 'text' is required." }
+        guard !instruction.isEmpty else { return "Error: 'instruction' is required." }
+        let chunks = ChunkRanker.chunk(text)
+        let ranked = ChunkRanker.rank(chunks: chunks, instruction: instruction, limit: 5)
+        if ranked.isEmpty { return "No part of the text matched: \(instruction)" }
+        return toolJSON(ranked)
+    }
+}
+
+/// `suggest_integration` — given a capability the agent lacks a tool for
+/// (e.g. "email", "calendar", "slack", "read a file"), return a concrete,
+/// actionable suggestion: which MCP server connects it and how to add it in
+/// Settings → MCP. This is how the agent stays capability-aware instead of
+/// flatly refusing. Pure lookup over `IntegrationCatalog`; no network, no gate.
+struct SuggestIntegrationTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(
+            name: "suggest_integration",
+            description: "When the user asks for a capability you have NO tool for "
+                + "(email, calendar, Slack, Notion, local files, GitHub, …), call this "
+                + "with the capability to get the name of an MCP server that provides it "
+                + "and how to add it. Use this instead of refusing; then relay the "
+                + "suggestion to the user.",
+            parametersSchema: [
+                "type": "object",
+                "properties": [
+                    "capability": [
+                        "type": "string",
+                        "description": "The capability the user wants, e.g. 'read my email', 'check my calendar', 'send a slack message', 'read a file'.",
+                    ],
+                ],
+                "required": ["capability"],
+            ])
+    }
+
+    func invoke(_ args: JSONObject) async throws -> String {
+        let capability = (args.dictionary["capability"] as? String) ?? ""
+        guard !capability.isEmpty else { return "Error: 'capability' is required." }
+        if let match = IntegrationCatalog.match(capability) {
+            return match.suggestionText()
+        }
+        // Unknown capability: still don't refuse — point at the generic path.
+        let known = IntegrationCatalog.all.map { $0.displayName }.joined(separator: ", ")
+        return "I don't have a built-in connector for \"\(capability)\" yet, but you can "
+            + "connect almost any service by adding an MCP server in Settings → MCP. "
+            + "Built-in presets cover: \(known). For other services, search for an "
+            + "\"<service> MCP server\" and add its command there."
+    }
+}
+
+/// Self-registration of the always-on text tools. These need no gate (no
+/// network, no privileged action) so they are always available.
+enum TextTools {
+    static func register() {
+        AgentToolCatalog.register(BuiltinToolGroup(
+            gate: { _ in true },
+            make: { _, _ in [SummarizeTextTool(), ExtractTextTool(), SuggestIntegrationTool()] }))
+    }
+}
+
+/// The single bootstrap that plugs every feature file's built-in tools into the
+/// catalog. Adding a NEW feature file = add a `register()` to it and one line
+/// here; adding a tool to an EXISTING feature = edit only that file's group.
+/// `AgentToolCatalog.installBuiltins` is wired to this at app startup, and the
+/// catalog runs it exactly once (lazily, on first registry/reserved-name use).
+enum BuiltinTools {
+    static func installAll() {
+        TextTools.register()       // summarize_text / extract_text / suggest_integration
+        WebTools.register()        // web_* + browser_*  (gated on enableWebSearch)
+        MacControlTools.register() // run_shell / run_applescript (gated on enableMacControl)
+    }
+
+    /// Arm the catalog's install hook. Safe to call multiple times; the catalog
+    /// itself guards against double-install.
+    static func arm() {
+        AgentToolCatalog.installBuiltins = { BuiltinTools.installAll() }
+    }
+}
+
+// MARK: - PopDraftAgent (registry + loop wiring)
+
+/// Builds the tool registry from config and runs the `AgentLoop` over the real
+/// model via `LLMClient.chatCompletion`. Minimal entry point for the "Ask Agent"
+/// action — returns the final answer plus the updated session.
+struct PopDraftAgent {
+    /// Default system prompt seeding the agent.
+    static let systemPrompt = """
+    You are PopDraft, a helpful desktop assistant. You can call tools to search \
+    and read the web, to DRIVE a live browser (navigate, click, type, read), and \
+    to transform text. You can also connect to external services (email, calendar, \
+    Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
+    each connected server's tools appear to you namespaced as `<server>__<tool>`. \
+    Think step by step. Prefer to verify facts with the web tools when a question \
+    needs current or external information; otherwise answer directly.
+
+    WHEN TO USE TOOLS — read this first. Prefer the FEWEST tools necessary, and \
+    NEVER call a tool when you can answer directly.
+    - PURE TEXT TASKS — translate, rewrite, fix grammar, summarize, rephrase, \
+    explain, format, or extract from text the user already gave you — need NO \
+    tools. Just produce the result. Do NOT call web_search / web_open / web_read \
+    / web_* / browser_* for these.
+    - GENERAL KNOWLEDGE you already know — answer DIRECTLY, no tools.
+    - Use web_search / browse tools ONLY when the user explicitly asks you to \
+    search or look something up online, OR the question genuinely needs current, \
+    external, or factual information you don't already have (news, prices, a \
+    specific person/org, recent events, a specific page).
+    - When the instruction is "translate / rewrite / summarize this text" and the \
+    text is included, output ONLY the transformed text — no tools, no preamble, \
+    no trailing commentary. If the user says "add nothing before or after", return \
+    exactly the transformed text and nothing else.
+    Examples:
+    - "Translate to Hebrew, add nothing: 'BQ incident costs:'" → answer with only \
+    the Hebrew translation, ZERO tool calls.
+    - "Fix the grammar: 'he go to store'" → answer "He goes to the store.", no tools.
+    - "What's the latest iPhone price?" → web_search is appropriate (current/external).
+
+    How to use tools well:
+    - When you call a tool, wait for its result before continuing.
+    - For a quick lookup, use web_search + web_read. To interact with a page \
+    (run a search box, click into results, work through a multi-step flow), use \
+    the browser_* tools: browser_open a site, browser_type into a field (with \
+    submit:true to search), browser_click a link/button by its visible text or a \
+    CSS selector, browser_read the page, browser_back to go back. The browser \
+    session persists across these calls, and each result lists the clickable \
+    elements you can act on next.
+    - After EACH tool result, reassess: decide whether you have enough to answer, \
+    or whether one more tool call is genuinely needed. Don't repeat the same \
+    search over and over — if a search returns results, READ them and answer.
+    - If a search or page returned relevant facts, base your answer on them; do \
+    not stop at the raw tool output.
+    - If the user has a connected MCP tool that fits the request (a \
+    `<server>__<tool>` tool), USE it — that is the whole point of connecting it.
+
+    CAPABILITY-AWARENESS — IMPORTANT. If the user asks for something you have NO \
+    tool for (e.g. "read my email", "what's on my calendar", "post to Slack", \
+    "open this Notion page", "read a file on disk"), DO NOT flatly refuse and do \
+    NOT say you simply cannot do it. Instead, call `suggest_integration` with the \
+    capability, then tell the user — in plain language — that you can connect to \
+    that service via an MCP server, name the specific server (e.g. the Gmail, \
+    Google Calendar, Slack, or Notion MCP server), and tell them to add it in \
+    Settings → MCP (mention the one-click preset). Be concrete and actionable, \
+    not a generic "I can't help with that".
+
+    ALWAYS finish your turn with a clear, direct, natural-language answer to the \
+    user's question, synthesized from what you found. Never end with only a tool \
+    result and no answer. Keep final answers concise and well-formatted.
+    """
+
+    /// Build the registry of tools the agent may use, honoring config gates.
+    ///
+    /// - Web tools: gated on `agentSettings.enableWebSearch`.
+    /// - Mac-control tools (`run_shell`/`run_applescript`): registered ONLY when
+    ///   `agentSettings.enableMacControl == true` (default false). When the gate
+    ///   is off they are literally absent from the registry, so the model cannot
+    ///   call them. When on, each runs through `MacControlGate` (denylist +
+    ///   confirm-before-execute); `confirmer` is the UI seam.
+    /// - MCP tools: discovered from each configured+enabled server; failures are
+    ///   skipped. The live clients are returned so the caller can shut them down.
+    static func buildRegistry(
+        config: AppConfig,
+        confirmer: (any MacControlConfirmer)? = nil
+    ) async -> (registry: ToolRegistry, mcpClients: [MCPClient]) {
+        let registry = ToolRegistry()
+        // Built-in tools are SELF-REGISTERED by their owning feature files into
+        // `AgentToolCatalog` (text — always on; web/browser — behind
+        // `enableWebSearch`; confirm-gated Mac-control — behind `enableMacControl`).
+        // The catalog applies each group's gate for `config` and builds the
+        // concrete tools, so this wiring no longer carries a hand-maintained tool
+        // list — adding a built-in tool is a change to one feature file.
+        let builtins = AgentToolCatalog.enabledTools(config: config, confirmer: confirmer)
+        await registry.register(builtins)
+        // PR9: MCP tools — only for configured+enabled servers (default none).
+        let mcp = await MCPManager.buildTools(servers: config.mcpServers)
+        if !mcp.tools.isEmpty { await registry.register(mcp.tools) }
+        return (registry, mcp.clients)
+    }
+
+    /// Run the agent loop on `session`. Returns the loop outcome (updated session
+    /// + final answer). The model `call` is `LLMClient.chatCompletion`; tools run
+    /// in parallel via `ToolRunner` with the renderer cap as the concurrency cap.
+    ///
+    /// `confirmer` is the Mac-control confirmation seam (the chat view-model). With
+    /// no confirmer, confirm-gated commands structurally resolve to deny.
+    static func run(
+        session: ChatSession,
+        config: AppConfig,
+        confirmer: (any MacControlConfirmer)? = nil,
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        onProgress: ToolProgressHook? = nil
+    ) async throws -> AgentLoop.Outcome {
+        let (registry, mcpClients) = await buildRegistry(config: config, confirmer: confirmer)
+        // Shut MCP servers down when the turn ends, however it ends.
+        defer { for c in mcpClients { c.shutdown() } }
+        // Tool concurrency cap == renderer pool size (web tools are the heavy ones).
+        // Per-tool timeout: normally web-nav + slack, but when Mac-control is on a
+        // confirm-gated tool may sit AWAITING THE USER'S APPROVAL — so give the
+        // batch a generous wall-clock window. (The execution itself is still
+        // bounded by MacControlExec's own 30s process timeout.)
+        let baseTimeout = max(5000, config.webNavTimeoutMs + 5000)
+        let perToolTimeout = config.agentSettings.enableMacControl ? max(baseTimeout, 300_000) : baseTimeout
+        let runner = ToolRunner(
+            maxConcurrent: max(1, config.webMaxRenderers),
+            perToolTimeoutMs: perToolTimeout)
+        let loop = AgentLoop(maxIterations: config.agentSettings.maxIterations, runner: runner)
+
+        let modelCall: AgentLoop.ModelCall = { messages, toolsBoxed in
+            let tools = unboxTools(toolsBoxed)
+            return try await LLMClient.shared.chatCompletion(
+                messages: messages, tools: tools.isEmpty ? nil : tools,
+                stream: false, onTextDelta: onTextDelta)
+        }
+        // Final answer-synthesis call (BUG 3 fix): tools DISABLED and thinking
+        // FORCED OFF, so when the tool loop ends without a plain answer we always
+        // get one synthesized from the gathered tool results — never blank, and
+        // never just the raw tool output. (toolsBoxed is empty here by contract.)
+        let finalizeCall: AgentLoop.ModelCall = { messages, _ in
+            return try await LLMClient.shared.chatCompletion(
+                messages: messages, tools: nil,
+                stream: false, onTextDelta: onTextDelta, forceThinkingOff: true)
+        }
+        return try await loop.run(
+            session: session, registry: registry, call: modelCall,
+            onProgress: onProgress, finalize: finalizeCall)
+    }
+}
+
+// MARK: - DNS resolution (for SSRF on resolved IP)
+
+/// Resolves a hostname to its IP strings using getaddrinfo. Pure C API; returns
+/// every resolved address so SafetyGuard can reject if ANY is private/loopback.
+enum DNSResolver {
+    static func resolve(_ host: String) -> [String] {
+        // A literal IP resolves to itself.
+        if SafetyGuard.parseIPv4(host) != nil || SafetyGuard.parseIPv6(host) != nil {
+            return [host]
+        }
+        var hints = addrinfo(
+            ai_flags: 0,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: 0,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, nil, &hints, &result)
+        guard status == 0 else { return [] }
+        defer { freeaddrinfo(result) }
+
+        var addrs: [String] = []
+        var ptr = result
+        while let info = ptr {
+            let sa = info.pointee.ai_addr
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if let sa = sa,
+               getnameinfo(sa, info.pointee.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 {
+                let ip = String(cString: buffer)
+                if !ip.isEmpty { addrs.append(ip) }
+            }
+            ptr = info.pointee.ai_next
+        }
+        return addrs
+    }
+}

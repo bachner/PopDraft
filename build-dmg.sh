@@ -27,8 +27,7 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 # Compile PopDraft
 echo "Compiling PopDraft..."
 swiftc -O -o "${APP_BUNDLE}/Contents/MacOS/PopDraft" \
-    "${SCRIPT_DIR}/scripts/PopDraft.swift" \
-    "${SCRIPT_DIR}/scripts/Core.swift" \
+    "${SCRIPT_DIR}"/scripts/*.swift \
     -framework Cocoa -framework Carbon -framework WebKit -framework AVFoundation -framework Network
 
 if [ $? -ne 0 ]; then
