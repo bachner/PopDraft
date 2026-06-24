@@ -290,7 +290,7 @@ class DependencyManager {
         <string>99</string>
         <string>--jinja</string>
         <string>-c</string>
-        <string>16384</string>
+        <string>32768</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
