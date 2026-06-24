@@ -48,17 +48,32 @@ struct AgentSettings: Codable, Equatable {
     /// record "would execute: <cmd> (awaiting confirm)" and return. Used by a
     /// future headless eval where there is no UI to confirm. Default OFF. (PR9)
     var macControlDryRun: Bool
+    /// MANUAL OVERRIDE for the model's context window, in tokens, used by the
+    /// agent's automatic session compaction (`ContextBudget`). When a turn's
+    /// estimated token usage nears the budget, the OLDER messages are summarized/
+    /// condensed before being sent so a long conversation never overflows the
+    /// served context window.
+    ///
+    /// `0` (the default) means AUTO: the budget is read from the ACTUAL served
+    /// context at run time — the llama-server `/props` `n_ctx` for llamacpp (now
+    /// ~200K with flash-attn + q4 KV), or a sensible per-provider default
+    /// (~200000 llamacpp / 16384 ollama / 120000 cloud) when detection fails. A
+    /// non-zero value PINS the budget to exactly that, overriding detection. See
+    /// `ContextBudget.effectiveBudget(provider:configured:detected:)`. (Compaction)
+    var contextTokens: Int
 
     init(maxIterations: Int = 6,
          enableMacControl: Bool = false,
          enableWebSearch: Bool = true,
          autoApproveSafeReadOnly: Bool = false,
-         macControlDryRun: Bool = false) {
+         macControlDryRun: Bool = false,
+         contextTokens: Int = 0) {
         self.maxIterations = maxIterations
         self.enableMacControl = enableMacControl
         self.enableWebSearch = enableWebSearch
         self.autoApproveSafeReadOnly = autoApproveSafeReadOnly
         self.macControlDryRun = macControlDryRun
+        self.contextTokens = contextTokens
     }
 
     init(from decoder: Decoder) throws {
@@ -68,6 +83,9 @@ struct AgentSettings: Codable, Equatable {
         enableWebSearch = try c.decodeIfPresent(Bool.self, forKey: .enableWebSearch) ?? true
         autoApproveSafeReadOnly = try c.decodeIfPresent(Bool.self, forKey: .autoApproveSafeReadOnly) ?? false
         macControlDryRun = try c.decodeIfPresent(Bool.self, forKey: .macControlDryRun) ?? false
+        // 0 ⇒ auto-detect at run time. A negative/garbage value also means auto.
+        let ctx = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
+        contextTokens = ctx > 0 ? ctx : 0
     }
 }
 
@@ -2885,6 +2903,366 @@ struct ToolProgressEvent: Sendable {
 /// fired from an async context. Optional — `nil` disables progress entirely.
 typealias ToolProgressHook = @Sendable (ToolProgressEvent) -> Void
 
+// =====================================================================
+// MARK: - Context budget + session compaction (pure)
+//
+// The local model (Qwen3.5-4B) is served by a launchd llama-server with
+// `-c 16384`. A long agent session (many user/assistant turns + big tool
+// results like fetched web pages or emitted SVGs) can blow past that window,
+// and llama-server returns a context-overflow error ("Context size has been
+// exceeded. error -1.") that previously killed the chat.
+//
+// `ContextBudget` is the pure, Foundation-only fix that the `AgentLoop` (and the
+// non-agent `generate()` path) call to keep a conversation under budget:
+//   - `estimateTokens`   — a cheap chars/≈3.5 estimator over the SERIALIZED
+//                          wire form (roles + content + tool-call args), so the
+//                          number tracks what actually gets sent to the model.
+//   - `trimToolResult`   — caps/condenses one oversized tool output (web page
+//                          text, screenshot dumps, big emitted code/SVG) so a
+//                          single result can't dominate the budget when re-sent.
+//   - `compact`          — PROACTIVE: when usage nears the budget, ALWAYS keep
+//                          the system prompt + the latest user message + the most
+//                          recent K turns verbatim, and fold the OLDER turns into
+//                          one short "Conversation so far:" recap (built from an
+//                          injected summarizer, or a structural condense fallback).
+//   - `effectiveBudget`  — per-provider budget (the configured `contextTokens`
+//                          for local; a large floor for cloud providers).
+//
+// Compaction only changes what is SENT to the model — the full transcript stays
+// in the `ChatSession`/UI. Unit-tested by `tests/test-compaction.swift`.
+// =====================================================================
+
+enum ContextBudget {
+    // ---- Tunables -------------------------------------------------------
+
+    /// Compact PROACTIVELY once the estimate exceeds this fraction of the budget.
+    /// 0.75 leaves headroom for the model's own reply (`max_tokens` 4096) plus
+    /// the tools array and estimator slack.
+    static let proactiveThreshold: Double = 0.75
+
+    /// Verbatim-preserved most-recent turns (a "turn" here is one message; a
+    /// user/assistant exchange with tool calls is several). Keeping the tail
+    /// verbatim preserves the immediate working context the model needs.
+    static let recentKeepDefault: Int = 8
+
+    /// Most aggressive recent-keep used by the reactive retry path.
+    static let recentKeepMin: Int = 2
+
+    /// Per-tool-result char cap when trimming a single oversized result.
+    static let toolResultMaxChars: Int = 4000
+
+    /// Tighter tool-result cap used when compacting more aggressively (reactive).
+    static let toolResultMaxCharsTight: Int = 1200
+
+    /// Chars-per-token divisor for the estimate. ~3.5 is a deliberately
+    /// conservative (slightly high token count) estimate for English+code+JSON
+    /// so we compact a touch early rather than late.
+    static let charsPerToken: Double = 3.5
+
+    /// Default budget for a local llama.cpp server when the served `n_ctx` can't
+    /// be detected. Matches the now-standard flash-attn + q4-KV config (~200K).
+    static let llamacppDefaultBudget: Int = 200_000
+
+    /// Default budget for Ollama when undetected (its default `num_ctx` is small).
+    static let ollamaDefaultBudget: Int = 16_384
+
+    /// Default budget for cloud providers (OpenAI/Claude) — their windows are
+    /// large, so we don't needlessly compact at a tiny number.
+    static let cloudBudgetFloor: Int = 120_000
+
+    /// The minimum sane budget — below this the loop couldn't make ANY model call.
+    static let minBudget: Int = 2048
+
+    // ---- Budget ---------------------------------------------------------
+
+    /// The effective token budget for a provider.
+    ///
+    /// Precedence:
+    ///   1. `configured > 0`  → a user/manual PIN; use it exactly (clamped to a
+    ///      sane floor). Cloud still gets at least `cloudBudgetFloor`.
+    ///   2. `detected` (the ACTUAL served context, e.g. llama-server `/props`
+    ///      `n_ctx`) → use it. This is the normal path: with the 200K server we
+    ///      compact at ~75% of 200K, so compaction is rare but still a safety net
+    ///      for huge pastes / long tool outputs.
+    ///   3. otherwise → a sensible per-provider default.
+    static func effectiveBudget(provider: String, configured: Int, detected: Int? = nil) -> Int {
+        let p = provider.lowercased()
+        let isCloud = (p == "openai" || p == "claude" || p == "anthropic")
+        if configured > 0 {
+            let cfg = max(minBudget, configured)
+            return isCloud ? max(cfg, cloudBudgetFloor) : cfg
+        }
+        if let d = detected, d >= minBudget {
+            return isCloud ? max(d, cloudBudgetFloor) : d
+        }
+        switch p {
+        case "openai", "claude", "anthropic": return cloudBudgetFloor
+        case "ollama": return ollamaDefaultBudget
+        default: return llamacppDefaultBudget   // llamacpp + unknown
+        }
+    }
+
+    // ---- Estimator ------------------------------------------------------
+
+    /// Estimated tokens for ONE message's wire footprint: role + content +
+    /// thinking + serialized tool-call args + a small per-message envelope.
+    static func estimateTokens(_ m: ChatMessage) -> Int {
+        var chars = m.role.count + m.content.count
+        if let t = m.thinking { chars += t.count }
+        if let calls = m.toolCalls {
+            for c in calls { chars += c.name.count + c.arguments.count + c.id.count }
+        }
+        if let id = m.toolCallId { chars += id.count }
+        // ~4-char structural envelope per message (role wrapper, JSON braces).
+        let tokens = Int((Double(chars) / charsPerToken).rounded(.up)) + 4
+        return tokens
+    }
+
+    /// Estimated total tokens for a message array (monotonic: appending a message
+    /// never lowers the estimate). This is what the loop compares to the budget.
+    static func estimateTokens(_ messages: [ChatMessage]) -> Int {
+        var total = 0
+        for m in messages { total += estimateTokens(m) }
+        return total
+    }
+
+    // ---- Tool-result trimming ------------------------------------------
+
+    /// Cap/condense one large tool output. Keeps the head and tail (so both the
+    /// start of a page and any trailing answer survive) and inserts a clear
+    /// elision marker with the dropped char count, so the model still knows the
+    /// shape of what it fetched without the whole payload eating the budget.
+    static func trimToolResult(_ content: String, maxChars: Int) -> String {
+        guard content.count > maxChars, maxChars > 200 else { return content }
+        let headLen = (maxChars * 2) / 3
+        let tailLen = maxChars - headLen
+        let head = String(content.prefix(headLen))
+        let tail = String(content.suffix(tailLen))
+        let dropped = content.count - head.count - tail.count
+        return head
+            + "\n\n…[\(dropped) characters trimmed to fit the context budget]…\n\n"
+            + tail
+    }
+
+    // ---- Compaction -----------------------------------------------------
+
+    /// A summarizer that turns the dropped older messages into a short recap.
+    /// Injected so the pure core never calls the network: the agent wires it to a
+    /// single cheap model call; tests pass a deterministic stub (or omit it, in
+    /// which case `compact` uses the structural-condense fallback).
+    typealias Summarizer = @Sendable ([ChatMessage]) async -> String?
+
+    /// The result of a compaction pass.
+    struct CompactionResult {
+        /// The messages to actually SEND to the model (system + recap + tail).
+        var messages: [ChatMessage]
+        /// Whether anything was dropped/folded (false ⇒ unchanged).
+        var didCompact: Bool
+        /// Token estimate BEFORE compaction (for logging / proof).
+        var beforeTokens: Int
+        /// Token estimate AFTER compaction.
+        var afterTokens: Int
+    }
+
+    /// Whether `messages` are estimated to exceed the proactive threshold for a
+    /// given budget — i.e. compaction should run before the next model call.
+    static func shouldCompact(_ messages: [ChatMessage], budget: Int) -> Bool {
+        return estimateTokens(messages) > Int(Double(budget) * proactiveThreshold)
+    }
+
+    /// The absolute last-resort context: the leading system prompt(s) + the single
+    /// most recent user message, with that message's content hard-clipped. Used by
+    /// the reactive retry only when normal compaction can't shrink any further —
+    /// it guarantees SOME call can be made rather than re-surfacing the raw "-1".
+    static func minimalContext(_ messages: [ChatMessage]) -> [ChatMessage] {
+        let systemPrefix = messages.prefix(while: { $0.role == "system" })
+        var out = Array(systemPrefix)
+        if let lastUser = messages.last(where: { $0.role == "user" }) {
+            var clipped = lastUser
+            // Cap the question itself so even a giant pasted block can be asked.
+            let cap = max(2000, toolResultMaxChars)
+            if clipped.content.count > cap {
+                clipped.content = trimToolResult(clipped.content, maxChars: cap)
+            }
+            out.append(clipped)
+        }
+        return out
+    }
+
+    /// Compact `messages` to fit under `budget`.
+    ///
+    /// INVARIANT (always honored): the leading system prompt(s), the most recent
+    /// `recentKeep` messages, AND the latest `role:"user"` message are kept
+    /// VERBATIM. Everything between the system prompt and that kept tail is the
+    /// "older" region: its tool results are trimmed, and the whole region is
+    /// folded into ONE injected `role:"user"` "Conversation so far:" recap (via
+    /// `summarize`, else a structural text condense).
+    ///
+    /// `target` defaults to the proactive threshold; the reactive path passes a
+    /// smaller `recentKeep` + tighter `toolMaxChars` to shrink harder.
+    static func compact(
+        _ messages: [ChatMessage],
+        budget: Int,
+        recentKeep: Int = recentKeepDefault,
+        toolMaxChars: Int = toolResultMaxChars,
+        summarize: Summarizer? = nil
+    ) async -> CompactionResult {
+        let before = estimateTokens(messages)
+
+        // Split off the leading system messages (kept verbatim, always first).
+        var systemPrefix: [ChatMessage] = []
+        var rest = messages
+        while let first = rest.first, first.role == "system" {
+            systemPrefix.append(first)
+            rest.removeFirst()
+        }
+
+        // Determine the verbatim tail: the most recent `recentKeep` messages, but
+        // also FORCE-extend it backward to include the latest user message if it
+        // happened to fall outside the window (so the user's actual question is
+        // never summarized away).
+        let keep = max(recentKeepMin, recentKeep)
+        var tailStart = max(0, rest.count - keep)
+        if let lastUserIdx = rest.lastIndex(where: { $0.role == "user" }), lastUserIdx < tailStart {
+            tailStart = lastUserIdx
+        }
+        // Don't split an assistant tool-call turn from its tool results: if the
+        // tail begins on a `role:"tool"` message, walk back to its assistant turn.
+        while tailStart > 0 && rest[tailStart].role == "tool" {
+            tailStart -= 1
+        }
+
+        let older = Array(rest[..<tailStart])
+        var tail = Array(rest[tailStart...])
+
+        // Always trim oversized tool results in the KEPT tail too — a single fresh
+        // web page can be larger than the whole budget on its own.
+        tail = tail.map { trimMessageToolResult($0, maxChars: toolMaxChars) }
+
+        // Nothing older to fold → just return the (tool-trimmed) tail.
+        if older.isEmpty {
+            let out = systemPrefix + tail
+            let after = estimateTokens(out)
+            return CompactionResult(messages: out, didCompact: after < before,
+                                    beforeTokens: before, afterTokens: after)
+        }
+
+        // Build the recap of the older region.
+        let recapText: String
+        if let summarize = summarize, let s = await summarize(older),
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            recapText = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            recapText = structuralRecap(older, toolMaxChars: toolMaxChars)
+        }
+        let recap = ChatMessage(
+            role: "user",
+            content: "Conversation so far (earlier messages were compacted to fit "
+                + "the context window):\n\(recapText)",
+            createdAt: older.first?.createdAt ?? Date().timeIntervalSince1970)
+
+        let out = systemPrefix + [recap] + tail
+        let after = estimateTokens(out)
+        return CompactionResult(messages: out, didCompact: true,
+                                beforeTokens: before, afterTokens: after)
+    }
+
+    /// Apply `compact` repeatedly with progressively smaller `recentKeep` and
+    /// tighter tool caps until the estimate is under `budget` (or we can't shrink
+    /// further). Used by the loop's PROACTIVE pass so one call reliably gets under
+    /// budget even for a huge single turn.
+    static func compactUntilUnder(
+        _ messages: [ChatMessage],
+        budget: Int,
+        summarize: Summarizer? = nil
+    ) async -> CompactionResult {
+        // Tiered passes: each is more aggressive than the last.
+        let tiers: [(keep: Int, tool: Int)] = [
+            (recentKeepDefault, toolResultMaxChars),
+            (recentKeepDefault / 2, toolResultMaxCharsTight),
+            (recentKeepMin, 600),
+            (recentKeepMin, 300),
+        ]
+        var best = CompactionResult(messages: messages, didCompact: false,
+                                    beforeTokens: estimateTokens(messages),
+                                    afterTokens: estimateTokens(messages))
+        for tier in tiers {
+            let r = await compact(messages, budget: budget,
+                                  recentKeep: tier.keep, toolMaxChars: tier.tool,
+                                  summarize: summarize)
+            best = CompactionResult(messages: r.messages, didCompact: r.didCompact || best.didCompact,
+                                    beforeTokens: best.beforeTokens, afterTokens: r.afterTokens)
+            if r.afterTokens <= Int(Double(budget) * proactiveThreshold) { return best }
+        }
+        return best
+    }
+
+    // ---- Internals ------------------------------------------------------
+
+    /// Trim a `role:"tool"` message's content (only tool results are trimmed;
+    /// user/assistant prose is left intact by compaction's recap, not here).
+    private static func trimMessageToolResult(_ m: ChatMessage, maxChars: Int) -> ChatMessage {
+        guard m.role == "tool", m.content.count > maxChars else { return m }
+        var copy = m
+        copy.content = trimToolResult(m.content, maxChars: maxChars)
+        return copy
+    }
+
+    /// Deterministic, network-free recap of the older region: a compact bullet
+    /// list of each turn (role + a clipped one-liner of its content / tool name),
+    /// with tool results trimmed hard. The reactive fallback and any summarizer-
+    /// less path use this; it is bounded and never larger than the input.
+    private static func structuralRecap(_ older: [ChatMessage], toolMaxChars: Int) -> String {
+        var lines: [String] = []
+        for m in older {
+            switch m.role {
+            case "user":
+                lines.append("- You asked: " + clip(m.content, 240))
+            case "assistant":
+                if let calls = m.toolCalls, !calls.isEmpty {
+                    let names = calls.map { $0.name }.joined(separator: ", ")
+                    let said = clip(m.content, 160)
+                    lines.append("- Assistant called tools [\(names)]" + (said.isEmpty ? "" : ": \(said)"))
+                } else if !m.content.isEmpty {
+                    lines.append("- Assistant: " + clip(m.content, 240))
+                }
+            case "tool":
+                lines.append("  → tool result: " + clip(m.content, min(toolMaxChars, 200)))
+            default:
+                break
+            }
+        }
+        return lines.isEmpty ? "(no earlier content)" : lines.joined(separator: "\n")
+    }
+
+    /// Single-line clip of `s` to `n` chars with an ellipsis marker.
+    private static func clip(_ s: String, _ n: Int) -> String {
+        let oneLine = s
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if oneLine.count <= n { return oneLine }
+        return String(oneLine.prefix(n)) + "…"
+    }
+}
+
+/// True iff `error`'s message looks like a llama.cpp / server context-overflow
+/// ("Context size has been exceeded", "context window", "too many tokens", a bare
+/// "-1" from the overflow path, etc.). Used by the reactive retry to decide
+/// whether a thrown error is one compaction can recover from. Pure string match
+/// so it is unit-tested without a server.
+func isContextOverflowError(_ error: Error) -> Bool {
+    let s = (error.localizedDescription + " " + String(describing: error)).lowercased()
+    if s.contains("context size has been exceeded") { return true }
+    if s.contains("context") && (s.contains("exceed") || s.contains("overflow")
+        || s.contains("window") || s.contains("too long") || s.contains("too large")) {
+        return true
+    }
+    if s.contains("exceeds the maximum") && s.contains("token") { return true }
+    if s.contains("prompt is too long") { return true }
+    if s.contains("requested tokens") && s.contains("exceed") { return true }
+    return false
+}
+
 // MARK: - AgentLoop (orchestrator)
 
 /// The tool-calling agent loop. `call` is INJECTED so tests can stub the model:
@@ -2902,6 +3280,27 @@ struct AgentLoop {
     /// The injected model call: (messages, toolsJSON) -> one assistant turn.
     /// `toolsJSON` arrives `Sendable`-boxed; unwrap with `unboxTools(_:)`.
     typealias ModelCall = @Sendable ([ChatMessage], [JSONObject]) async throws -> AssistantTurn
+
+    /// Automatic-compaction settings for one run. When non-nil, the loop applies
+    /// `ContextBudget` so a long session never overflows the served context
+    /// window: PROACTIVELY (compact before a call when near budget) and
+    /// REACTIVELY (catch a context-overflow throw, compact harder, retry). The
+    /// `summarize` closure is injected so the pure loop never calls the network —
+    /// the app wires it to a cheap model call; tests pass a stub or omit it.
+    struct Compaction: Sendable {
+        /// Token budget for the active provider (see `ContextBudget.effectiveBudget`).
+        var budget: Int
+        /// Reactive retries after a context-overflow throw before giving up.
+        var maxRetries: Int
+        /// Optional summarizer for the folded older region (nil ⇒ structural recap).
+        var summarize: ContextBudget.Summarizer?
+
+        init(budget: Int, maxRetries: Int = 2, summarize: ContextBudget.Summarizer? = nil) {
+            self.budget = max(2048, budget)
+            self.maxRetries = max(0, maxRetries)
+            self.summarize = summarize
+        }
+    }
 
     var maxIterations: Int
     var runner: ToolRunner
@@ -2933,7 +3332,8 @@ struct AgentLoop {
         registry: ToolRegistry,
         call: ModelCall,
         onProgress: ToolProgressHook? = nil,
-        finalize: ModelCall? = nil
+        finalize: ModelCall? = nil,
+        compaction: Compaction? = nil
     ) async throws -> Outcome {
         var working = session
         var lastText = ""
@@ -2947,7 +3347,12 @@ struct AgentLoop {
             // newly-available tools on its next turn. The registry is an actor, so
             // this snapshot is always consistent.
             let toolsJSON = await registry.openAITools()
-            let turn = try await call(working.messages, toolsJSON)
+            // Compaction (proactive + reactive) wraps the model call so a long
+            // session never overflows the served context window. `working.messages`
+            // (the full transcript shown in the UI) is NEVER mutated here — only the
+            // messages SENT to the model are compacted.
+            let turn = try await Self.callCompacted(
+                working.messages, toolsJSON, call: call, compaction: compaction)
 
             // No tools requested → final answer.
             if turn.toolCalls.isEmpty {
@@ -3074,7 +3479,7 @@ struct AgentLoop {
         if lastText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let finalize = finalize,
            working.messages.contains(where: { $0.role == "tool" }) {
-            if let synth = try? await synthesizeFinal(&working, finalize: finalize),
+            if let synth = try? await synthesizeFinal(&working, finalize: finalize, compaction: compaction),
                !synth.isEmpty {
                 return Outcome(session: working, finalText: synth,
                                iterations: iterations + 1, stoppedAtMax: true)
@@ -3085,13 +3490,77 @@ struct AgentLoop {
                        iterations: iterations, stoppedAtMax: true)
     }
 
+    /// Make one model call through automatic compaction. With `compaction == nil`
+    /// this is exactly `try await call(messages, tools)` (existing behavior — the
+    /// agentloop/toolrunner tests are unaffected). With compaction:
+    ///   1. PROACTIVE: if the estimate nears the budget, compact `messages` before
+    ///      the call (`compactUntilUnder` — tiered passes that always keep system +
+    ///      latest-user + recent-K and fold older turns into a recap).
+    ///   2. REACTIVE: if the call still throws a context-overflow, compact HARDER
+    ///      (smaller recent-K, tighter tool caps) and retry, up to `maxRetries`.
+    /// Only a non-overflow throw (or exhausted retries) propagates. Static + pure
+    /// (no `self`/actor state) so it's `@Sendable`-clean and unit-testable.
+    static func callCompacted(
+        _ messages: [ChatMessage],
+        _ tools: [JSONObject],
+        call: ModelCall,
+        compaction: Compaction?
+    ) async throws -> AssistantTurn {
+        guard let comp = compaction else {
+            return try await call(messages, tools)
+        }
+
+        // 1) Proactive: compact before the call when near budget.
+        var sent = messages
+        if ContextBudget.shouldCompact(messages, budget: comp.budget) {
+            let r = await ContextBudget.compactUntilUnder(
+                messages, budget: comp.budget, summarize: comp.summarize)
+            sent = r.messages
+        }
+
+        // 2) Try, then reactively compact-harder-and-retry on overflow.
+        var attempt = 0
+        // Progressive reactive tiers (smaller keep + tighter tool caps each retry).
+        let reactiveTiers: [(keep: Int, tool: Int)] = [
+            (ContextBudget.recentKeepMin, 600),
+            (ContextBudget.recentKeepMin, 250),
+        ]
+        while true {
+            do {
+                return try await call(sent, tools)
+            } catch {
+                guard isContextOverflowError(error), attempt < comp.maxRetries else { throw error }
+                let tier = reactiveTiers[min(attempt, reactiveTiers.count - 1)]
+                let r = await ContextBudget.compact(
+                    messages, budget: comp.budget,
+                    recentKeep: tier.keep, toolMaxChars: tier.tool,
+                    summarize: comp.summarize)
+                // If we couldn't shrink any further, fall back to the minimal
+                // context (and surface the original error only if even that is no
+                // smaller). `&&` binds tighter than `||`; parenthesized for clarity.
+                if !r.didCompact || (r.messages.count >= sent.count && r.afterTokens >= ContextBudget.estimateTokens(sent)) {
+                    // Last resort: keep ONLY system + the latest user message.
+                    let minimal = ContextBudget.minimalContext(messages)
+                    if ContextBudget.estimateTokens(minimal) < ContextBudget.estimateTokens(sent) {
+                        sent = minimal
+                    } else {
+                        throw error
+                    }
+                } else {
+                    sent = r.messages
+                }
+                attempt += 1
+            }
+        }
+    }
+
     /// One final model turn with tools DISABLED and a directive to answer now in
     /// plain language using the information gathered so far. Appends the directive
     /// + the synthesized assistant answer to `working` and returns the answer text
     /// (or "" on failure). `finalize` is the injected model call; the caller wires
     /// it to disable thinking for this turn so the model reliably emits prose.
     private func synthesizeFinal(
-        _ working: inout ChatSession, finalize: ModelCall
+        _ working: inout ChatSession, finalize: ModelCall, compaction: Compaction? = nil
     ) async throws -> String {
         let directive = ChatMessage(
             role: "user",
@@ -3101,7 +3570,8 @@ struct AgentLoop {
         var msgs = working.messages
         msgs.append(directive)
         // Empty tools array → the model gets no `tools`, so it must answer in text.
-        let turn = try await finalize(msgs, [])
+        // Route through compaction so the synthesis turn can't overflow either.
+        let turn = try await Self.callCompacted(msgs, [], call: finalize, compaction: compaction)
         let text = (turn.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return "" }
         working.messages.append(directive)
