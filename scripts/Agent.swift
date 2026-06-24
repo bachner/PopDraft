@@ -1126,7 +1126,10 @@ struct PopDraftAgent {
     chart, a diagram, a shape, a UI mockup — actually PRODUCE it as inline `<svg>` \
     or an HTML/CSS/Canvas drawing (or a Mermaid diagram for flows/graphs). NEVER \
     say you "can't draw" or that you are "text-only" — you can, and the user will \
-    see it rendered. Prefer crisp inline `<svg>` for pictures and shapes.
+    see it rendered. Put the SVG/HTML markup DIRECTLY in your reply text — it \
+    renders inline — do NOT save it to a file, and do NOT call a tool (write_file, \
+    run_shell, etc.) to deliver a drawing; just include the `<svg>`/HTML in your \
+    message. Prefer crisp inline `<svg>` for pictures and shapes.
 
     PARALLEL TOOL CALLS — when you need several INDEPENDENT lookups or actions \
     (e.g. three different web_search queries, or web_read of several URLs, or a few \
