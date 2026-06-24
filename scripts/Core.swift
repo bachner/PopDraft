@@ -878,6 +878,39 @@ extension Int64 {
 // only — and decode forward-compatibly (every field uses `decodeIfPresent` + a
 // default) so a session written by a newer build still loads in an older one.
 
+/// A reference to an image attached to a chat message (vision). The `source` is
+/// one of: a LOCAL file path (`/Users/…/x.png`), an `https:` image URL, or a
+/// self-contained `data:` URI (`data:image/png;base64,…`). `detail` is the
+/// optional OpenAI/Anthropic detail hint (`"low"`/`"high"`/`"auto"`).
+///
+/// Pure + Codable so a session carrying images round-trips on disk and the
+/// serializers (OpenAI / Anthropic) can turn it into the right content-part.
+/// Backward-compatible decode (`decodeIfPresent`) — older sessions had no images.
+struct ImageRef: Codable, Equatable {
+    var source: String
+    var detail: String?
+
+    init(source: String, detail: String? = nil) {
+        self.source = source
+        self.detail = detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+    }
+
+    /// Which transport this source maps to. Used by the serializers and `see_image`.
+    enum Kind: Equatable { case dataURI, httpURL, localPath }
+    var kind: Kind {
+        let s = source.lowercased()
+        if s.hasPrefix("data:") { return .dataURI }
+        if s.hasPrefix("http://") || s.hasPrefix("https://") { return .httpURL }
+        return .localPath
+    }
+}
+
 /// One OpenAI-style tool call requested by the assistant. No execution here — just
 /// the shape, so a session that already used tools can round-trip on disk.
 struct ChatToolCall: Codable, Equatable {
@@ -916,6 +949,10 @@ struct ChatMessage: Codable, Equatable {
     /// errored tool results (e.g. Anthropic's `is_error`) can flag them, and the
     /// PR8 chat UI can render error tool cards. nil/false on success.
     var isError: Bool?
+    /// Image attachments for vision (only meaningful on a `user` turn). `nil` for
+    /// the overwhelmingly common text-only case — decoded with `decodeIfPresent`
+    /// so older saved sessions (no `images` key) load unchanged.
+    var images: [ImageRef]?
     var createdAt: Double   // epoch seconds
 
     init(
@@ -926,6 +963,7 @@ struct ChatMessage: Codable, Equatable {
         toolCallId: String? = nil,
         thinking: String? = nil,
         isError: Bool? = nil,
+        images: [ImageRef]? = nil,
         createdAt: Double = Date().timeIntervalSince1970
     ) {
         self.id = id
@@ -935,6 +973,7 @@ struct ChatMessage: Codable, Equatable {
         self.toolCallId = toolCallId
         self.thinking = thinking
         self.isError = isError
+        self.images = images
         self.createdAt = createdAt
     }
 
@@ -947,6 +986,7 @@ struct ChatMessage: Codable, Equatable {
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         thinking = try c.decodeIfPresent(String.self, forKey: .thinking)
         isError = try c.decodeIfPresent(Bool.self, forKey: .isError)
+        images = try c.decodeIfPresent([ImageRef].self, forKey: .images)
         createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? 0
     }
 }
@@ -3790,6 +3830,178 @@ struct IntegrationCatalog {
         s += "(or pick its one-click preset): command `\(cmd)`."
         if !setupNote.isEmpty { s += " \(setupNote)" }
         return s
+    }
+}
+
+// =====================================================================
+// MARK: - Vision (image attachments): pure capability + serialization logic
+//
+// Gives the agent SIGHT. Three pure, testable pieces shared by the message
+// serializers (Agent.swift) and the `see_image` tool (VisionTools.swift):
+//   - `VisionSupport`     — does the configured model SEE images?
+//   - `VisionContent`     — build OpenAI / Anthropic content-PART arrays from a
+//                           user message's text + ImageRefs (the ONLY thing that
+//                           diverges from the bare-string fast-path).
+//   - `VisionSource`      — parse a `see_image` `source` argument (local path |
+//                           https URL | `screenshot:<url>`).
+// Foundation-only (no AppKit / WebKit), so `tests/test-vision.swift` co-compiles
+// with just Core.swift.
+// =====================================================================
+
+/// Decides whether the model configured for `provider` can actually SEE images.
+/// Conservative by design: a wrong "yes" sends an image to a text-only model
+/// (wasted call / error), so unknowns default to FALSE.
+enum VisionSupport {
+    /// True iff the active provider's model is multimodal.
+    ///  - OpenAI:   gpt-4o / gpt-4o-mini / gpt-4.1(+mini/nano) / o3 / o4 (vision).
+    ///  - Claude:   3.5 / 3.7 / 4 Sonnet & Opus & Haiku (all vision-capable).
+    ///  - llamacpp: ONLY when a known multimodal local model (gemma-3 / gemma-3n /
+    ///              llava / minicpm / qwen*-vl / moondream / pixtral …) is
+    ///              configured (it implies an mmproj is loaded). The default 4B is
+    ///              text-only → false.
+    ///  - ollama:   same multimodal-model heuristic on `ollamaModel`.
+    static func modelSupportsVision(config: AppConfig) -> Bool {
+        switch config.provider {
+        case "openai":
+            return openAIModelHasVision(config.openaiModel)
+        case "claude", "anthropic":
+            return claudeModelHasVision(config.claudeModel)
+        case "llamacpp":
+            return localModelLooksMultimodal(config.llamaModel)
+        case "ollama":
+            return localModelLooksMultimodal(config.ollamaModel)
+        default:
+            return false
+        }
+    }
+
+    static func openAIModelHasVision(_ model: String) -> Bool {
+        let m = model.lowercased()
+        // Known text-only / embedding families → explicitly NOT vision.
+        if m.contains("gpt-3.5") || m.hasPrefix("text-") || m.contains("embedding") {
+            return false
+        }
+        // gpt-4o*, gpt-4.1*, o3*, o4* and the chatgpt-4o snapshots all see images.
+        return m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("4o-")
+            || m.hasPrefix("o3") || m.hasPrefix("o4") || m.contains("chatgpt-4o")
+    }
+
+    static func claudeModelHasVision(_ model: String) -> Bool {
+        let m = model.lowercased()
+        // Claude 3+ (3 / 3.5 / 3.7 / 4) are all vision-capable. The legacy
+        // claude-2 / claude-instant generation was text-only.
+        if m.contains("claude-2") || m.contains("instant") { return false }
+        return m.contains("claude-3") || m.contains("claude-sonnet-4")
+            || m.contains("claude-opus-4") || m.contains("claude-haiku-4")
+            || m.contains("sonnet-4") || m.contains("opus-4")
+    }
+
+    /// Heuristic for a LOCAL multimodal model name (implies an mmproj is loaded).
+    static func localModelLooksMultimodal(_ model: String) -> Bool {
+        let m = model.lowercased()
+        let needles = ["gemma-3", "gemma3", "llava", "minicpm", "moondream",
+                       "pixtral", "bakllava", "vl", "vision", "internvl", "mmproj",
+                       "smolvlm", "phi-3-vision", "phi-4-multimodal"]
+        return needles.contains { m.contains($0) }
+    }
+
+    /// A clear, actionable message when the user wants to SEE something but no
+    /// vision-capable model is configured. Mirrors `suggest_integration`: never a
+    /// blank failure — tell them exactly how to gain the capability.
+    static func noVisionModelMessage() -> String {
+        return "I can capture the page/image, but I need a vision-capable model to "
+            + "SEE it — add an OpenAI (gpt-4o) or Anthropic (Claude Sonnet) key in "
+            + "Settings → Models, or use a local multimodal model (gemma-3n + mmproj). "
+            + "Once one is set, ask again and I'll describe what it looks like."
+    }
+}
+
+/// Builds the provider-specific content-PART arrays for a user message that
+/// carries images. The serializers call these ONLY when `images` is non-empty;
+/// the no-image path stays a bare string (byte-identical to before — the
+/// fast-path).
+enum VisionContent {
+    /// OpenAI content array: a text part (if any) followed by one
+    /// `{type:"image_url", image_url:{url[, detail]}}` per image. For local paths
+    /// the caller must have already turned `source` into a `data:` URI (OpenAI
+    /// can't read a local path); URLs/data-URIs pass straight through.
+    static func openAIParts(text: String, images: [ImageRef]) -> [[String: Any]] {
+        var parts: [[String: Any]] = []
+        if !text.isEmpty { parts.append(["type": "text", "text": text]) }
+        for img in images {
+            var imageURL: [String: Any] = ["url": img.source]
+            if let d = img.detail, !d.isEmpty { imageURL["detail"] = d }
+            parts.append(["type": "image_url", "image_url": imageURL])
+        }
+        return parts
+    }
+
+    /// Anthropic content array: a text block (if any) followed by one `image`
+    /// block per image. A `data:` URI is split into `{type:"base64", media_type,
+    /// data}`; an `https:` URL becomes `{type:"url", url}`. (A local path can't be
+    /// sent to Anthropic; the caller converts it to a data URI first.)
+    static func anthropicParts(text: String, images: [ImageRef]) -> [[String: Any]] {
+        var blocks: [[String: Any]] = []
+        if !text.isEmpty { blocks.append(["type": "text", "text": text]) }
+        for img in images {
+            switch img.kind {
+            case .dataURI:
+                if let (media, b64) = parseDataURI(img.source) {
+                    blocks.append([
+                        "type": "image",
+                        "source": ["type": "base64", "media_type": media, "data": b64],
+                    ])
+                }
+            case .httpURL:
+                blocks.append([
+                    "type": "image",
+                    "source": ["type": "url", "url": img.source],
+                ])
+            case .localPath:
+                // Should have been converted to a data URI upstream; skip if not.
+                break
+            }
+        }
+        return blocks
+    }
+
+    /// Split a `data:<media>;base64,<payload>` URI into (mediaType, base64). Returns
+    /// nil if it isn't a base64 data URI.
+    static func parseDataURI(_ uri: String) -> (media: String, base64: String)? {
+        guard uri.lowercased().hasPrefix("data:") else { return nil }
+        guard let comma = uri.firstIndex(of: ",") else { return nil }
+        let header = String(uri[uri.index(uri.startIndex, offsetBy: 5)..<comma]) // after "data:"
+        let payload = String(uri[uri.index(after: comma)...])
+        guard header.lowercased().contains("base64") else { return nil }
+        let media = header.split(separator: ";").first.map(String.init) ?? "image/png"
+        return (media.isEmpty ? "image/png" : media, payload)
+    }
+}
+
+/// Parses the `source` argument of `see_image` into a typed request. Pure so the
+/// prefix handling (`screenshot:<url>`) and classification are unit-tested.
+enum VisionSource: Equatable {
+    /// `screenshot:<website-url>` — capture the page first, then see it.
+    case screenshot(url: String)
+    /// An `https:`/`http:` image URL — passed to the vision model directly.
+    case imageURL(String)
+    /// A local image file path — base64/data-URI loaded (confirm-gated).
+    case localPath(String)
+
+    /// Parse a raw `source` string. The `screenshot:` prefix is matched
+    /// case-insensitively; everything after it is the URL to capture.
+    static func parse(_ raw: String) -> VisionSource {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("screenshot:") {
+            let rest = String(trimmed.dropFirst("screenshot:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return .screenshot(url: rest)
+        }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+            return .imageURL(trimmed)
+        }
+        return .localPath(trimmed)
     }
 }
 
