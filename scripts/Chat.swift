@@ -2363,6 +2363,14 @@ struct ChatView: View {
                 .onChange(of: viewModel.streamingText) { _, _ in autoScroll(proxy) }
                 .onChange(of: viewModel.liveToolCards.count) { _, _ in autoScroll(proxy) }
                 .onChange(of: viewModel.pendingConfirmations.count) { _, _ in autoScroll(proxy) }
+                // When a new turn STARTS generating, re-pin to the bottom and scroll
+                // there so the response is followed from its very first token.
+                .onChange(of: viewModel.isGenerating) { _, generating in
+                    if generating {
+                        isAtBottom = true
+                        withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("__bottom__", anchor: .bottom) }
+                    }
+                }
                 .overlay(alignment: .bottomTrailing) {
                     if !isAtBottom {
                         jumpToLatestButton(proxy)

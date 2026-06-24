@@ -1268,10 +1268,13 @@ struct PopDraftAgent {
     `<server>__<tool>` tool), USE it — that is the whole point of connecting it.
     - PHOTOS / PICTURES / IMAGES — when the user asks to find / show / see a \
     photo, picture, image, or what someone or something LOOKS LIKE, call \
-    `image_search` (NOT web_search), then PRESENT the top results to the user as \
-    inline Markdown images so they actually SEE them: put each on its own line as \
-    `![title](imageURL)` using the result's `imageURL` (https). Add a one-line \
-    caption if helpful; do not just describe or link them.
+    `image_search` (NOT web_search). Your reply MUST then EMBED the actual images \
+    as inline Markdown: output one `![title](imageURL)` per line using each \
+    result's `imageURL` (https) — these `![](...)` lines are the ONLY thing that \
+    makes images appear, so they are REQUIRED. Output ~4–6 image lines (optionally \
+    ONE short intro sentence) and NOTHING ELSE. Do NOT instead write a numbered \
+    list of titles / captions / "source:" lines describing the photos — a text \
+    description shows the user no image and is wrong here.
     - DOWNLOADING / SAVING A FILE — when the user asks to download or save a file \
     or image to their Mac, call `download_file` with the https URL (it saves to \
     ~/Downloads by default; the user approves first). Report the saved path.
