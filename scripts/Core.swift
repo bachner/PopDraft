@@ -1623,39 +1623,76 @@ enum DDGParser {
         return uddg
     }
 
+    /// Extract an HTML attribute value from a tag's attribute string, tolerating
+    /// single- OR double-quoted values (DDG lite uses single quotes on `class`,
+    /// double on `href`). Returns nil if the attribute is absent.
+    static func attrValue(_ name: String, in attrs: String) -> String? {
+        let pattern = "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')"
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let ns = attrs as NSString
+        guard let m = re.firstMatch(in: attrs, options: [], range: NSRange(location: 0, length: ns.length)) else { return nil }
+        for i in 1..<m.numberOfRanges {
+            let r = m.range(at: i)
+            if r.location != NSNotFound { return ns.substring(with: r) }
+        }
+        return nil
+    }
+
     /// Parse the HTML body of the DDG **lite** endpoint into results.
     /// The lite page is a flat table: result rows have an `<a ... class="result-link">`
     /// (the title+link) followed by a snippet cell with `class="result-snippet"`.
     /// We parse defensively with regex (no HTML lib) and tolerate format drift.
+    ///
+    /// As of 2026 the lite endpoint emits DIRECT hrefs on `class='result-link'`
+    /// anchors (e.g. `<a href="https://example.com" class='result-link'>`) — it
+    /// no longer wraps them in a `/l/?uddg=` redirect. It also uses SINGLE quotes
+    /// on its `class` attributes. So we accept a result anchor when EITHER:
+    ///   (a) its `class` contains `result-link` (single OR double quoted), or
+    ///   (b) its href decodes a `uddg` redirect (older markup / html endpoint).
     static func parseLite(_ html: String, maxResults: Int = 10) -> [SearchResult] {
         var results: [SearchResult] = []
-        // Anchors that carry the result link. On lite, these are class="result-link";
-        // we also accept any anchor whose href is a /l/?uddg= redirect.
-        let anchorPattern = "<a[^>]*href=\"([^\"]*)\"[^>]*>(.*?)</a>"
+        // Capture the whole opening `<a ...>` tag (group 1) and the link text
+        // (group 2). We pull href/class out of the tag separately so quoting
+        // (single vs double) and attribute ordering don't matter.
+        let anchorPattern = "<a\\b([^>]*)>(.*?)</a>"
         guard let re = try? NSRegularExpression(pattern: anchorPattern, options: [.dotMatchesLineSeparators, .caseInsensitive]) else {
             return []
         }
         let ns = html as NSString
         let matches = re.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length))
 
-        // Build a list of (url, title, anchorStart, anchorEnd) for redirect anchors.
+        // Build a list of (url, title, anchorStart, anchorEnd) for result anchors.
         var anchors: [(url: String, title: String, start: Int, end: Int)] = []
         for m in matches {
             guard m.numberOfRanges >= 3 else { continue }
-            let href = ns.substring(with: m.range(at: 1))
-            // Only result links carry a uddg redirect.
-            guard let real = decodeRedirect(href) else { continue }
+            let attrs = ns.substring(with: m.range(at: 1))
+            guard let href = attrValue("href", in: attrs) else { continue }
+            let cls = attrValue("class", in: attrs) ?? ""
+            let isResultLink = cls.range(of: "result-link", options: .caseInsensitive) != nil
+            // Resolve the real destination: a uddg redirect decodes to its target;
+            // otherwise (new lite markup) the href IS the destination when it's a
+            // result-link anchor pointing at an absolute http(s) URL.
+            let real: String?
+            if let decoded = decodeRedirect(href) {
+                real = decoded
+            } else if isResultLink, href.hasPrefix("http") {
+                real = href
+            } else {
+                real = nil
+            }
+            guard let dest = real, !dest.isEmpty else { continue }
             let rawTitle = ns.substring(with: m.range(at: 2))
             let title = stripTags(rawTitle)
             guard !title.isEmpty else { continue }
-            anchors.append((url: URLCleaner.strip(real), title: title,
+            anchors.append((url: URLCleaner.strip(dest), title: title,
                             start: m.range.location, end: m.range.location + m.range.length))
         }
 
         // For each result anchor, grab a result-snippet block — but ONLY one that
         // falls strictly BEFORE the next result anchor, so a result with no
-        // snippet of its own can't borrow the following result's snippet.
-        let snippetPattern = "class=\"result-snippet\"[^>]*>(.*?)</td>"
+        // snippet of its own can't borrow the following result's snippet. The
+        // class attribute may be single- OR double-quoted, hence `['\"]`.
+        let snippetPattern = "class=['\"]result-snippet['\"][^>]*>(.*?)</td>"
         let snippetRe = try? NSRegularExpression(pattern: snippetPattern, options: [.dotMatchesLineSeparators, .caseInsensitive])
 
         var snippetRanges: [(text: String, start: Int)] = []
@@ -1673,6 +1710,31 @@ enum DDGParser {
             // Dedupe by exact URL within this page.
             if results.contains(where: { $0.url == a.url }) { continue }
             results.append(SearchResult(title: a.title, url: a.url, snippet: snippet))
+            if results.count >= maxResults { break }
+        }
+        return results
+    }
+
+    /// Parse the JSON array string produced by `WebJS.serpExtractScript` (the
+    /// browse-the-SERP fallback) into `[SearchResult]`. Tolerant: bad/empty
+    /// input yields []. URLs are normalized through `URLCleaner.strip`.
+    static func parseSERPJSON(_ json: String, maxResults: Int = 10) -> [SearchResult] {
+        guard let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        var results: [SearchResult] = []
+        var seen = Set<String>()
+        for obj in arr {
+            guard let rawURL = obj["url"] as? String, !rawURL.isEmpty,
+                  rawURL.hasPrefix("http") else { continue }
+            let title = (obj["title"] as? String) ?? ""
+            guard !title.isEmpty else { continue }
+            let url = URLCleaner.strip(rawURL)
+            if seen.contains(url) { continue }
+            seen.insert(url)
+            let snippet = (obj["snippet"] as? String) ?? ""
+            results.append(SearchResult(title: title, url: url, snippet: snippet))
             if results.count >= maxResults { break }
         }
         return results
@@ -2585,7 +2647,8 @@ struct AgentLoop {
         session: ChatSession,
         registry: ToolRegistry,
         call: ModelCall,
-        onProgress: ToolProgressHook? = nil
+        onProgress: ToolProgressHook? = nil,
+        finalize: ModelCall? = nil
     ) async throws -> Outcome {
         var working = session
         let toolsJSON = await registry.openAITools()
@@ -2599,6 +2662,19 @@ struct AgentLoop {
             // No tools requested → final answer.
             if turn.toolCalls.isEmpty {
                 let text = turn.content ?? ""
+                // GUARD: a no-tools turn that still came back EMPTY (e.g. the whole
+                // answer was eaten by a <think> block, or the model emitted nothing
+                // usable) — synthesize a real answer from the context so we never
+                // return blank. Only when a `finalize` synthesis call is injected.
+                if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let finalize = finalize,
+                   working.messages.contains(where: { $0.role == "tool" }) {
+                    if let synth = try? await synthesizeFinal(&working, finalize: finalize),
+                       !synth.isEmpty {
+                        return Outcome(session: working, finalText: synth,
+                                       iterations: iterations + 1, stoppedAtMax: false)
+                    }
+                }
                 lastText = text
                 working.messages.append(ChatMessage(
                     role: "assistant", content: text, thinking: turn.thinking))
@@ -2700,10 +2776,49 @@ struct AgentLoop {
             // …loop: ask the model again with the tool results in context.
         }
 
-        // Iteration cap hit while still in a tool loop. Return whatever text we have.
+        // Iteration cap hit while still in a tool loop. The model never produced a
+        // plain answer — it kept calling tools. If we have tool results in context
+        // and a `finalize` synthesis call, do ONE final tools-disabled turn so we
+        // ALWAYS end with a real natural-language answer (never blank). This is the
+        // heart of the "always-answer" fix: tool-using flows must not end empty.
+        if lastText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let finalize = finalize,
+           working.messages.contains(where: { $0.role == "tool" }) {
+            if let synth = try? await synthesizeFinal(&working, finalize: finalize),
+               !synth.isEmpty {
+                return Outcome(session: working, finalText: synth,
+                               iterations: iterations + 1, stoppedAtMax: true)
+            }
+        }
         working.updatedAt = Date().timeIntervalSince1970
         return Outcome(session: working, finalText: lastText,
                        iterations: iterations, stoppedAtMax: true)
+    }
+
+    /// One final model turn with tools DISABLED and a directive to answer now in
+    /// plain language using the information gathered so far. Appends the directive
+    /// + the synthesized assistant answer to `working` and returns the answer text
+    /// (or "" on failure). `finalize` is the injected model call; the caller wires
+    /// it to disable thinking for this turn so the model reliably emits prose.
+    private func synthesizeFinal(
+        _ working: inout ChatSession, finalize: ModelCall
+    ) async throws -> String {
+        let directive = ChatMessage(
+            role: "user",
+            content: "Using the information gathered above, answer my question now "
+                + "in plain language. Do not call any tools. If a search or page "
+                + "returned relevant facts, base your answer on them. Be direct and concise.")
+        var msgs = working.messages
+        msgs.append(directive)
+        // Empty tools array → the model gets no `tools`, so it must answer in text.
+        let turn = try await finalize(msgs, [])
+        let text = (turn.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        working.messages.append(directive)
+        working.messages.append(ChatMessage(
+            role: "assistant", content: text, thinking: turn.thinking))
+        working.updatedAt = Date().timeIntervalSince1970
+        return text
     }
 }
 

@@ -350,6 +350,85 @@ func runTests() async {
         check(box.value == 3, "the model was invoked exactly 3 times")
         let toolMsgs = outcome.session.messages.filter { $0.role == "tool" }
         check(toolMsgs.count == 3, "3 tool turns ran before the cap stopped it")
+        // No `finalize` injected here → finalText stays empty (legacy behavior).
+        check(outcome.finalText.isEmpty, "without finalize, capped tool loop returns empty (unchanged)")
+    }
+
+    // ------------------------------------------------------------------------
+    section("BUG3: always-answer — capped tool loop synthesizes a final answer")
+    do {
+        // A model that NEVER answers in text (only tool calls) hits the cap with
+        // empty finalText. With a `finalize` synthesis call injected, the loop
+        // must do ONE final tools-disabled turn and ALWAYS end with a real answer.
+        let box = Box()
+        let registry = await makeRegistry([EchoArgsTool(name: "spin")])
+        let loop = AgentLoop(maxIterations: 3)
+        let alwaysTool: AgentLoop.ModelCall = { _, tools in
+            // Sanity: the synthesis call passes an EMPTY tools array.
+            check(!tools.isEmpty, "main call receives the tools array")
+            let n = box.inc()
+            return AssistantTurn(toolCalls: [ParsedToolCall(id: "spin\(n)", name: "spin", rawArguments: "{}")])
+        }
+        let finalizeBox = Box()
+        let finalize: AgentLoop.ModelCall = { _, tools in
+            _ = finalizeBox.inc()
+            check(tools.isEmpty, "finalize call receives an EMPTY tools array (tools disabled)")
+            return AssistantTurn(content: "Synthesized answer from the gathered results.")
+        }
+        let outcome = try! await loop.run(
+            session: newSession(user: "loop"), registry: registry,
+            call: alwaysTool, finalize: finalize)
+        check(outcome.stoppedAtMax, "stoppedAtMax still flagged (we did hit the cap)")
+        check(finalizeBox.value == 1, "finalize was invoked exactly once")
+        check(outcome.finalText == "Synthesized answer from the gathered results.",
+              "BUG3: non-empty synthesized final answer, got '\(outcome.finalText)'")
+        check(outcome.session.messages.last?.role == "assistant", "ends with the assistant answer")
+        check(outcome.session.messages.last?.content == outcome.finalText, "final message carries the answer")
+    }
+
+    // ------------------------------------------------------------------------
+    section("BUG3: a no-tools turn with EMPTY content + prior tools → synthesize")
+    do {
+        // The model stops calling tools but returns an empty answer (e.g. the
+        // whole answer was eaten by a <think> block). With prior tool results +
+        // finalize, the loop must synthesize rather than return blank.
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 6)
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [ParsedToolCall(id: "e1", name: "echo", rawArguments: "{\"q\":\"x\"}")]),
+            AssistantTurn(content: ""),   // model "answers" but it's empty
+        ])
+        let finalize: AgentLoop.ModelCall = { _, _ in
+            AssistantTurn(content: "Recovered answer.")
+        }
+        let outcome = try! await loop.run(
+            session: newSession(user: "go"), registry: registry,
+            call: turns.call, finalize: finalize)
+        check(outcome.finalText == "Recovered answer.",
+              "BUG3: empty no-tools answer recovered via synthesis, got '\(outcome.finalText)'")
+        check(!outcome.stoppedAtMax, "did not hit the cap (model returned a no-tools turn)")
+    }
+
+    // ------------------------------------------------------------------------
+    section("BUG3: a non-empty answer is NOT overwritten by synthesis")
+    do {
+        // When the model DOES answer, finalize must not fire.
+        let registry = await makeRegistry([EchoArgsTool(name: "echo")])
+        let loop = AgentLoop(maxIterations: 6)
+        let turns = TurnScript([
+            AssistantTurn(toolCalls: [ParsedToolCall(id: "e1", name: "echo", rawArguments: "{\"q\":\"x\"}")]),
+            AssistantTurn(content: "The real answer."),
+        ])
+        let finBox = Box()
+        let finalize: AgentLoop.ModelCall = { _, _ in
+            _ = finBox.inc()
+            return AssistantTurn(content: "SHOULD NOT APPEAR")
+        }
+        let outcome = try! await loop.run(
+            session: newSession(user: "go"), registry: registry,
+            call: turns.call, finalize: finalize)
+        check(outcome.finalText == "The real answer.", "real answer kept, got '\(outcome.finalText)'")
+        check(finBox.value == 0, "finalize NOT invoked when the model already answered")
     }
 
     // ------------------------------------------------------------------------

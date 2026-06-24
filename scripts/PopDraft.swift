@@ -1099,7 +1099,8 @@ class LLMClient {
         messages: [ChatMessage],
         tools: [[String: Any]]? = nil,
         stream: Bool = false,
-        onTextDelta: (@Sendable (String) -> Void)? = nil
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        forceThinkingOff: Bool = false
     ) async throws -> AssistantTurn {
         let provider = config.provider
         activeProvider = provider
@@ -1108,14 +1109,14 @@ class LLMClient {
             return try await chatCompletionOpenAICompatible(
                 urlString: "\(config.llamacppURL)/v1/chat/completions",
                 model: nil, apiKey: nil, messages: messages, tools: tools,
-                isLlamaCpp: true, onTextDelta: onTextDelta)
+                isLlamaCpp: true, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
         case .ollama:
             // Ollama's native /api/generate isn't tool-capable; use its
             // OpenAI-compatible endpoint for the agent path.
             return try await chatCompletionOpenAICompatible(
                 urlString: "\(config.ollamaURL)/v1/chat/completions",
                 model: config.ollamaModel, apiKey: nil, messages: messages, tools: tools,
-                isLlamaCpp: false, onTextDelta: onTextDelta)
+                isLlamaCpp: false, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
         case .openai:
             guard !config.openaiAPIKey.isEmpty else {
                 throw NSError(domain: "OpenAI API key not configured", code: -1)
@@ -1123,7 +1124,8 @@ class LLMClient {
             return try await chatCompletionOpenAICompatible(
                 urlString: "https://api.openai.com/v1/chat/completions",
                 model: config.openaiModel, apiKey: config.openaiAPIKey,
-                messages: messages, tools: tools, isLlamaCpp: false, onTextDelta: onTextDelta)
+                messages: messages, tools: tools, isLlamaCpp: false, onTextDelta: onTextDelta,
+                forceThinkingOff: forceThinkingOff)
         case .claude:
             guard !config.claudeAPIKey.isEmpty else {
                 throw NSError(domain: "Claude API key not configured", code: -1)
@@ -1168,7 +1170,8 @@ class LLMClient {
     private func chatCompletionOpenAICompatible(
         urlString: String, model: String?, apiKey: String?,
         messages: [ChatMessage], tools: [[String: Any]]?, isLlamaCpp: Bool,
-        onTextDelta: (@Sendable (String) -> Void)? = nil
+        onTextDelta: (@Sendable (String) -> Void)? = nil,
+        forceThinkingOff: Bool = false
     ) async throws -> AssistantTurn {
         guard let url = URL(string: urlString) else {
             throw NSError(domain: "Invalid URL", code: -1)
@@ -1194,6 +1197,16 @@ class LLMClient {
             if apiKey != nil && !isLlamaCpp {
                 body["parallel_tool_calls"] = true
             }
+        }
+        // Force-disable model reasoning for THIS turn (used by the agent's final
+        // answer-synthesis turn so a thinking model reliably emits plain prose and
+        // doesn't bury the whole answer inside a <think> block). Qwen/llama.cpp
+        // honor `chat_template_kwargs.enable_thinking`; OpenAI's reasoning models
+        // read `reasoning_effort`. Harmless extra keys on servers that ignore them.
+        if forceThinkingOff {
+            body["chat_template_kwargs"] = ["enable_thinking": false]
+            body["enable_thinking"] = false
+            if apiKey != nil && !isLlamaCpp { body["reasoning_effort"] = "low" }
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -4558,11 +4571,13 @@ class PopupWindowController: NSWindowController {
     }
 
     func showAtMouseLocation() {
+        Logger.shared.info("showAtMouseLocation: entry")
         // Minimize the corner bubble (if enabled) as we transition to the panel.
         onWillShow?()
 
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
+        Logger.shared.info("showAtMouseLocation: captured \(clipboardText.count) chars of selected text")
 
         // Reset state.
         searchText = ""
@@ -4582,12 +4597,14 @@ class PopupWindowController: NSWindowController {
         // it's always the action list (the user picks an action → chat).
         let bubbleEnabled = LLMConfig.load().bubble.enabled
         if bubbleEnabled && clipboardText.isEmpty {
+            Logger.shared.info("showAtMouseLocation: no selection + bubble enabled → opening chat")
             enterChat(seedUser: "", selectedText: nil, autoRun: false)
             window?.makeKeyAndOrderFront(nil)
             startKeyboardMonitoring()
             NSApp.activate(ignoringOtherApps: true)
             return
         }
+        Logger.shared.info("showAtMouseLocation: showing action menu (selection=\(!clipboardText.isEmpty), bubble=\(bubbleEnabled))")
         state = .actionList
         updateView()
 
@@ -4634,6 +4651,7 @@ class PopupWindowController: NSWindowController {
     }
 
     func showWithAction(actionID: String) {
+        Logger.shared.info("showWithAction: \(actionID)")
         // Minimize the corner bubble (if enabled) as we transition to the panel.
         onWillShow?()
 
@@ -8623,10 +8641,16 @@ class HotkeyManager {
     }
 
     func handleHotkey(id: UInt32) {
-        guard let config = registeredHotkeys.first(where: { $0.id == id }) else { return }
+        guard let config = registeredHotkeys.first(where: { $0.id == id }) else {
+            Logger.shared.error("handleHotkey: no registered hotkey for id \(id)")
+            return
+        }
+        Logger.shared.info("handleHotkey fired: id=\(id) action=\(config.actionID) (\(config.description))")
 
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.triggerAction(actionID: config.actionID)
+        } else {
+            Logger.shared.error("handleHotkey: NSApp.delegate is not AppDelegate — cannot trigger action")
         }
     }
 }
@@ -8944,11 +8968,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func triggerAction(actionID: String) {
+        Logger.shared.info("triggerAction: \(actionID) (accessibility=\(AXIsProcessTrusted()))")
+        // BUG-1 fix: capturing the user's selected text relies on simulating
+        // Cmd+C via CGEvent, which SILENTLY no-ops without Accessibility
+        // permission. A fresh/unsigned build at the same path loses the grant, so
+        // the hotkey appeared to "do nothing": capture returned empty → with the
+        // bubble enabled the empty selection routed to chat (or nothing visible),
+        // never the action menu. Detect the missing permission up-front and guide
+        // the user instead of failing silently.
+        guard AXIsProcessTrusted() else {
+            Logger.shared.error("triggerAction: Accessibility NOT granted — prompting user (hotkey would otherwise do nothing)")
+            promptForAccessibility()
+            return
+        }
         if actionID == "popup" {
             showPopup()
         } else {
             popupController?.showWithAction(actionID: actionID)
         }
+    }
+
+    /// Show a clear, actionable prompt when the global hotkey fires but
+    /// Accessibility permission is missing (so the app can't read the selection
+    /// or simulate Cmd+C). Triggers the system "add this app" prompt AND opens the
+    /// Accessibility pane, plus an alert explaining what to do. Debounced so a
+    /// repeated hotkey press doesn't stack alerts.
+    private var isShowingAccessibilityPrompt = false
+    func promptForAccessibility() {
+        if isShowingAccessibilityPrompt { return }
+        isShowingAccessibilityPrompt = true
+
+        // Ask macOS to surface THIS binary in the Accessibility list.
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "PopDraft needs Accessibility permission"
+        alert.informativeText = "To read your selected text and show the action menu, "
+            + "PopDraft needs Accessibility access.\n\n"
+            + "Open System Settings → Privacy & Security → Accessibility, then enable "
+            + "PopDraft (toggle it off and on again if it's already listed — a new build "
+            + "can lose the grant). Then press the hotkey again."
+        alert.addButton(withTitle: "Open Accessibility Settings")
+        alert.addButton(withTitle: "Later")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first?.activate()
+                }
+            }
+        }
+        isShowingAccessibilityPrompt = false
     }
 
     @objc func showSettings() {
@@ -9238,6 +9311,71 @@ enum WebJS {
     """
 
     static let readyStateScript = "document.readyState"
+
+    /// Extract search results from a RENDERED SERP DOM (DuckDuckGo or Bing).
+    /// Returns a JSON array string of `{title,url,snippet}`. Engine-agnostic:
+    /// tries each engine's known result-container selectors, then a generic
+    /// fallback over organic-looking links. Skips ads, internal DDG/Bing links,
+    /// and javascript/# hrefs. Decodes Bing's `/ck/a?...&u=` redirect wrappers.
+    static let serpExtractScript = #"""
+    (function(){
+      function clean(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+      function host(u){ try { return new URL(u, location.href).hostname; } catch(e){ return ''; } }
+      // Bing wraps real URLs in /ck/a?...&u=a1<base64url>. Best-effort decode;
+      // if it fails, keep the wrapper (still a valid clickable link).
+      function unwrap(u){
+        try{
+          var url=new URL(u, location.href);
+          if(/bing\.com$/.test(url.hostname) && url.pathname.indexOf('/ck/a')===0){
+            var raw=url.searchParams.get('u');
+            if(raw){
+              if(raw.slice(0,2)==='a1'){ raw=raw.slice(2); }
+              var b64=raw.replace(/-/g,'+').replace(/_/g,'/');
+              while(b64.length%4){ b64+='='; }
+              try{ var dec=atob(b64); if(/^https?:\/\//.test(dec)) return dec; }catch(e){}
+            }
+          }
+        }catch(e){}
+        return u;
+      }
+      var out=[]; var seen={};
+      function push(title,url,snippet){
+        url=unwrap(url);
+        if(!url || !/^https?:\/\//.test(url)) return;
+        var h=host(url);
+        if(!h) return;
+        // Drop the engine's own chrome / ads / verticals.
+        if(/(^|\.)duckduckgo\.com$/.test(h)) return;
+        if(/(^|\.)bing\.com$/.test(h)) return;
+        if(/(^|\.)microsoft(translator)?\.com$/.test(h) && /\/ck\//.test(url)) return;
+        title=clean(title);
+        if(!title) return;
+        var key=url.split('#')[0];
+        if(seen[key]) return; seen[key]=1;
+        out.push({title:title, url:url, snippet:clean(snippet)});
+      }
+      // 1) DuckDuckGo (react SERP): each result is an article[data-testid=result].
+      document.querySelectorAll('article[data-testid="result"], li[data-layout="organic"], .result').forEach(function(el){
+        var a=el.querySelector('a[data-testid="result-title-a"]') || el.querySelector('h2 a') || el.querySelector('a.result__a') || el.querySelector('a[href]');
+        if(!a) return;
+        var sn=el.querySelector('[data-result="snippet"]') || el.querySelector('.result__snippet') || el.querySelector('span');
+        push(a.innerText||a.textContent, a.href, sn?(sn.innerText||sn.textContent):'');
+      });
+      // 2) Bing: organic results live in li.b_algo with an h2 > a.
+      document.querySelectorAll('li.b_algo').forEach(function(el){
+        var a=el.querySelector('h2 a'); if(!a) return;
+        var sn=el.querySelector('.b_caption p') || el.querySelector('p');
+        push(a.innerText||a.textContent, a.href, sn?(sn.innerText||sn.textContent):'');
+      });
+      // 3) Generic fallback: any heading link if the above found nothing.
+      if(out.length===0){
+        document.querySelectorAll('h2 a[href], h3 a[href]').forEach(function(a){
+          push(a.innerText||a.textContent, a.href, '');
+        });
+      }
+      return JSON.stringify(out.slice(0,15));
+    })();
+    """#
 }
 
 // MARK: - Content blocking ruleset
@@ -9619,32 +9757,30 @@ struct DuckDuckGoProvider: SearchProvider {
     static let maxSearchBytes = 4 * 1024 * 1024
     func isConfigured(keys: [String: String]) -> Bool { true }  // always available
 
-    /// PR11: a URLSession whose traffic is pinned through the localhost proxy on
-    /// macOS 14+, so the search path is rebinding-safe too. On macOS 13 we fall
-    /// back to a plain shared session (PR6 behavior — DDG hosts are public CDNs).
-    static func pinnedSession() -> URLSession {
-        if #available(macOS 14.0, *) {
-            let proxyPort = PinningProxy.shared.startIfNeeded()
-            if proxyPort != 0, let nwPort = NWEndpoint.Port(rawValue: proxyPort) {
-                let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: nwPort)
-                let cfg = URLSessionConfiguration.ephemeral
-                cfg.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: endpoint)]
-                return URLSession(configuration: cfg)
-            }
-        }
-        return URLSession.shared
-    }
+    // NOTE: earlier builds routed this scrape through the PR11 localhost pinning
+    // proxy (`pinnedSession()`). That broke search — DuckDuckGo 202-blocks proxied
+    // traffic — so the keyless scrape now uses a PLAIN ephemeral URLSession (see
+    // `search` below). Rebinding-sensitive rendering of untrusted result pages
+    // still goes through the proxy via the WebEngine browse-SERP fallback.
 
     func search(_ q: SearchQuery, keys: [String: String]) async throws -> [SearchResult] {
         let trimmed = q.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
-        let session = Self.pinnedSession()
+        // NB: the keyless DDG scrape is fetched with a PLAIN URLSession, NOT the
+        // PR11 pinning proxy. DuckDuckGo rate-limits / 202-blocks traffic that
+        // arrives via the localhost CONNECT proxy (observed: every proxied query
+        // returns "HTTP 202"), which silently killed the in-app search. A public
+        // search engine over HTTPS is low SSRF risk, so we go direct here. The
+        // browse-SERP fallback (which renders untrusted result pages) still goes
+        // through the SSRF guard + proxy via WebEngine.
+        let session = URLSession(configuration: .ephemeral)
 
-        // Try lite first, then the html endpoint.
+        // Use the LITE endpoint only. The `html.duckduckgo.com` endpoint now
+        // serves an "anomaly"/captcha page to scrapers, so it's a dead end; lite
+        // returns real results to a desktop UA. (POST also works but GET is fine.)
         let endpoints = [
             "https://lite.duckduckgo.com/lite/",
-            "https://html.duckduckgo.com/html/",
         ]
         var lastError: Error?
         for endpoint in endpoints {
@@ -9653,8 +9789,11 @@ struct DuckDuckGoProvider: SearchProvider {
             guard let url = comps.url else { continue }
             var req = URLRequest(url: url)
             req.timeoutInterval = 12
+            // A real, current desktop Safari UA + language headers; the bare
+            // "text/html" Accept and an old UA invite the anomaly page.
             req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
-            req.setValue("text/html", forHTTPHeaderField: "Accept")
+            req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
             do {
                 let (data, response) = try await session.data(for: req)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -10503,10 +10642,67 @@ final class WebEngine {
         let router = self.router
         let query = q
         let data = try await cache.value(forKey: key, ttl: 300) {
-            let results = try await router.search(query)
+            // 1) Keyless lite scrape (+ any configured keyed provider) first.
+            var results: [SearchResult] = []
+            do {
+                results = try await router.search(query)
+            } catch {
+                Logger.shared.error("web_search: router failed: \(error)")
+            }
+            // 2) Browse-the-SERP fallback: when the scrape yields nothing
+            // (blocked / empty / rate-limited), render a real SERP in a WKWebView
+            // and extract results from the rendered DOM. WKWebView loads like a
+            // real browser, bypassing the scrape block. Still goes through the
+            // SSRF guard + pinning proxy. Don't cache a 0-result page.
+            if results.isEmpty {
+                Logger.shared.info("web_search: scrape empty for \"\(query.query)\" — browsing SERP fallback")
+                results = (try? await self.browseSERP(query)) ?? []
+                if results.isEmpty {
+                    Logger.shared.error("web_search: SERP fallback also empty for \"\(query.query)\"")
+                    throw WebEngineError.searchFailed("no results (scrape + SERP fallback both empty)")
+                }
+                Logger.shared.info("web_search: SERP fallback returned \(results.count) results")
+            }
             return (try? JSONEncoder().encode(results)) ?? Data("[]".utf8)
         }
         return (try? JSONDecoder().decode([SearchResult].self, from: data)) ?? []
+    }
+
+    /// Browse-the-SERP fallback. Renders a real search-results page in an
+    /// offscreen WKWebView (through the SSRF guard + PR11 pinning proxy) and
+    /// extracts result links/titles/snippets from the rendered DOM via injected
+    /// JS. Tries DuckDuckGo's full (JS) site first, then Bing as a backstop.
+    private func browseSERP(_ q: SearchQuery) async throws -> [SearchResult] {
+        let encoded = q.query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q.query
+        // Engines to try in order. Each renders client-side, so a plain scrape
+        // can't read them — but a real WKWebView can.
+        let serps = [
+            "https://duckduckgo.com/?q=\(encoded)&ia=web",
+            "https://www.bing.com/search?q=\(encoded)",
+        ]
+        for serp in serps {
+            guard let url = URL(string: serp) else { continue }
+            do {
+                try guardURL(url)
+            } catch {
+                Logger.shared.error("web_search SERP guard blocked \(serp): \(error)")
+                continue
+            }
+            do {
+                let results = try await pool.withRenderer(readMode: false) { webView in
+                    try await self.loadAndSettle(webView, url: url)
+                    // Give a client-rendered SERP a moment to paint its results.
+                    try await Task.sleep(nanoseconds: 700_000_000)
+                    let raw = (try? await webView.evaluateJavaScript(WebJS.serpExtractScript) as? String) ?? "[]"
+                    return DDGParser.parseSERPJSON(raw, maxResults: q.maxResults)
+                }
+                if !results.isEmpty { return results }
+            } catch {
+                Logger.shared.error("web_search SERP render failed for \(serp): \(error)")
+                continue
+            }
+        }
+        return []
     }
 
     // MARK: open
@@ -11355,8 +11551,19 @@ struct PopDraftAgent {
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
     and read the web and to transform text. Think step by step. Prefer to verify \
     facts with the web tools when a question needs current or external \
-    information; otherwise answer directly. When you call a tool, wait for its \
-    result before answering. Keep final answers concise and well-formatted.
+    information; otherwise answer directly.
+
+    How to use tools well:
+    - When you call a tool, wait for its result before continuing.
+    - After EACH tool result, reassess: decide whether you have enough to answer, \
+    or whether one more tool call is genuinely needed. Don't repeat the same \
+    search over and over — if a search returns results, READ them and answer.
+    - If a search or page returned relevant facts, base your answer on them; do \
+    not stop at the raw tool output.
+
+    ALWAYS finish your turn with a clear, direct, natural-language answer to the \
+    user's question, synthesized from what you found. Never end with only a tool \
+    result and no answer. Keep final answers concise and well-formatted.
     """
 
     /// Build the registry of tools the agent may use, honoring config gates.
@@ -11429,8 +11636,18 @@ struct PopDraftAgent {
                 messages: messages, tools: tools.isEmpty ? nil : tools,
                 stream: false, onTextDelta: onTextDelta)
         }
+        // Final answer-synthesis call (BUG 3 fix): tools DISABLED and thinking
+        // FORCED OFF, so when the tool loop ends without a plain answer we always
+        // get one synthesized from the gathered tool results — never blank, and
+        // never just the raw tool output. (toolsBoxed is empty here by contract.)
+        let finalizeCall: AgentLoop.ModelCall = { messages, _ in
+            return try await LLMClient.shared.chatCompletion(
+                messages: messages, tools: nil,
+                stream: false, onTextDelta: onTextDelta, forceThinkingOff: true)
+        }
         return try await loop.run(
-            session: session, registry: registry, call: modelCall, onProgress: onProgress)
+            session: session, registry: registry, call: modelCall,
+            onProgress: onProgress, finalize: finalizeCall)
     }
 }
 

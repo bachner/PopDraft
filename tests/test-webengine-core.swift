@@ -177,6 +177,57 @@ test("DDG uddg redirect decoding directly") {
     assert(DDGParser.decodeRedirect("https://example.com/plain") == nil, "absolute non-redirect -> nil")
 }
 
+test("DDG lite parses 2026 DIRECT-href markup (single-quoted class, no uddg)") {
+    // The current lite endpoint emits direct hrefs on single-quoted
+    // class='result-link' anchors, with single-quoted result-snippet cells.
+    let html = """
+    <table>
+      <tr><td>
+        <a rel="nofollow" href="https://en.wikipedia.org/wiki/Canberra" class='result-link'>Canberra - Wikipedia</a>
+      </td></tr>
+      <tr><td class='result-snippet'>Canberra is the <b>capital</b> city of Australia.</td></tr>
+      <tr><td>
+        <a rel="nofollow" href="https://www.britannica.com/place/Canberra" class='result-link'>Canberra | Britannica</a>
+      </td></tr>
+      <tr><td class='result-snippet'>Canberra, capital of Australia.</td></tr>
+      <tr><td><a href="/settings" class='nav-link'>Settings</a></td></tr>
+    </table>
+    """
+    let r = DDGParser.parseLite(html, maxResults: 10)
+    assert(r.count == 2, "two direct-href results parsed, got \(r.count)")
+    assert(r[0].url == "https://en.wikipedia.org/wiki/Canberra", "direct href #1, got '\(r[0].url)'")
+    assert(r[0].title == "Canberra - Wikipedia", "title #1, got '\(r[0].title)'")
+    assert(r[0].snippet.contains("capital city of Australia"), "snippet #1, got '\(r[0].snippet)'")
+    assert(r[1].url == "https://www.britannica.com/place/Canberra", "direct href #2")
+    // The non-result nav link (not a result-link, relative href) must be ignored.
+    assert(!r.contains(where: { $0.url.contains("settings") }), "nav link ignored")
+}
+
+test("DDGParser.attrValue tolerates single + double quotes") {
+    let attrs = "rel=\"nofollow\" href=\"https://x.com\" class='result-link'"
+    assert(DDGParser.attrValue("href", in: attrs) == "https://x.com", "double-quoted href")
+    assert(DDGParser.attrValue("class", in: attrs) == "result-link", "single-quoted class")
+    assert(DDGParser.attrValue("missing", in: attrs) == nil, "absent attr -> nil")
+}
+
+test("DDGParser.parseSERPJSON parses browse-SERP fallback output") {
+    let json = """
+    [
+      {"title":"Canberra - Wikipedia","url":"https://en.wikipedia.org/wiki/Canberra?utm_source=ddg","snippet":"Capital of Australia."},
+      {"title":"","url":"https://skip.me","snippet":"no title -> skipped"},
+      {"title":"Dup","url":"https://en.wikipedia.org/wiki/Canberra","snippet":"deduped by url"},
+      {"title":"Bad","url":"ftp://nope","snippet":"non-http skipped"}
+    ]
+    """
+    let r = DDGParser.parseSERPJSON(json, maxResults: 10)
+    // The two Canberra entries dedupe AFTER url-cleaning (utm stripped) → 1 unique.
+    assert(r.count == 1, "deduped + filtered to 1 result, got \(r.count)")
+    assert(r[0].title == "Canberra - Wikipedia", "title kept")
+    assert(r[0].url == "https://en.wikipedia.org/wiki/Canberra", "tracking param stripped")
+    assert(DDGParser.parseSERPJSON("not json", maxResults: 10).isEmpty, "bad json -> []")
+    assert(DDGParser.parseSERPJSON("[]", maxResults: 10).isEmpty, "empty array -> []")
+}
+
 // MARK: - URL tracking-param stripping
 
 test("URL tracking-param stripping") {
