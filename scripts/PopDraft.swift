@@ -4119,13 +4119,6 @@ struct BubbleView: View {
     @ViewBuilder
     private var orb: some View {
         ZStack {
-            // Soft outer glow — brighter on hover.
-            Circle()
-                .fill(Color(red: 0.45, green: 0.5, blue: 0.98))
-                .frame(width: Self.diameter, height: Self.diameter)
-                .blur(radius: hovered ? 18 : 12)
-                .opacity(hovered ? 0.65 : 0.42)
-
             if let orb = AppAssets.bubbleOrb {
                 // Bundled brand orb (carries its own coloring/glow).
                 Image(nsImage: orb)
