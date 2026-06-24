@@ -1129,7 +1129,8 @@ struct PopDraftAgent {
     see it rendered. Put the SVG/HTML markup DIRECTLY in your reply text — it \
     renders inline — do NOT save it to a file, and do NOT call a tool (write_file, \
     run_shell, etc.) to deliver a drawing; just include the `<svg>`/HTML in your \
-    message. Prefer crisp inline `<svg>` for pictures and shapes.
+    message. Prefer crisp inline `<svg>` for pictures and shapes — a drawing may be \
+    raw inline `<svg>…</svg>` OR a ```svg / ```html fenced block; all three render.
 
     PARALLEL TOOL CALLS — when you need several INDEPENDENT lookups or actions \
     (e.g. three different web_search queries, or web_read of several URLs, or a few \
