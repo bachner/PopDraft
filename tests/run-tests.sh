@@ -18,6 +18,7 @@ TESTS=(
   "tests/test-webengine-core.swift scripts/Core.swift"
   "tests/test-toolrunner.swift scripts/Core.swift"
   "tests/test-agentloop.swift scripts/Core.swift"
+  "tests/test-compaction.swift scripts/Core.swift"
   "tests/test-maccontrol.swift scripts/Core.swift"
   "tests/test-ippinning.swift scripts/Core.swift"
   "tests/test-mcp.swift scripts/Core.swift"

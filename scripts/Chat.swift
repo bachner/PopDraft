@@ -104,6 +104,12 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// tool. Usually 0 or 1.
     @Published private(set) var pendingConfirmations: [ConfirmationRequest] = []
 
+    /// True once a run's transcript got large enough that the agent compacted
+    /// older messages to stay under the model's context window. Drives a tiny,
+    /// non-blocking "· compacted earlier messages" footnote so the user knows the
+    /// model isn't seeing the full verbatim history (the transcript is intact).
+    @Published private(set) var didCompact: Bool = false
+
     /// PR9: the broker the Mac-control tools `await`. This view-model is its sink.
     let confirmBroker = MacControlBroker()
 
@@ -269,6 +275,16 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         let snapshot = session
         let appConfig = AppConfig.load(dir: LLMConfig.configDir)
 
+        // Surface a tiny note if this turn's transcript is large enough that the
+        // agent will compact older messages to stay under the context window. The
+        // budget mirrors the loop's `ContextBudget.effectiveBudget`, including the
+        // ACTUAL detected served context (llama-server `/props` `n_ctx`).
+        let budget = ContextBudget.effectiveBudget(
+            provider: appConfig.provider,
+            configured: appConfig.agentSettings.contextTokens,
+            detected: LLMClient.shared.detectedContextTokens())
+        if ContextBudget.shouldCompact(snapshot.messages, budget: budget) { didCompact = true }
+
         // @Sendable sinks: capture self weakly ONCE (not via the enclosing Task)
         // so they stay strict-concurrency clean. Each event hops to the MainActor
         // and is dropped if a newer run/cancel has superseded this `gen`.
@@ -313,8 +329,13 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
             } catch {
                 guard self.generation == gen else { return }
                 // Surface the failure as an assistant error message so the user
-                // sees what went wrong (and the chat stays continuable).
-                let msg = "I hit an error: \(error.localizedDescription)"
+                // sees what went wrong (and the chat stays continuable). For a
+                // context-overflow that even aggressive compaction couldn't
+                // recover from, show a graceful, actionable message instead of the
+                // raw "Context size has been exceeded … error -1".
+                let msg: String = isContextOverflowError(error)
+                    ? "This conversation got too long for the model's context window, even after compacting older messages. Start a new chat or shorten what you pasted to continue."
+                    : "I hit an error: \(error.localizedDescription)"
                 self.session.messages.append(ChatMessage(
                     role: "assistant", content: msg, isError: true))
                 self.session.updatedAt = Date().timeIntervalSince1970
@@ -1746,6 +1767,15 @@ struct ChatView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(ChatPalette.ink2)
                     .lineLimit(1)
+                // Tiny, non-blocking note when older messages were compacted to fit
+                // the context window (the full transcript is still shown below).
+                if viewModel.didCompact {
+                    Text("· compacted earlier messages")
+                        .font(.system(size: 10))
+                        .foregroundColor(ChatPalette.ink3)
+                        .lineLimit(1)
+                        .help("Older messages were summarized so the conversation fits the model's context window. The full transcript is preserved here.")
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)

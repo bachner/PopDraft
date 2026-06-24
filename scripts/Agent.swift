@@ -29,10 +29,51 @@ class LLMClient {
     func reloadConfig() {
         config = LLMConfig.load()
         activeProvider = nil
+        cachedLlamaContext = nil   // re-detect against the (possibly new) URL
     }
 
     var providerName: String {
         return (activeProvider ?? config.provider).displayName
+    }
+
+    /// Cached detected llama-server context window (`/props` `n_ctx`), keyed by
+    /// the URL it was read from, so we probe at most once per server/config.
+    private var cachedLlamaContext: (url: String, nCtx: Int)?
+
+    /// The ACTUAL served context window in tokens for the current provider, or nil
+    /// when it can't be detected. For llama.cpp this reads `/props` `n_ctx` (the
+    /// real served window — now ~200K with flash-attn + q4 KV — not a hardcoded
+    /// guess). Cloud/Ollama return nil (handled by per-provider defaults in
+    /// `ContextBudget.effectiveBudget`). Result cached per-URL. Bounded 1.5s probe.
+    func detectedContextTokens() -> Int? {
+        guard (activeProvider ?? config.provider) == .llamacpp else { return nil }
+        let urlString = "\(config.llamacppURL)/props"
+        if let cached = cachedLlamaContext, cached.url == urlString { return cached.nCtx }
+        guard let url = URL(string: urlString) else { return nil }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var detected: Int?
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            defer { semaphore.signal() }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return }
+            // llama-server exposes n_ctx under default_generation_settings (and,
+            // on some builds, at the top level). Accept either.
+            if let gen = json["default_generation_settings"] as? [String: Any],
+               let n = gen["n_ctx"] as? Int, n > 0 {
+                detected = n
+            } else if let n = json["n_ctx"] as? Int, n > 0 {
+                detected = n
+            }
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 2.0)
+
+        if let n = detected { cachedLlamaContext = (urlString, n) }
+        return detected
     }
 
     var currentModel: String {
@@ -76,6 +117,15 @@ class LLMClient {
     }
 
     func generate(prompt: String, systemPrompt: String? = nil, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
+        generate(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress,
+                 allowContextRetry: true, completion: completion)
+    }
+
+    /// `allowContextRetry` is an internal flag: when a single-shot generation
+    /// overflows the context window, we retry ONCE with a budget-trimmed prompt
+    /// (this flag false on the retry, so we can't loop). The menu-bar text actions
+    /// can hit this when a user selects a very large block. (Compaction)
+    private func generate(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)?, allowContextRetry: Bool, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         let provider = config.provider
         activeProvider = provider
 
@@ -87,6 +137,25 @@ class LLMClient {
             case .success:
                 completion(result)
             case .failure(let error):
+                // Reactive context-overflow recovery for the single-shot path: a
+                // very large selection can blow the served window. Trim the prompt
+                // to fit the budget and retry ONCE (never the raw "-1").
+                if allowContextRetry, let self = self, isContextOverflowError(error) {
+                    let budget = ContextBudget.effectiveBudget(
+                        provider: provider.rawValue,
+                        configured: self.config.agentSettings.contextTokens,
+                        detected: self.detectedContextTokens())
+                    // Reserve room for the system prompt + the model's reply.
+                    let reserve = (systemPrompt?.count ?? 0) + 4096 * Int(ContextBudget.charsPerToken)
+                    let promptCap = max(2000, Int(Double(budget) * 0.6 * ContextBudget.charsPerToken) - reserve)
+                    if prompt.count > promptCap {
+                        let trimmed = ContextBudget.trimToolResult(prompt, maxChars: promptCap)
+                        self.logError("Context overflow on single-shot generate; retrying with prompt trimmed \(prompt.count)→\(trimmed.count) chars.")
+                        self.generate(prompt: trimmed, systemPrompt: systemPrompt,
+                                      onProgress: onProgress, allowContextRetry: false, completion: completion)
+                        return
+                    }
+                }
                 // If not already using llama.cpp, try falling back to it
                 if provider != .llamacpp {
                     self?.logError("Provider \(provider.displayName) failed: \(error.localizedDescription). Falling back to llama.cpp.")
@@ -1299,9 +1368,74 @@ struct PopDraftAgent {
                 messages: messages, tools: nil,
                 stream: false, onTextDelta: onTextDelta, forceThinkingOff: true)
         }
+        // Automatic session compaction: keep a long conversation under the served
+        // context window so it never dies with the "Context size has been
+        // exceeded" / "-1" error. The budget is the provider's effective window —
+        // the ACTUAL served context (llama-server `/props` `n_ctx`, now ~200K) when
+        // it can be detected, else a sensible per-provider default; a non-zero
+        // `contextTokens` config pins it manually. With a 200K window compaction
+        // is rare, but it's the safety net for huge pastes / long tool outputs and
+        // for cloud models with smaller windows. The summarizer is a single cheap,
+        // tools-OFF, thinking-OFF model call that recaps the dropped older messages.
+        let detected = LLMClient.shared.detectedContextTokens()
+        let budget = ContextBudget.effectiveBudget(
+            provider: config.provider,
+            configured: config.agentSettings.contextTokens,
+            detected: detected)
+        let summarize: ContextBudget.Summarizer = { dropped in
+            await PopDraftAgent.summarizeOlder(dropped)
+        }
+        let compaction = AgentLoop.Compaction(budget: budget, maxRetries: 2, summarize: summarize)
         return try await loop.run(
             session: session, registry: registry, call: modelCall,
-            onProgress: onProgress, finalize: finalizeCall)
+            onProgress: onProgress, finalize: finalizeCall, compaction: compaction)
+    }
+
+    /// Summarize the older messages that compaction is about to fold away, with a
+    /// single cheap model call (tools OFF, thinking OFF). Returns a concise recap
+    /// for the "Conversation so far:" message, or nil on any failure (the caller
+    /// then falls back to a deterministic structural recap — never an error).
+    ///
+    /// The summary request itself is intentionally bounded: we feed the model a
+    /// pre-trimmed transcript of the dropped region (tool results hard-capped) so
+    /// the summarization call can't itself overflow.
+    static func summarizeOlder(_ dropped: [ChatMessage]) async -> String? {
+        guard !dropped.isEmpty else { return nil }
+        // Build a compact, role-tagged transcript with tool results pre-trimmed.
+        var transcript = ""
+        for m in dropped {
+            let body: String
+            if m.role == "tool" {
+                body = ContextBudget.trimToolResult(m.content, maxChars: 800)
+            } else if let calls = m.toolCalls, !calls.isEmpty, m.content.isEmpty {
+                body = "[called tools: " + calls.map { $0.name }.joined(separator: ", ") + "]"
+            } else {
+                body = m.content
+            }
+            if body.isEmpty { continue }
+            transcript += "\(m.role.uppercased()): \(body)\n\n"
+        }
+        if transcript.isEmpty { return nil }
+        // Hard cap the transcript fed to the summarizer so the call itself is safe.
+        transcript = ContextBudget.trimToolResult(transcript, maxChars: 8000)
+
+        let messages: [ChatMessage] = [
+            ChatMessage(role: "system", content:
+                "You compress conversation history. Produce a tight, factual recap "
+                + "(8 bullet points max) of the exchange below: the user's goals/"
+                + "questions, key facts found, decisions, and any open threads. No "
+                + "preamble, no tool call syntax — just the recap."),
+            ChatMessage(role: "user", content: "Recap this earlier conversation:\n\n\(transcript)"),
+        ]
+        do {
+            let turn = try await LLMClient.shared.chatCompletion(
+                messages: messages, tools: nil, stream: false,
+                onTextDelta: nil, forceThinkingOff: true)
+            let text = (turn.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? nil : text
+        } catch {
+            return nil  // structural recap fallback handles it
+        }
     }
 }
 
