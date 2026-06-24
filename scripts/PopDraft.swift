@@ -5252,6 +5252,7 @@ struct SettingsView: View {
         case general = "General"
         case actions = "Actions"
         case models = "Models"
+        case mcp = "MCP"
         case tts = "Text-to-Speech"
     }
 
@@ -5433,6 +5434,8 @@ struct SettingsView: View {
                     actionsSettingsTab
                 case .models:
                     modelsSettingsTab
+                case .mcp:
+                    MCPSettingsView(servers: $mcpServers)
                 case .tts:
                     ttsSettingsTab
                 }
@@ -5614,7 +5617,7 @@ struct SettingsView: View {
                     .cornerRadius(6)
 
                     if !mcpServers.isEmpty {
-                        Text("MCP servers (from config.json): \(mcpServers.map { $0.name }.joined(separator: ", "))")
+                        Text("MCP servers: \(mcpServers.map { $0.name }.joined(separator: ", ")) — manage in the MCP tab")
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
                     }
@@ -6916,6 +6919,189 @@ struct SettingsView: View {
         config.agentSettings = agent
         config.mcpServers = mcpServers
         onSave(config)
+    }
+}
+
+// MARK: - PR10: MCP servers settings (self-contained)
+
+/// Self-contained Settings section for managing MCP servers: add / edit /
+/// remove + enable, with one-click presets for common integrations. Binds
+/// directly to `SettingsView`'s `mcpServers` state, which `saveSettings()`
+/// already persists into `AppConfig.mcpServers`. Kept as its own struct so it
+/// merges cleanly with a parallel SettingsView overhaul (one `case .mcp`).
+struct MCPSettingsView: View {
+    @Binding var servers: [MCPServerConfig]
+    /// Index of the server being edited inline (nil = none / list view).
+    @State private var editingIndex: Int? = nil
+    @State private var draftName: String = ""
+    @State private var draftCommand: String = ""
+    @State private var draftArgs: String = ""   // space/newline-joined for editing
+    @State private var showPresetMenu: Bool = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("MCP servers")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Connect external tools (email, calendar, Slack, Notion, files, …) "
+                    + "so the agent can use them. Each runs as a local stdio process; its "
+                    + "tools appear to the agent namespaced as server__tool.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Existing servers.
+                if servers.isEmpty {
+                    Text("No MCP servers configured. Add one below or pick a preset.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(servers.indices, id: \.self) { i in
+                        serverRow(i)
+                    }
+                }
+
+                Divider().padding(.vertical, 4)
+
+                // Add / edit form.
+                if let idx = editingIndex {
+                    editForm(editingExisting: idx < servers.count)
+                } else {
+                    HStack(spacing: 8) {
+                        Button {
+                            beginAdd()
+                        } label: {
+                            Label("Add server", systemImage: "plus")
+                        }
+                        Menu("Presets") {
+                            ForEach(IntegrationCatalog.all.indices, id: \.self) { p in
+                                let cat = IntegrationCatalog.all[p]
+                                Button(cat.displayName) { addPreset(cat) }
+                            }
+                        }
+                        .frame(width: 110)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+        }
+    }
+
+    // MARK: Rows
+
+    @ViewBuilder
+    private func serverRow(_ i: Int) -> some View {
+        let s = servers[i]
+        HStack(alignment: .top, spacing: 10) {
+            Toggle("", isOn: Binding(
+                get: { i < servers.count ? servers[i].enabled : false },
+                set: { newVal in if i < servers.count { servers[i].enabled = newVal } }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(s.name.isEmpty ? "(unnamed)" : s.name)
+                    .font(.system(size: 12, weight: .medium))
+                Text(([s.command] + s.args).joined(separator: " "))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Button {
+                beginEdit(i)
+            } label: { Image(systemName: "pencil") }
+                .buttonStyle(.borderless)
+            Button {
+                if i < servers.count { servers.remove(at: i) }
+                if editingIndex == i { editingIndex = nil }
+            } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
+                .foregroundColor(.red)
+        }
+        .padding(8)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        .cornerRadius(6)
+    }
+
+    // MARK: Add / edit form
+
+    @ViewBuilder
+    private func editForm(editingExisting: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(editingExisting ? "Edit server" : "Add server")
+                .font(.system(size: 12, weight: .semibold))
+            TextField("Name (e.g. Gmail)", text: $draftName)
+                .textFieldStyle(.roundedBorder)
+            TextField("Command (e.g. npx)", text: $draftCommand)
+                .textFieldStyle(.roundedBorder)
+            TextField("Args (space-separated)", text: $draftArgs)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+            Text("Tip: many servers need a token or path supplied via the command "
+                + "args or the process environment — check the server's docs.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Cancel") { editingIndex = nil }
+                Button(editingExisting ? "Update" : "Add") { commitDraft() }
+                    .disabled(draftName.trimmingCharacters(in: .whitespaces).isEmpty
+                        || draftCommand.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        .cornerRadius(6)
+    }
+
+    // MARK: Actions
+
+    private func beginAdd() {
+        draftName = ""; draftCommand = ""; draftArgs = ""
+        editingIndex = servers.count    // sentinel: "new"
+    }
+
+    private func beginEdit(_ i: Int) {
+        guard i < servers.count else { return }
+        let s = servers[i]
+        draftName = s.name
+        draftCommand = s.command
+        draftArgs = s.args.joined(separator: " ")
+        editingIndex = i
+    }
+
+    private func addPreset(_ cat: IntegrationCatalog) {
+        // Don't duplicate an existing server of the same name.
+        if !servers.contains(where: { $0.name == cat.id }) {
+            servers.append(cat.preset)
+        }
+        // Open it for editing so the user can fill in any token/path immediately.
+        if let idx = servers.firstIndex(where: { $0.name == cat.id }) {
+            beginEdit(idx)
+        }
+    }
+
+    private func commitDraft() {
+        let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = draftCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !command.isEmpty else { return }
+        let args = draftArgs
+            .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+            .map(String.init)
+        let cfg = MCPServerConfig(name: name, command: command, args: args, enabled: true)
+        if let idx = editingIndex, idx < servers.count {
+            // Preserve the existing enabled state on edit.
+            var updated = cfg
+            updated.enabled = servers[idx].enabled
+            servers[idx] = updated
+        } else {
+            servers.append(cfg)
+        }
+        editingIndex = nil
     }
 }
 
@@ -11043,6 +11229,47 @@ struct ExtractTextTool: AgentTool {
     }
 }
 
+/// `suggest_integration` — given a capability the agent lacks a tool for
+/// (e.g. "email", "calendar", "slack", "read a file"), return a concrete,
+/// actionable suggestion: which MCP server connects it and how to add it in
+/// Settings → MCP. This is how the agent stays capability-aware instead of
+/// flatly refusing. Pure lookup over `IntegrationCatalog`; no network, no gate.
+struct SuggestIntegrationTool: AgentTool {
+    var spec: ToolSpec {
+        ToolSpec(
+            name: "suggest_integration",
+            description: "When the user asks for a capability you have NO tool for "
+                + "(email, calendar, Slack, Notion, local files, GitHub, …), call this "
+                + "with the capability to get the name of an MCP server that provides it "
+                + "and how to add it. Use this instead of refusing; then relay the "
+                + "suggestion to the user.",
+            parametersSchema: [
+                "type": "object",
+                "properties": [
+                    "capability": [
+                        "type": "string",
+                        "description": "The capability the user wants, e.g. 'read my email', 'check my calendar', 'send a slack message', 'read a file'.",
+                    ],
+                ],
+                "required": ["capability"],
+            ])
+    }
+
+    func invoke(_ args: JSONObject) async throws -> String {
+        let capability = (args.dictionary["capability"] as? String) ?? ""
+        guard !capability.isEmpty else { return "Error: 'capability' is required." }
+        if let match = IntegrationCatalog.match(capability) {
+            return match.suggestionText()
+        }
+        // Unknown capability: still don't refuse — point at the generic path.
+        let known = IntegrationCatalog.all.map { $0.displayName }.joined(separator: ", ")
+        return "I don't have a built-in connector for \"\(capability)\" yet, but you can "
+            + "connect almost any service by adding an MCP server in Settings → MCP. "
+            + "Built-in presets cover: \(known). For other services, search for an "
+            + "\"<service> MCP server\" and add its command there."
+    }
+}
+
 // MARK: - PR9: Mac-control confirmation seam
 
 /// The seam between a Mac-control tool (running off-main inside `ToolRunner`)
@@ -11525,12 +11752,22 @@ enum MCPManager {
             let client = MCPClient(serverName: cfg.name)
             do {
                 let specs = try await client.start(command: cfg.command, args: cfg.args)
+                var registered = 0
                 for s in specs {
                     let namespaced = s.toToolSpec(serverName: cfg.name)
+                    // SAFETY: never let an MCP tool shadow a built-in (esp. the
+                    // confirm-gated run_shell / run_applescript). Namespacing makes
+                    // a collision unlikely, but a server named to collide must be
+                    // rejected, not allowed to hijack a privileged tool.
+                    guard !BuiltinToolNames.isReserved(namespaced.name) else {
+                        Logger.shared.error("[mcp] '\(cfg.name)' tool '\(s.name)' skipped: '\(namespaced.name)' collides with a built-in tool")
+                        continue
+                    }
                     tools.append(MCPTool(client: client, originalName: s.name, toolSpec: namespaced))
+                    registered += 1
                 }
                 clients.append(client)
-                Logger.shared.info("[mcp] '\(cfg.name)' started; \(specs.count) tools")
+                Logger.shared.info("[mcp] '\(cfg.name)' started; \(registered)/\(specs.count) tools registered")
             } catch {
                 client.shutdown()
                 Logger.shared.error("[mcp] '\(cfg.name)' skipped: \(error.localizedDescription)")
@@ -11549,9 +11786,12 @@ struct PopDraftAgent {
     /// Default system prompt seeding the agent.
     static let systemPrompt = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
-    and read the web and to transform text. Think step by step. Prefer to verify \
-    facts with the web tools when a question needs current or external \
-    information; otherwise answer directly.
+    and read the web and to transform text. You can also connect to external \
+    services (email, calendar, Slack, Notion, files, GitHub, …) through MCP \
+    servers the user has configured — each connected server's tools appear to you \
+    namespaced as `<server>__<tool>`. Think step by step. Prefer to verify facts \
+    with the web tools when a question needs current or external information; \
+    otherwise answer directly.
 
     How to use tools well:
     - When you call a tool, wait for its result before continuing.
@@ -11560,6 +11800,18 @@ struct PopDraftAgent {
     search over and over — if a search returns results, READ them and answer.
     - If a search or page returned relevant facts, base your answer on them; do \
     not stop at the raw tool output.
+    - If the user has a connected MCP tool that fits the request (a \
+    `<server>__<tool>` tool), USE it — that is the whole point of connecting it.
+
+    CAPABILITY-AWARENESS — IMPORTANT. If the user asks for something you have NO \
+    tool for (e.g. "read my email", "what's on my calendar", "post to Slack", \
+    "open this Notion page", "read a file on disk"), DO NOT flatly refuse and do \
+    NOT say you simply cannot do it. Instead, call `suggest_integration` with the \
+    capability, then tell the user — in plain language — that you can connect to \
+    that service via an MCP server, name the specific server (e.g. the Gmail, \
+    Google Calendar, Slack, or Notion MCP server), and tell them to add it in \
+    Settings → MCP (mention the one-click preset). Be concrete and actionable, \
+    not a generic "I can't help with that".
 
     ALWAYS finish your turn with a clear, direct, natural-language answer to the \
     user's question, synthesized from what you found. Never end with only a tool \
@@ -11581,8 +11833,10 @@ struct PopDraftAgent {
         confirmer: (any MacControlConfirmer)? = nil
     ) async -> (registry: ToolRegistry, mcpClients: [MCPClient]) {
         let registry = ToolRegistry()
-        // Text tools are always available (no network).
-        await registry.register([SummarizeTextTool(), ExtractTextTool()])
+        // Text tools + the capability-suggestion tool are always available (no
+        // network, no gate). `suggest_integration` lets the agent stay
+        // capability-aware (propose connecting an MCP) instead of flatly refusing.
+        await registry.register([SummarizeTextTool(), ExtractTextTool(), SuggestIntegrationTool()])
         if config.agentSettings.enableWebSearch {
             await registry.register([
                 WebSearchTool(), WebOpenTool(), WebReadTool(),

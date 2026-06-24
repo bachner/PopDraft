@@ -20,6 +20,7 @@ TESTS=(
   "tests/test-agentloop.swift scripts/Core.swift"
   "tests/test-maccontrol.swift scripts/Core.swift"
   "tests/test-ippinning.swift scripts/Core.swift"
+  "tests/test-mcp.swift scripts/Core.swift"
 )
 
 OVERALL_EXIT=0

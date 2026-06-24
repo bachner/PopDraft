@@ -3346,3 +3346,126 @@ extension MCPProtocol {
         return obj["id"] as? Int
     }
 }
+
+// =====================================================================
+// MARK: - Integration catalog (capability → MCP server)
+//
+// PR10: makes the agent *capability-aware*. When the user asks for something
+// the agent has no tool for (email, calendar, Slack, Notion, files, …), the
+// agent should NOT flatly refuse — it should explain it can connect via an MCP
+// server and name a concrete one, pointing the user at Settings → MCP.
+//
+// This is the single source of truth for BOTH:
+//   - the `suggest_integration(capability)` agent tool, and
+//   - the one-click presets in the MCP settings UI.
+// Pure + testable; no AppKit, no process spawning.
+// =====================================================================
+
+/// A known integration the app can connect to via an MCP server. Carries enough
+/// to (a) tell the user which server to add and how, and (b) prefill the add-MCP
+/// form as a one-click preset.
+struct IntegrationCatalog {
+    /// Canonical id (also the suggested MCP server name).
+    let id: String
+    /// Human-facing label, e.g. "Gmail".
+    let displayName: String
+    /// Capability keywords that should map to this integration (lowercased).
+    let keywords: [String]
+    /// The MCP server command to run (e.g. "npx").
+    let command: String
+    /// Arguments for the command (e.g. ["-y", "@modelcontextprotocol/server-gmail"]).
+    let args: [String]
+    /// Short note on what the user must supply (token, path, …) — empty if none.
+    let setupNote: String
+
+    /// The full registry of known integrations. Commands use `npx -y …` so a bare
+    /// machine can fetch the package on first run; the user supplies any token via
+    /// the server's own auth flow / env (noted in `setupNote`).
+    static let all: [IntegrationCatalog] = [
+        IntegrationCatalog(
+            id: "Gmail", displayName: "Gmail",
+            keywords: ["email", "e-mail", "mail", "gmail", "inbox", "message", "messages",
+                       "read my email", "send an email", "compose"],
+            command: "npx", args: ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+            setupNote: "Runs a one-time Google OAuth in your browser on first use."),
+        IntegrationCatalog(
+            id: "Google_Calendar", displayName: "Google Calendar",
+            keywords: ["calendar", "event", "events", "schedule", "meeting", "meetings",
+                       "appointment", "availability", "free time", "agenda"],
+            command: "npx", args: ["-y", "@cocal/google-calendar-mcp"],
+            setupNote: "Set GOOGLE_OAUTH_CREDENTIALS to your OAuth client JSON path."),
+        IntegrationCatalog(
+            id: "Slack", displayName: "Slack",
+            keywords: ["slack", "channel", "channels", "dm", "direct message", "workspace"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-slack"],
+            setupNote: "Set SLACK_BOT_TOKEN and SLACK_TEAM_ID."),
+        IntegrationCatalog(
+            id: "Notion", displayName: "Notion",
+            keywords: ["notion", "wiki", "doc", "docs", "page", "pages", "knowledge base", "database"],
+            command: "npx", args: ["-y", "@notionhq/notion-mcp-server"],
+            setupNote: "Set NOTION_API_KEY to your internal integration token."),
+        IntegrationCatalog(
+            id: "Filesystem", displayName: "Local Files",
+            keywords: ["file", "files", "filesystem", "folder", "directory", "disk",
+                       "read a file", "write a file", "local files", "documents"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "$HOME"],
+            setupNote: "Replace $HOME with the folder you want to grant access to."),
+        IntegrationCatalog(
+            id: "GitHub", displayName: "GitHub",
+            keywords: ["github", "repo", "repository", "pull request", "pr", "issue", "issues", "commit"],
+            command: "npx", args: ["-y", "@modelcontextprotocol/server-github"],
+            setupNote: "Set GITHUB_PERSONAL_ACCESS_TOKEN."),
+    ]
+
+    /// Find the best integration for a free-text capability ask. Matches against
+    /// keywords (substring, case-insensitive), preferring the longest matching
+    /// keyword so "google calendar" beats a bare "google". Returns nil if nothing
+    /// in the catalog plausibly covers it.
+    static func match(_ capability: String) -> IntegrationCatalog? {
+        let q = capability.lowercased()
+        guard !q.isEmpty else { return nil }
+        var best: (entry: IntegrationCatalog, score: Int)?
+        for entry in all {
+            for kw in entry.keywords where q.contains(kw) {
+                let score = kw.count
+                if best == nil || score > best!.score {
+                    best = (entry, score)
+                }
+            }
+        }
+        return best?.entry
+    }
+
+    /// The preset `MCPServerConfig` for this integration (disabled by default so
+    /// the user can fill in any token/path before enabling it).
+    var preset: MCPServerConfig {
+        MCPServerConfig(name: id, command: command, args: args, enabled: false)
+    }
+
+    /// A concrete, actionable one-line suggestion the agent can speak back, e.g.
+    /// "I can connect to your Gmail via the Gmail MCP server. Add it in
+    /// Settings → MCP (command: `npx -y …`). …"
+    func suggestionText() -> String {
+        let cmd = ([command] + args).joined(separator: " ")
+        var s = "I can connect to \(displayName) for you via an MCP server. "
+        s += "Open Settings → MCP and add the \"\(displayName)\" server "
+        s += "(or pick its one-click preset): command `\(cmd)`."
+        if !setupNote.isEmpty { s += " \(setupNote)" }
+        return s
+    }
+}
+
+/// Names of the built-in agent tools that an MCP server's tool must NEVER shadow.
+/// MCP tools are namespaced `<server>__<tool>`, so a collision is unlikely, but
+/// we belt-and-suspenders guard the confirm-gated Mac-control tools (and the
+/// other built-ins) so a malicious/buggy server can't hijack them.
+enum BuiltinToolNames {
+    static let reserved: Set<String> = [
+        "run_shell", "run_applescript",
+        "summarize_text", "extract_text", "suggest_integration",
+        "web_search", "web_open", "web_read", "web_screenshot", "web_extract",
+    ]
+
+    /// True if `name` would shadow a built-in tool and must be rejected.
+    static func isReserved(_ name: String) -> Bool { reserved.contains(name) }
+}
