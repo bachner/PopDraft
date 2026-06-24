@@ -200,33 +200,37 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                         label: ollamaModel, isActive: isActive(.ollama, ollamaModel))
         ]))
 
-        // OpenAI — catalog (minus the "Custom…" sentinel) + any user/configured
-        // models; disabled when no key is set.
+        // OpenAI — ONLY when a key is configured (otherwise it isn't pickable
+        // here; "Other model…" → Settings is the way to add a key). Shows the
+        // configured model + any user-added OpenAI models.
         let openaiKey = (cfg.openaiAPIKey.isEmpty ? (cfg.providerKeys["openai"] ?? "") : cfg.openaiAPIKey)
-        var openaiModels = LLMConfig.openaiModels.filter { $0 != "Custom..." }
-        for m in cfg.userModels where m.provider == "openai" && !openaiModels.contains(m.name) {
-            openaiModels.append(m.name)
+        if !openaiKey.isEmpty {
+            var openaiModels = LLMConfig.openaiModels.filter { $0 != "Custom..." }
+            for m in cfg.userModels where m.provider == "openai" && !openaiModels.contains(m.name) {
+                openaiModels.append(m.name)
+            }
+            if !openaiModels.contains(cfg.openaiModel) { openaiModels.insert(cfg.openaiModel, at: 0) }
+            groups.append(ModelChoiceGroup(
+                provider: .openai, needsKey: false,
+                choices: openaiModels.map { m in
+                    ModelChoice(provider: .openai, model: m, label: m, isActive: isActive(.openai, m))
+                }))
         }
-        if !openaiModels.contains(cfg.openaiModel) { openaiModels.insert(cfg.openaiModel, at: 0) }
-        groups.append(ModelChoiceGroup(
-            provider: .openai, needsKey: openaiKey.isEmpty,
-            choices: openaiModels.map { m in
-                ModelChoice(provider: .openai, model: m, label: m, isActive: isActive(.openai, m))
-            }))
 
-        // Claude — catalog (minus "Custom…") + any user/configured models;
-        // disabled when no key is set.
+        // Claude — ONLY when a key is configured.
         let claudeKey = (cfg.claudeAPIKey.isEmpty ? (cfg.providerKeys["anthropic"] ?? "") : cfg.claudeAPIKey)
-        var claudeModels = LLMConfig.claudeModels.filter { $0 != "Custom..." }
-        for m in cfg.userModels where m.provider == "claude" && !claudeModels.contains(m.name) {
-            claudeModels.append(m.name)
+        if !claudeKey.isEmpty {
+            var claudeModels = LLMConfig.claudeModels.filter { $0 != "Custom..." }
+            for m in cfg.userModels where m.provider == "claude" && !claudeModels.contains(m.name) {
+                claudeModels.append(m.name)
+            }
+            if !claudeModels.contains(cfg.claudeModel) { claudeModels.insert(cfg.claudeModel, at: 0) }
+            groups.append(ModelChoiceGroup(
+                provider: .claude, needsKey: false,
+                choices: claudeModels.map { m in
+                    ModelChoice(provider: .claude, model: m, label: m, isActive: isActive(.claude, m))
+                }))
         }
-        if !claudeModels.contains(cfg.claudeModel) { claudeModels.insert(cfg.claudeModel, at: 0) }
-        groups.append(ModelChoiceGroup(
-            provider: .claude, needsKey: claudeKey.isEmpty,
-            choices: claudeModels.map { m in
-                ModelChoice(provider: .claude, model: m, label: m, isActive: isActive(.claude, m))
-            }))
 
         return groups
     }
@@ -2146,6 +2150,9 @@ struct ModelMenuPill: View {
 
     var body: some View {
         Menu {
+            // Only AVAILABLE models are listed: the local model, the Ollama model,
+            // and any cloud provider that has a key configured. To use a different
+            // model, "Other model…" opens Settings to add a key / pick one.
             ForEach(AgentChatViewModel.modelChoiceGroups()) { group in
                 Section(group.provider.displayName) {
                     ForEach(group.choices) { choice in
@@ -2155,15 +2162,17 @@ struct ModelMenuPill: View {
                             if choice.isActive {
                                 Label(choice.label, systemImage: "checkmark")
                             } else {
-                                Text(group.needsKey ? "\(choice.label) — needs key in Settings"
-                                                     : choice.label)
+                                Text(choice.label)
                             }
                         }
-                        // A cloud provider with no key can't make a request — keep
-                        // it visible (so the user knows it exists) but un-pickable.
-                        .disabled(group.needsKey && !choice.isActive)
                     }
                 }
+            }
+            Divider()
+            Button {
+                (NSApplication.shared.delegate as? AppDelegate)?.showSettings()
+            } label: {
+                Label("Other model…  (opens Settings)", systemImage: "slider.horizontal.3")
             }
         } label: {
             HStack(spacing: 5) {
