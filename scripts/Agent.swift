@@ -1174,6 +1174,7 @@ enum BuiltinTools {
         MacControlTools.register() // run_shell / run_applescript (gated on enableMacControl)
         LocalActionTools.register() // current_datetime / calculator / clipboard_* / current_context / open_app_or_url
         VisionTools.register()     // see_image (local path / image URL / screenshot:<url>) — vision
+        FileTools.register()       // read_document (confirm-gated local document/PDF reader)
     }
 
     /// Arm the catalog's install hook. Safe to call multiple times; the catalog
@@ -1198,6 +1199,9 @@ struct PopDraftAgent {
     (clipboard_read / clipboard_write), see the frontmost app + the user's text \
     selection (current_context), and open an app or URL (open_app_or_url) — the \
     clipboard write and open actions ask the user to confirm before they run. \
+    You can also READ a local document the user names (text, code, markdown, json, \
+    csv, PDF, or RTF) via read_document (confirm-gated), then summarize or answer \
+    questions about it. \
     You can also connect to external services (email, calendar, \
     Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
     each connected server's tools appear to you namespaced as `<server>__<tool>`. \
