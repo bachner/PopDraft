@@ -1787,6 +1787,9 @@ struct MCPSettingsView: View {
     @State private var draftCommand: String = ""
     @State private var draftArgs: String = ""   // space/newline-joined for editing
     @State private var showPresetMenu: Bool = false
+    /// Per-server connection-probe results, keyed by server NAME (stable across
+    /// index shifts when a row is removed). Filled by the "Test" action.
+    @State private var probeResults: [String: MCPProbeResult] = [:]
 
     var body: some View {
         ScrollView {
@@ -1844,6 +1847,7 @@ struct MCPSettingsView: View {
     @ViewBuilder
     private func serverRow(_ i: Int) -> some View {
         let s = servers[i]
+        let probe = probeResults[s.name] ?? .untested
         HStack(alignment: .top, spacing: 10) {
             Toggle("", isOn: Binding(
                 get: { i < servers.count ? servers[i].enabled : false },
@@ -1851,8 +1855,15 @@ struct MCPSettingsView: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
             VStack(alignment: .leading, spacing: 2) {
-                Text(s.name.isEmpty ? "(unnamed)" : s.name)
-                    .font(.system(size: 12, weight: .medium))
+                HStack(spacing: 6) {
+                    statusDot(probe)
+                    Text(s.name.isEmpty ? "(unnamed)" : s.name)
+                        .font(.system(size: 12, weight: .medium))
+                    Text(probe.label)
+                        .font(.system(size: 10))
+                        .foregroundColor(probe.isReachable ? .green
+                            : (probe.isFailure ? .orange : .secondary))
+                }
                 Text(([s.command] + s.args).joined(separator: " "))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -1860,6 +1871,10 @@ struct MCPSettingsView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            Button("Test") { testServer(s) }
+                .buttonStyle(.borderless)
+                .font(.system(size: 11))
+                .disabled(probe.state == .probing)
             Button {
                 beginEdit(i)
             } label: { Image(systemName: "pencil") }
@@ -1874,6 +1889,31 @@ struct MCPSettingsView: View {
         .padding(8)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
         .cornerRadius(6)
+    }
+
+    /// A small status dot: green = reachable, orange = unreachable / needs auth,
+    /// gray = not yet tested, spinner while probing.
+    @ViewBuilder
+    private func statusDot(_ probe: MCPProbeResult) -> some View {
+        if probe.state == .probing {
+            ProgressView().scaleEffect(0.4).frame(width: 8, height: 8)
+        } else {
+            Circle()
+                .fill(probe.isReachable ? Color.green
+                    : (probe.isFailure ? Color.orange : Color.gray.opacity(0.5)))
+                .frame(width: 8, height: 8)
+        }
+    }
+
+    /// Run a one-shot, time-bounded handshake against the server and record the
+    /// result. Async + bounded (MCPManager.probe) so a hung server can't freeze
+    /// Settings; the @MainActor Task only mutates @State on the main actor.
+    private func testServer(_ s: MCPServerConfig) {
+        probeResults[s.name] = .probing
+        Task { @MainActor in
+            let result = await MCPManager.probe(s)
+            probeResults[s.name] = result
+        }
     }
 
     // MARK: Add / edit form

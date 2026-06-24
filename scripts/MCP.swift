@@ -226,34 +226,301 @@ struct MCPTool: AgentTool {
 /// the caller can shut them down when the turn ends.
 @MainActor
 enum MCPManager {
-    static func buildTools(servers: [MCPServerConfig]) async -> (tools: [any AgentTool], clients: [MCPClient]) {
-        var tools: [any AgentTool] = []
-        var clients: [MCPClient] = []
-        for cfg in servers where cfg.enabled && !cfg.command.isEmpty {
-            let client = MCPClient(serverName: cfg.name)
-            do {
-                let specs = try await client.start(command: cfg.command, args: MCPClient.expandedArgs(cfg.args))
-                var registered = 0
-                for s in specs {
-                    let namespaced = s.toToolSpec(serverName: cfg.name)
-                    // SAFETY: never let an MCP tool shadow a built-in (esp. the
-                    // confirm-gated run_shell / run_applescript). Namespacing makes
-                    // a collision unlikely, but a server named to collide must be
-                    // rejected, not allowed to hijack a privileged tool.
-                    guard !BuiltinToolNames.isReserved(namespaced.name) else {
-                        Logger.shared.error("[mcp] '\(cfg.name)' tool '\(s.name)' skipped: '\(namespaced.name)' collides with a built-in tool")
-                        continue
-                    }
-                    tools.append(MCPTool(client: client, originalName: s.name, toolSpec: namespaced))
-                    registered += 1
+    /// Start ONE server and turn its advertised tools into namespaced
+    /// `MCPTool`s. Returns nil if the server failed to start/handshake (it is
+    /// shut down + logged). Shared by the serial-output assembly and the live
+    /// `add_mcp_server` path.
+    static func startServer(_ cfg: MCPServerConfig) async -> (client: MCPClient, tools: [any AgentTool])? {
+        let client = MCPClient(serverName: cfg.name)
+        do {
+            let specs = try await client.start(command: cfg.command, args: MCPClient.expandedArgs(cfg.args))
+            var tools: [any AgentTool] = []
+            for s in specs {
+                let namespaced = s.toToolSpec(serverName: cfg.name)
+                // SAFETY: never let an MCP tool shadow a built-in (esp. the
+                // confirm-gated run_shell / run_applescript). Namespacing makes a
+                // collision unlikely, but a server named to collide must be
+                // rejected, not allowed to hijack a privileged tool.
+                guard !BuiltinToolNames.isReserved(namespaced.name) else {
+                    Logger.shared.error("[mcp] '\(cfg.name)' tool '\(s.name)' skipped: '\(namespaced.name)' collides with a built-in tool")
+                    continue
                 }
-                clients.append(client)
-                Logger.shared.info("[mcp] '\(cfg.name)' started; \(registered)/\(specs.count) tools registered")
-            } catch {
-                client.shutdown()
-                Logger.shared.error("[mcp] '\(cfg.name)' skipped: \(error.localizedDescription)")
+                tools.append(MCPTool(client: client, originalName: s.name, toolSpec: namespaced))
+            }
+            Logger.shared.info("[mcp] '\(cfg.name)' started; \(tools.count)/\(specs.count) tools registered")
+            return (client, tools)
+        } catch {
+            client.shutdown()
+            Logger.shared.error("[mcp] '\(cfg.name)' skipped: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Build the tools for all enabled servers. Startups run CONCURRENTLY (one
+    /// task per server) so a slow/failing server (e.g. Gmail awaiting OAuth) can't
+    /// delay the others — but the OUTPUT stays ordered by the config list so the
+    /// agent's `tools` array is deterministic. The live clients are returned so the
+    /// caller can shut them down when the turn ends.
+    static func buildTools(servers: [MCPServerConfig]) async -> (tools: [any AgentTool], clients: [MCPClient]) {
+        let enabled = servers.enumerated().filter { $0.element.enabled && !$0.element.command.isEmpty }
+        guard !enabled.isEmpty else { return ([], []) }
+
+        // Run each server's handshake on its own task, keyed by config index so we
+        // can re-order the results deterministically afterwards.
+        var byIndex: [Int: (client: MCPClient, tools: [any AgentTool])] = [:]
+        await withTaskGroup(of: (Int, (client: MCPClient, tools: [any AgentTool])?).self) { group in
+            for (idx, cfg) in enabled {
+                group.addTask { (idx, await startServer(cfg)) }
+            }
+            for await (idx, result) in group {
+                if let result = result { byIndex[idx] = result }
             }
         }
+
+        var tools: [any AgentTool] = []
+        var clients: [MCPClient] = []
+        for (idx, _) in enabled {
+            guard let r = byIndex[idx] else { continue }
+            clients.append(r.client)
+            tools.append(contentsOf: r.tools)
+        }
         return (tools, clients)
+    }
+
+    /// One-shot, time-bounded connection probe for the Settings "Test" action:
+    /// start the server, count its advertised tools, then shut it down. Bounded by
+    /// `timeoutMs` so a hung/awaiting-auth server can't freeze Settings. Pure-result
+    /// (`MCPProbeResult`) so the UI mapping stays testable.
+    static func probe(_ cfg: MCPServerConfig, timeoutMs: Int = 12000) async -> MCPProbeResult {
+        guard !cfg.command.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return MCPProbeResult.from(toolCount: nil, error: "no command configured")
+        }
+        let client = MCPClient(serverName: cfg.name)
+        defer { client.shutdown() }
+        do {
+            let specs = try await client.start(
+                command: cfg.command, args: MCPClient.expandedArgs(cfg.args), timeoutMs: timeoutMs)
+            return MCPProbeResult.from(toolCount: specs.count, error: nil)
+        } catch {
+            return MCPProbeResult.from(toolCount: nil, error: error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - PR12: live MCP client holder (teardown set, appended to mid-turn)
+
+/// A reference holder for the live `MCPClient`s a turn owns. It exists (instead
+/// of a plain returned `[MCPClient]`) so a server STARTED MID-TURN by
+/// `add_mcp_server` is tracked in the SAME set the turn's teardown shuts down —
+/// a value-type array returned from `buildRegistry` couldn't see a later append.
+/// `@MainActor`: appended from the installer (main actor) and drained by the
+/// turn's `defer`, also on the main actor.
+@MainActor
+final class MCPClientHolder {
+    private(set) var clients: [MCPClient] = []
+    func append(_ client: MCPClient) { clients.append(client) }
+    func append(contentsOf newClients: [MCPClient]) { clients.append(contentsOf: newClients) }
+    func shutdownAll() { for c in clients { c.shutdown() }; clients.removeAll() }
+}
+
+// MARK: - PR12: live MCP installer (the add_mcp_server execution seam)
+
+/// The seam `add_mcp_server` uses to actually SET UP a server in the running
+/// session: it (a) persists the new `MCPServerConfig` into `AppConfig.mcpServers`,
+/// (b) starts the server live and registers its tools INTO THE CURRENTLY RUNNING
+/// agent `ToolRegistry` (so they're usable in the same turn), and (c) tracks the
+/// live client so the turn's teardown shuts it down.
+///
+/// `@MainActor`: it owns the live `[MCPClient]` array that `PopDraftAgent.run`'s
+/// `defer` shuts down on the main actor, and persistence is cheap. The actual
+/// confirm-gate + denylist run in `AddMcpServerTool.invoke` BEFORE this is called.
+@MainActor
+final class MCPServerInstaller {
+    /// The live registry new tools are registered into (the same instance the
+    /// loop re-reads each iteration).
+    let registry: ToolRegistry
+    /// Where to persist `AppConfig` (so a future turn / the Settings UI sees it).
+    let configDir: String
+    /// Appends a started client to the turn's shutdown list. Keeps the installer
+    /// from owning teardown policy — `PopDraftAgent.run` does.
+    private let trackClient: @MainActor (MCPClient) -> Void
+
+    init(registry: ToolRegistry, configDir: String, trackClient: @escaping @MainActor (MCPClient) -> Void) {
+        self.registry = registry
+        self.configDir = configDir
+        self.trackClient = trackClient
+    }
+
+    /// The outcome relayed back to the model.
+    enum InstallResult {
+        case started(toolNames: [String])     // started + registered N tools
+        case addedNotReachable(String)        // persisted, but handshake failed
+    }
+
+    /// Persist + start `cfg` and register its tools into the live registry.
+    /// `cfg` has already passed `MCPInstallGuard.validate` and the user's confirm.
+    func install(_ cfg: MCPServerConfig) async -> InstallResult {
+        // (b) Persist into config first so the server survives the session even if
+        // the live handshake then times out (the user can finish auth + it loads
+        // next time). Replace any existing server of the same name.
+        var config = AppConfig.load(dir: configDir)
+        if let i = config.mcpServers.firstIndex(where: { $0.name == cfg.name }) {
+            config.mcpServers[i] = cfg
+        } else {
+            config.mcpServers.append(cfg)
+        }
+        _ = config.save(to: configDir)
+
+        // (c) Start live + register into the running registry.
+        guard let started = await MCPManager.startServer(cfg) else {
+            return .addedNotReachable(
+                "Added '\(cfg.name)' to your MCP servers and saved it, but it did not "
+                + "connect just now (handshake timed out / failed). It may need a one-time "
+                + "auth or setup step — check Settings → MCP and use Test. It will be tried "
+                + "again next session.")
+        }
+        trackClient(started.client)
+        await registry.register(started.tools)
+        let names = started.tools.map { $0.spec.name }
+        return .started(toolNames: names)
+    }
+}
+
+// MARK: - PR12: add_mcp_server agent tool (confirm-gated)
+
+/// `add_mcp_server` — lets the agent INSTALL + ENABLE a new MCP server itself.
+/// Confirm-gated through the SAME `MacControlConfirmer` seam as `run_shell`: the
+/// agent PROPOSES the exact `command args`; nothing spawns until the user
+/// Approves (or Edits). The hard `MacControlGuard` denylist applies so it can
+/// never `curl|sh`, `sudo`, etc. On approval it persists the server and starts it
+/// live, registering the discovered tools into the running registry so the agent
+/// can USE them in the same turn.
+///
+/// `@unchecked Sendable`: `confirmer` and `installer` are `@MainActor`-isolated
+/// reference types, only ever touched via `await` (i.e. hopped to the MainActor);
+/// `settings` is a value type. No mutable shared state crosses threads. Mirrors
+/// the same rationale as `MacControlGate`.
+struct AddMcpServerTool: AgentTool, @unchecked Sendable {
+    let confirmer: (any MacControlConfirmer)?
+    let installer: MCPServerInstaller?
+    let settings: AgentSettings
+
+    var spec: ToolSpec {
+        ToolSpec(
+            name: "add_mcp_server",
+            description: "Install and enable a new MCP server so you gain NEW tools you "
+                + "don't currently have (e.g. a weather, maps, database, or service "
+                + "connector). Propose the launch command; the user must Approve before "
+                + "anything is installed/run (you are PROPOSING, not executing). On approval "
+                + "the server starts and its tools become available to you in THIS turn — "
+                + "call them next. Prefer an IntegrationCatalog preset's command when one "
+                + "fits; otherwise use web_search to find the right npx/uvx package first. "
+                + "Do NOT use this for local file/command/code work — use run_shell for that.",
+            parametersSchema: [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string",
+                             "description": "A short server name (used as the tool namespace, e.g. 'Weather')."],
+                    "command": ["type": "string",
+                                "description": "The launch command, e.g. 'npx' or 'uvx'."],
+                    "args": ["type": "array", "items": ["type": "string"],
+                             "description": "Command arguments, e.g. ['-y', '@modelcontextprotocol/server-...']."],
+                    "description": ["type": "string",
+                                    "description": "One-line plain-English note on what this server adds (for the approval card)."],
+                ],
+                "required": ["name", "command"],
+            ])
+    }
+
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let name = (d["name"] as? String) ?? ""
+        let command = (d["command"] as? String) ?? ""
+        let argsList = (d["args"] as? [String])
+            ?? (d["args"] as? [Any])?.compactMap { $0 as? String }
+            ?? []
+        let note = (d["description"] as? String) ?? ""
+
+        // (a) PURE validation + denylist (same hard block as run_shell).
+        switch MCPInstallGuard.validate(name: name, command: command, args: argsList) {
+        case .invalid(let reason):
+            return "Error: cannot add MCP server — \(reason)."
+        case .denied(let reason):
+            Logger.shared.error("[mcp] add_mcp_server DENIED by denylist (\(reason)): \(MCPInstallGuard.commandLine(command: command, args: argsList))")
+            return "Error: that install command is blocked by the safety denylist (\(reason)). "
+                + "It was NOT run. Propose a safer command."
+        case .ok(let cfg):
+            // Headless/eval dry-run: never spawn — record "would install" and return,
+            // exactly like the Mac-control gate does.
+            if settings.macControlDryRun {
+                let line = MCPInstallGuard.commandLine(command: cfg.command, args: cfg.args)
+                Logger.shared.info("[mcp] DRY-RUN would install MCP server '\(cfg.name)': \(line)")
+                return "Dry-run: would install and enable MCP server '\(cfg.name)' "
+                    + "(\(line)). (Mac-control dry-run mode is on, so nothing was installed/run.)"
+            }
+            // (b) Confirm gate — same seam as run_shell. No confirmer (headless UI)
+            // → structurally deny.
+            guard let confirmer = confirmer, let installer = installer else {
+                return "Error: no confirmation UI is available, so the MCP server was NOT installed."
+            }
+            let line = MCPInstallGuard.commandLine(command: cfg.command, args: cfg.args)
+            let explanation = note.isEmpty
+                ? "Install and run a new MCP server to gain its tools."
+                : note
+            let req = ConfirmationRequest(
+                id: UUID().uuidString, kind: .shell,
+                command: "Add MCP server '\(cfg.name)': \(line)",
+                explanation: explanation)
+            let decision = await confirmer.requestConfirmation(req)
+            let approved: MCPServerConfig
+            switch decision {
+            case .deny:
+                Logger.shared.info("[mcp] user DENIED add_mcp_server '\(cfg.name)'")
+                return "The user declined to add that MCP server. It was NOT installed. "
+                    + "Do not retry it; ask the user what they'd prefer or continue without it."
+            case .approve:
+                approved = cfg
+            case .edit(let edited):
+                // The user can edit the "<command> <args…>" line. Re-validate the
+                // edited launch through the denylist (Edit can't smuggle danger).
+                let editedLine = Self.stripPrefix(edited, server: cfg.name)
+                let parts = editedLine
+                    .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+                guard let editedCmd = parts.first else {
+                    return "Error: the edited install command was empty. Nothing was run."
+                }
+                let editedArgs = Array(parts.dropFirst())
+                switch MCPInstallGuard.validate(name: cfg.name, command: editedCmd, args: editedArgs) {
+                case .ok(let c2): approved = c2
+                case .denied(let reason):
+                    return "Error: the edited install command is blocked by the safety denylist (\(reason)). It was NOT run."
+                case .invalid(let reason):
+                    return "Error: the edited install command is invalid — \(reason)."
+                }
+            }
+
+            Logger.shared.info("[mcp] EXECUTING add_mcp_server '\(approved.name)': \(MCPInstallGuard.commandLine(command: approved.command, args: approved.args))")
+            switch await installer.install(approved) {
+            case .started(let names):
+                if names.isEmpty {
+                    return "Added and started '\(approved.name)', but it advertised no tools. "
+                        + "It may need configuration; check Settings → MCP."
+                }
+                return "Installed and enabled MCP server '\(approved.name)'. New tools now "
+                    + "available to you this turn: \(names.joined(separator: ", ")). "
+                    + "Call them to fulfill the request."
+            case .addedNotReachable(let msg):
+                return msg
+            }
+        }
+    }
+
+    /// Strip the "Add MCP server '<name>': " prefix the confirm card shows, so an
+    /// untouched-then-edited command still parses cleanly.
+    static func stripPrefix(_ edited: String, server: String) -> String {
+        let prefix = "Add MCP server '\(server)': "
+        let s = edited.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix(prefix) { return String(s.dropFirst(prefix.count)) }
+        return s
     }
 }

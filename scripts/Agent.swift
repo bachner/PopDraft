@@ -1086,6 +1086,7 @@ enum BuiltinTools {
         TextTools.register()       // summarize_text / extract_text / suggest_integration
         WebTools.register()        // web_* + browser_*  (gated on enableWebSearch)
         MacControlTools.register() // run_shell / run_applescript (gated on enableMacControl)
+        LocalActionTools.register() // current_datetime / calculator / clipboard_* / current_context / open_app_or_url
     }
 
     /// Arm the catalog's install hook. Safe to call multiple times; the catalog
@@ -1105,7 +1106,12 @@ struct PopDraftAgent {
     static let systemPrompt = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
     and read the web, to DRIVE a live browser (navigate, click, type, read), and \
-    to transform text. You can also connect to external services (email, calendar, \
+    to transform text. You also have local OS tools: get the current date/time \
+    (current_datetime), do exact math (calculator), read/write the clipboard \
+    (clipboard_read / clipboard_write), see the frontmost app + the user's text \
+    selection (current_context), and open an app or URL (open_app_or_url) — the \
+    clipboard write and open actions ask the user to confirm before they run. \
+    You can also connect to external services (email, calendar, \
     Slack, Notion, files, GitHub, …) through MCP servers the user has configured — \
     each connected server's tools appear to you namespaced as `<server>__<tool>`. \
     Think step by step. Prefer to verify facts with the web tools when a question \
@@ -1157,15 +1163,30 @@ struct PopDraftAgent {
     approves before anything runs; read-only commands like cat/ls may auto-run). \
     Do local file/command/code work with run_shell, NOT by suggesting an MCP.
 
-    CAPABILITY-AWARENESS — IMPORTANT. Reserve `suggest_integration` for EXTERNAL \
-    cloud services that need their own account/auth (email, calendar, Slack, \
-    Notion, GitHub, Drive) — NEVER for local file/command/code tasks (use \
-    run_shell for those). If the user asks for such an external service you have \
-    NO connected tool for (e.g. "read my email", "what's on my calendar", "post \
-    to Slack"), DO NOT flatly refuse: call `suggest_integration` with the \
-    capability, then tell the user — in plain language — that you can connect to \
-    that service via an MCP server, name the specific server, and tell them to add \
-    it in Settings → MCP (mention the one-click preset). Be concrete and actionable.
+    GAINING A NEW CAPABILITY — IMPORTANT. You can SET UP new tools for yourself \
+    via MCP servers. When the user wants something you have NO connected tool for \
+    (weather, maps, a database, Linear, Drive, email, calendar, Slack, …) — and it \
+    is NOT local file/command/code work (that ALWAYS uses run_shell, never an MCP) \
+    — DO NOT refuse. Instead, set it up yourself, end to end:
+    1. Call `suggest_integration` with the capability. If it returns a known \
+    server (it checks a built-in catalog of presets), use that server's exact \
+    command + args.
+    2. If it's NOT in the catalog, use `web_search` to find the right package — \
+    search e.g. "<capability> MCP server npm" or "<capability> MCP server github" \
+    — and determine the `npx -y <package>` (or `uvx <package>`) command + args.
+    3. Call `add_mcp_server` with {name, command, args, description} to install + \
+    enable it. The USER must Approve before it installs/runs — you are PROPOSING. \
+    On approval its tools become available to you immediately, named \
+    `<server>__<tool>`.
+    4. Then ACTUALLY USE those new tools (look at the next tool list) to fulfill \
+    the original request, and answer.
+    Example: "set up a weather MCP and tell me the weather in Tel Aviv" → \
+    suggest_integration("weather") → add_mcp_server(name:"Weather", command:"npx", \
+    args:["-y","<weather-pkg>"]) → user approves → call the new \
+    `Weather__<tool>` → answer with the forecast.
+    If `add_mcp_server` reports the server was added but not reachable (it may need \
+    a one-time auth/OAuth or setup step), tell the user that plainly and point them \
+    at Settings → MCP (Test) — don't pretend it worked.
 
     ALWAYS finish your turn with a clear, direct, natural-language answer to the \
     user's question, synthesized from what you found. Never end with only a tool \
@@ -1181,12 +1202,17 @@ struct PopDraftAgent {
     ///   call them. When on, each runs through `MacControlGate` (denylist +
     ///   confirm-before-execute); `confirmer` is the UI seam.
     /// - MCP tools: discovered from each configured+enabled server; failures are
-    ///   skipped. The live clients are returned so the caller can shut them down.
+    ///   skipped. Live clients are tracked in the returned `MCPClientHolder` so the
+    ///   caller can shut them ALL down — INCLUDING any started mid-turn by
+    ///   `add_mcp_server` (the holder is a reference, so a later append is visible).
+    @MainActor
     static func buildRegistry(
         config: AppConfig,
-        confirmer: (any MacControlConfirmer)? = nil
-    ) async -> (registry: ToolRegistry, mcpClients: [MCPClient]) {
+        confirmer: (any MacControlConfirmer)? = nil,
+        configDir: String = LLMConfig.configDir
+    ) async -> (registry: ToolRegistry, mcpClients: MCPClientHolder) {
         let registry = ToolRegistry()
+        let holder = MCPClientHolder()
         // Built-in tools are SELF-REGISTERED by their owning feature files into
         // `AgentToolCatalog` (text — always on; web/browser — behind
         // `enableWebSearch`; confirm-gated Mac-control — behind `enableMacControl`).
@@ -1197,8 +1223,18 @@ struct PopDraftAgent {
         await registry.register(builtins)
         // PR9: MCP tools — only for configured+enabled servers (default none).
         let mcp = await MCPManager.buildTools(servers: config.mcpServers)
+        holder.append(contentsOf: mcp.clients)
         if !mcp.tools.isEmpty { await registry.register(mcp.tools) }
-        return (registry, mcp.clients)
+        // PR12: the agent can SET UP a new MCP server itself. The installer starts
+        // a server live, registers its tools into THIS running registry, and tracks
+        // its client in the same `holder` the turn teardown drains. Confirm-gated
+        // through the run_shell `confirmer` seam (denylist enforced in the tool).
+        let installer = MCPServerInstaller(
+            registry: registry, configDir: configDir,
+            trackClient: { holder.append($0) })
+        await registry.register(AddMcpServerTool(
+            confirmer: confirmer, installer: installer, settings: config.agentSettings))
+        return (registry, holder)
     }
 
     /// Run the agent loop on `session`. Returns the loop outcome (updated session
@@ -1207,6 +1243,7 @@ struct PopDraftAgent {
     ///
     /// `confirmer` is the Mac-control confirmation seam (the chat view-model). With
     /// no confirmer, confirm-gated commands structurally resolve to deny.
+    @MainActor
     static func run(
         session: ChatSession,
         config: AppConfig,
@@ -1215,8 +1252,9 @@ struct PopDraftAgent {
         onProgress: ToolProgressHook? = nil
     ) async throws -> AgentLoop.Outcome {
         let (registry, mcpClients) = await buildRegistry(config: config, confirmer: confirmer)
-        // Shut MCP servers down when the turn ends, however it ends.
-        defer { for c in mcpClients { c.shutdown() } }
+        // Shut MCP servers down when the turn ends, however it ends — INCLUDING any
+        // started mid-turn by `add_mcp_server` (the holder is appended to live).
+        defer { mcpClients.shutdownAll() }
         // Tool concurrency cap == renderer pool size (web tools are the heavy ones).
         // Per-tool timeout: normally web-nav + slack, but when Mac-control is on a
         // confirm-gated tool may sit AWAITING THE USER'S APPROVAL — so give the

@@ -21,6 +21,7 @@ TESTS=(
   "tests/test-maccontrol.swift scripts/Core.swift"
   "tests/test-ippinning.swift scripts/Core.swift"
   "tests/test-mcp.swift scripts/Core.swift"
+  "tests/test-localactions.swift scripts/Core.swift scripts/MacControl.swift scripts/LocalActionTools.swift"
 )
 
 OVERALL_EXIT=0
@@ -65,6 +66,35 @@ for entry in "${TESTS[@]}"; do
   rm -f "$bin"
   echo ""
 done
+
+# ----------------------------------------------------------------------------
+# History browser test — pure HistorySearch predicate (History.swift). Its host
+# view references app-wide types (ChatPalette, LiquidGlassBackground, AppDelegate,
+# …), so it co-compiles with all app sources EXCEPT scripts/Main.swift (the @main
+# entry) — the test file is staged as main.swift to be the sole entry point.
+# Swift autolinks the system frameworks it imports, so no -framework flags here.
+# ----------------------------------------------------------------------------
+echo "=========================================="
+echo "Compiling tests/test-history.swift..."
+HSTAGE="$(mktemp -d /tmp/popdraft-history.XXXXXX)"
+cp "tests/test-history.swift" "$HSTAGE/main.swift"
+HBIN="/tmp/popdraft-test-history"
+HIST_SOURCES=()
+for f in scripts/*.swift; do
+  [ "$f" = "scripts/Main.swift" ] && continue
+  HIST_SOURCES+=("$f")
+done
+if swiftc -o "$HBIN" "$HSTAGE/main.swift" "${HIST_SOURCES[@]}"; then
+  echo "Running test-history..."
+  echo ""
+  if ! "$HBIN"; then OVERALL_EXIT=1; fi
+else
+  echo "  [ERROR] Failed to compile tests/test-history.swift"
+  OVERALL_EXIT=1
+fi
+rm -rf "$HSTAGE"
+rm -f "$HBIN"
+echo ""
 
 # ----------------------------------------------------------------------------
 # GUI / WebKit tests (LOCAL ONLY) — gated behind RUN_GUI_TESTS=1.
