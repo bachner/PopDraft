@@ -4426,6 +4426,9 @@ class PopupWindowController: NSWindowController {
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
+        // Keep the chat on screen when it loses focus so the user can keep
+        // working alongside it; only transient states auto-dismiss on blur.
+        if case .chat = state { return }
         dismiss()
     }
 
