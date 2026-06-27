@@ -374,7 +374,26 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
     private(set) var downloadURL: String?
     private(set) var isDownloading = false
     private(set) var downloadProgress: Double = 0
+    /// `true` once the DMG download finished and we're mounting/copying the new
+    /// app (drives the visible "Installing…" phase).
+    private(set) var isInstalling = false
+    /// Set to the version just installed when the copy succeeds and we're about
+    /// to relaunch (drives the visible "Updated — Relaunch" end state).
+    private(set) var installedVersion: String?
     var onUpdateStatusChanged: (() -> Void)?
+    /// Invoked (on the main thread) by `checkForUpdates(silent:false)` when an
+    /// update is available, so the AppDelegate can present the visible
+    /// "Update Available — Install Now / Later" dialog. Returns whether the
+    /// user chose to install now. When nil, no dialog is shown.
+    var onManualUpdateAvailable: ((_ version: String, _ current: String) -> Bool)?
+    /// Invoked (on the main thread) when a silent launch check finds an update,
+    /// so the AppDelegate can surface a subtle, non-modal "install" affordance
+    /// WITHOUT downloading or relaunching the running app.
+    var onSilentUpdateAvailable: (() -> Void)?
+    /// Invoked (on the main thread) when a MANUAL check resolves to a terminal
+    /// non-available state (up-to-date or error), so the AppDelegate can dismiss
+    /// the "Checking…" progress window before showing the existing NSAlert.
+    var onManualCheckResolved: (() -> Void)?
 
     private let githubAPI = "https://api.github.com/repos/bachner/PopDraft/releases/latest"
     private let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
@@ -409,7 +428,10 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
             if let error = error {
                 Logger.shared.error("Update check failed: \(error.localizedDescription)")
                 if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not connect to GitHub. Please check your internet connection.") }
+                    DispatchQueue.main.async {
+                        self.onManualCheckResolved?()
+                        self.showAlert(title: "Update Check Failed", message: "Could not connect to GitHub. Please check your internet connection.")
+                    }
                 }
                 return
             }
@@ -418,7 +440,10 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tagName = json["tag_name"] as? String else {
                 if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not parse update information.") }
+                    DispatchQueue.main.async {
+                        self.onManualCheckResolved?()
+                        self.showAlert(title: "Update Check Failed", message: "Could not parse update information.")
+                    }
                 }
                 return
             }
@@ -444,14 +469,29 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
                 Logger.shared.info("Update available: v\(remoteVersion)")
                 DispatchQueue.main.async { self.onUpdateStatusChanged?() }
                 if silent {
-                    DispatchQueue.main.async { self.downloadAndInstall() }
+                    // NON-DISRUPTIVE: do NOT download + relaunch the running app
+                    // out from under the user. Just surface a subtle, non-modal
+                    // "install" affordance; the actual download happens only on
+                    // explicit user action (menu item / dialog).
+                    DispatchQueue.main.async { self.onSilentUpdateAvailable?() }
+                } else {
+                    // MANUAL check with an update available: PRESENT it. Show the
+                    // "Update Available — Install Now / Later" dialog and only
+                    // start the download if the user chooses Install Now.
+                    DispatchQueue.main.async {
+                        let install = self.onManualUpdateAvailable?(remoteVersion, AppVersion.current) ?? false
+                        if install { self.downloadAndInstall() }
+                    }
                 }
             } else {
                 self.updateAvailable = false
                 self.latestVersion = nil
                 self.downloadURL = nil
                 if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "You're Up to Date", message: "PopDraft \(AppVersion.current) is the latest version.") }
+                    DispatchQueue.main.async {
+                        self.onManualCheckResolved?()
+                        self.showAlert(title: "You're Up to Date", message: "PopDraft \(AppVersion.current) is the latest version.")
+                    }
                 }
             }
         }.resume()
@@ -512,6 +552,10 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
             try? FileManager.default.removeItem(at: dmgURL)
             try FileManager.default.moveItem(at: location, to: dmgURL)
             Logger.shared.info("Download complete: \(dmgPath)")
+            // Download done → flip to the visible "Installing…" phase.
+            isDownloading = false
+            isInstalling = true
+            onUpdateStatusChanged?()
             installFromDMG(at: dmgPath)
         } catch {
             Logger.shared.error("Failed to save DMG: \(error)")
@@ -561,6 +605,7 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
             } catch {
                 DispatchQueue.main.async {
                     self.isDownloading = false
+                    self.isInstalling = false
                     self.onUpdateStatusChanged?()
                     self.showAlert(title: "Update Error", message: "Failed to mount DMG: \(error.localizedDescription)")
                 }
@@ -570,6 +615,7 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
             guard mount.terminationStatus == 0 else {
                 DispatchQueue.main.async {
                     self.isDownloading = false
+                    self.isInstalling = false
                     self.onUpdateStatusChanged?()
                     self.showAlert(title: "Update Error", message: "Failed to mount DMG (exit code \(mount.terminationStatus)).")
                 }
@@ -590,6 +636,7 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
 
                 DispatchQueue.main.async {
                     self.isDownloading = false
+                    self.isInstalling = false
                     self.onUpdateStatusChanged?()
                     self.showAlert(title: "Update Error", message: "PopDraft.app not found in DMG.")
                 }
@@ -620,6 +667,7 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
                 Logger.shared.error("Failed to install update: \(error)")
                 DispatchQueue.main.async {
                     self.isDownloading = false
+                    self.isInstalling = false
                     self.onUpdateStatusChanged?()
                     self.showAlert(title: "Update Error", message: "Failed to install: \(error.localizedDescription)")
                 }
@@ -646,8 +694,13 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
             // Cleanup
             try? FileManager.default.removeItem(atPath: dmgPath)
 
-            // Relaunch
+            // Install succeeded: surface the visible "Updated — Relaunch" end
+            // state, then relaunch into the new build. (The user explicitly
+            // chose Install Now to reach here, so relaunching is expected.)
             DispatchQueue.main.async {
+                self.isInstalling = false
+                self.installedVersion = self.latestVersion
+                self.onUpdateStatusChanged?()
                 self.relaunchApp()
             }
         }
@@ -747,6 +800,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
     var serverStatusMenuItem: NSMenuItem?
+    /// Drives the visible update flow (the "Update Available" dialog + the
+    /// Liquid-Glass progress window). See scripts/UpdateUI.swift.
+    let updateUI = UpdateUIPresenter()
 
     /// PR5: "Recent" submenu listing recently saved sessions. Rebuilt lazily each
     /// time the menu is about to open (so newly saved sessions appear).
@@ -920,11 +976,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             FileManager.default.createFile(atPath: loginFlag, contents: nil)
         }
 
-        // Set up update manager
-        UpdateManager.shared.onUpdateStatusChanged = { [weak self] in
-            self?.refreshUpdateMenuItem()
+        // Set up update manager + VISIBLE update UI. All these callbacks are
+        // invoked on the main thread (the manager dispatches them via
+        // DispatchQueue.main.async), so `MainActor.assumeIsolated` lets us touch
+        // the @MainActor `updateUI` presenter without spawning a hop.
+        let mgr = UpdateManager.shared
+        mgr.onUpdateStatusChanged = { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                self.refreshUpdateMenuItem()
+                // Drive the glass progress window from the updater's live flags.
+                self.updateUI.refresh(
+                    isDownloading: mgr.isDownloading,
+                    progress: mgr.downloadProgress,
+                    installing: mgr.isInstalling,
+                    finishedVersion: mgr.installedVersion)
+            }
         }
-        UpdateManager.shared.checkOnLaunchIfNeeded()
+        // MANUAL check finds an update → present the visible "Update Available"
+        // dialog; return whether the user chose Install Now (the manager starts
+        // the download only when true), and show the progress window if so.
+        mgr.onManualUpdateAvailable = { [weak self] version, current in
+            MainActor.assumeIsolated {
+                guard let self = self else { return false }
+                let install = self.updateUI.presentUpdateAvailable(version: version, current: current)
+                if install { self.updateUI.beginDownload() }
+                return install
+            }
+        }
+        // SILENT launch check finds an update → NON-DISRUPTIVE: just refresh the
+        // menu-bar affordance ("Install Update vX…"); no download, no relaunch.
+        mgr.onSilentUpdateAvailable = { [weak self] in
+            MainActor.assumeIsolated { self?.refreshUpdateMenuItem() }
+        }
+        // MANUAL check resolved to up-to-date / error → dismiss "Checking…" so
+        // the existing NSAlert is the only thing on screen.
+        mgr.onManualCheckResolved = { [weak self] in
+            MainActor.assumeIsolated { self?.updateUI.dismissProgress() }
+        }
+        mgr.checkOnLaunchIfNeeded()
 
         // Monitor accessibility permission periodically
         var wasAccessible = AXIsProcessTrusted()
@@ -1152,36 +1242,55 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func checkForUpdatesMenu() {
-        let mgr = UpdateManager.shared
-        if mgr.updateAvailable && !mgr.isDownloading {
-            let alert = NSAlert()
-            alert.messageText = "Update Available"
-            alert.informativeText = "PopDraft v\(mgr.latestVersion ?? "?") is available. You have v\(AppVersion.current).\n\nDownload and install now?"
-            alert.addButton(withTitle: "Update")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                mgr.downloadAndInstall()
+        // Menu actions always run on the main thread; assume the isolation so we
+        // can drive the @MainActor `updateUI` presenter directly.
+        MainActor.assumeIsolated {
+            let mgr = UpdateManager.shared
+            if mgr.isDownloading || mgr.isInstalling {
+                // A download/install is already running — surface its progress.
+                updateUI.beginDownload()
+                updateUI.refresh(isDownloading: mgr.isDownloading,
+                                 progress: mgr.downloadProgress,
+                                 installing: mgr.isInstalling,
+                                 finishedVersion: mgr.installedVersion)
+            } else if mgr.updateAvailable, let v = mgr.latestVersion {
+                // A silent launch check already found an update: present the
+                // visible "Update Available — Install Now / Later" dialog
+                // directly (no need to re-hit the network).
+                if updateUI.presentUpdateAvailable(version: v, current: AppVersion.current) {
+                    updateUI.beginDownload()
+                    mgr.downloadAndInstall()
+                }
+            } else {
+                // Fresh manual check: show immediate "Checking…" feedback in the
+                // glass progress window, then let checkForUpdates(silent:false)
+                // drive the dialog / up-to-date / error end states.
+                updateUI.beginManualCheck()
+                mgr.checkForUpdates(silent: false)
             }
-        } else if !mgr.isDownloading {
-            mgr.checkForUpdates(silent: false)
         }
     }
 
     private func refreshUpdateMenuItem() {
         let mgr = UpdateManager.shared
-        if mgr.isDownloading {
+        if mgr.isInstalling {
+            updateMenuItem?.title = "Installing Update…"
+            updateMenuItem?.action = #selector(checkForUpdatesMenu)
+        } else if mgr.isDownloading {
             let pct = Int(mgr.downloadProgress * 100)
-            updateMenuItem?.title = "Downloading Update... \(pct)%"
-            updateMenuItem?.action = nil
+            updateMenuItem?.title = "Downloading Update… \(pct)%"
+            updateMenuItem?.action = #selector(checkForUpdatesMenu)
         } else if mgr.updateAvailable {
-            updateMenuItem?.title = "Update Available: v\(mgr.latestVersion ?? "")"
+            // NON-DISRUPTIVE affordance: a subtle, click-to-install menu title
+            // (the silent launch check NEVER auto-downloads/relaunches).
+            updateMenuItem?.title = "Install Update v\(mgr.latestVersion ?? "")…"
             updateMenuItem?.action = #selector(checkForUpdatesMenu)
         } else {
-            updateMenuItem?.title = "Check for Updates..."
+            updateMenuItem?.title = "Check for Updates…"
             updateMenuItem?.action = #selector(checkForUpdatesMenu)
         }
 
-        // Status bar dot indicator
+        // Status bar dot indicator: a subtle badge when an update is waiting.
         if let button = statusItem?.button {
             button.title = mgr.updateAvailable ? "·" : ""
         }

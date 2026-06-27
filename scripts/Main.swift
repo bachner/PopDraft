@@ -59,6 +59,7 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
     private var settings: SettingsWindowController?
     private var bubble: BubbleWindowController?
     private var history: HistoryWindowController?
+    private var update: UpdateProgressWindowController?
 
     init(state: String) { self.state = state }
 
@@ -93,9 +94,49 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
             h.showWindow()
             history = h
             centerOnPrimary(h.window)
+        case let s where s == "update" || s.hasPrefix("update:"):
+            // Renders the VISIBLE auto-updater UI for a screen capture. A
+            // sub-state after the colon selects the phase:
+            //   update            → "Checking…" (default)
+            //   update:available  → the "Update Available — Install Now/Later" dialog
+            //   update:downloading→ "Downloading update… 45%"
+            //   update:installing → "Installing…"
+            //   update:relaunch   → "Updated to vX — Relaunch"
+            //   update:uptodate   → "You're up to date"
+            //   update:error      → an error end-state
+            let sub = s.contains(":") ? String(s.split(separator: ":")[1]) : "checking"
+            if sub == "available" {
+                // The real "Update Available" dialog is a native NSAlert; show it
+                // non-blocking so it can be captured.
+                let alert = NSAlert()
+                alert.messageText = "Update Available"
+                alert.informativeText = "PopDraft v2.7.0 is available (you have v2.6.0)."
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "Install Now")
+                alert.addButton(withTitle: "Later")
+                let panel = alert.window
+                panel.center()
+                panel.makeKeyAndOrderFront(nil)
+                break
+            }
+            let u = UpdateProgressWindowController()
+            switch sub {
+            case "downloading": u.model.phase = .downloading(progress: 0.45)
+            case "installing":  u.model.phase = .installing
+            case "relaunch":    u.model.phase = .readyToRelaunch(version: "2.7.0")
+            case "uptodate":    u.model.phase = .upToDate(version: "2.6.0")
+            case "error":       u.model.phase = .error(message: "Could not connect to GitHub. Please check your internet connection.")
+            default:            u.model.phase = .checking
+            }
+            u.model.onRelaunch = {
+                FileHandle.standardError.write(Data("debug-show update: would relaunch\n".utf8))
+            }
+            u.present()
+            centerOnPrimary(u.window)
+            update = u
         default:
             FileHandle.standardError.write(Data(
-                "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings|history)\n".utf8))
+                "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings|history|update[:phase])\n".utf8))
             exit(2)
         }
     }
