@@ -2256,7 +2256,10 @@ struct ModelSwitcherPalette: View {
     @State private var query = ""
     @State private var selected = 0
     @FocusState private var focused: Bool
-    private let choices = AgentChatViewModel.allSwitchableChoices()
+    // Populated in onAppear (a main-actor context) — NOT a stored initializer,
+    // which would call the @MainActor `allSwitchableChoices()` from a nonisolated
+    // context (a build error on stricter Swift toolchains / in CI).
+    @State private var choices: [ModelChoice] = []
 
     private var filtered: [ModelChoice] {
         guard !query.isEmpty else { return choices }
@@ -2320,7 +2323,10 @@ struct ModelSwitcherPalette: View {
                     .keyboardShortcut(.downArrow, modifiers: [])
             }.opacity(0).allowsHitTesting(false)
         )
-        .onAppear { focused = true }
+        .onAppear {
+            choices = AgentChatViewModel.allSwitchableChoices()
+            focused = true
+        }
     }
 
     private func commit() {
