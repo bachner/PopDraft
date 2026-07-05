@@ -706,6 +706,12 @@ enum ModelValidator {
             // Tree entries: {"type":"file","path":"...","size":N, "lfs":{"size":N}}
             guard let path = entry["path"] as? String, path.lowercased().hasSuffix(".gguf") else { continue }
             if let type = entry["type"] as? String, type != "file" { continue }
+            // Skip files that are NOT loadable model weights, so they can't be
+            // picked as "the model":
+            //  - mmproj-*.gguf : a multimodal vision PROJECTOR (companion to a
+            //    model, ~1GB); loading it as `-m` fails and takes the server offline.
+            let base = (path as NSString).lastPathComponent.lowercased()
+            if base.hasPrefix("mmproj") || base.contains("mmproj") { continue }
             // Prefer the LFS size (real file size for GGUFs stored in LFS); fall back to `size`.
             var size: Int64 = 0
             if let lfs = entry["lfs"] as? [String: Any], let s = (lfs["size"] as? NSNumber)?.int64Value {
