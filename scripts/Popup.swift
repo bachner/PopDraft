@@ -1284,7 +1284,16 @@ class PopupWindowController: NSWindowController {
             return
         }
 
-        // Get selected text from clipboard
+        // "Ask Agent" works WITH or WITHOUT a selection — no selection just opens a
+        // blank chat. It must NOT be blocked by the empty-selection guard below.
+        if action.actionType == .agent {
+            runAgent(action: action)
+            return
+        }
+
+        // Text-transformation and Read-aloud actions genuinely need text to act on.
+        // If nothing was captured (nothing selected, OR the frontmost app — e.g. a
+        // terminal — doesn't expose its selection), say so instead of acting on ""
         guard !clipboardText.isEmpty else {
             Logger.shared.error("Action '\(action.name)' failed: No text selected")
             state = .error("No text selected.\nSelect some text first.")
