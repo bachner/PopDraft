@@ -900,8 +900,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         bubbleController = BubbleWindowController()
         bubbleController?.onExpand = { [weak self] in
             // Clicking the orb opens the agent chat directly (the hotkey is the
-            // action-menu entry point; the bubble is the chat one).
-            self?.popupController?.showChat()
+            // action-menu entry point; the bubble is the chat one). The orb pops
+            // as the chat blooms out of its corner position.
+            guard let self = self else { return }
+            let origin = self.bubbleController?.orbScreenCenter
+            self.bubbleController?.hideWithPop()
+            self.popupController?.showChat(from: origin)
         }
         popupController?.onWillShow = { [weak self] in
             // Hide the orb while the expanded panel is open.

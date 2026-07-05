@@ -437,7 +437,9 @@ enum UIScreenshotRenderer {
         let view: NSView
         switch state {
         case "bubble":
-            view = host(BubbleView(forceHover: true), size: NSSize(width: 120, height: 120))
+            // freezeTime pins the live animation's phase so captures stay
+            // deterministic.
+            view = host(BubbleView(forceHover: true, freezeTime: 0), size: NSSize(width: 120, height: 120))
         case "menu":
             view = host(sampleMenuView(), size: NSSize(width: 420, height: 360))
         case "chat":
