@@ -158,15 +158,49 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// A compact "Model · provider" label for the header.
     static func makeModelLabel() -> String {
         let cfg = LLMConfig.load()
-        let provider = cfg.provider
-        let suffix: String
-        switch provider {
-        case .llamacpp: suffix = "local"
-        case .ollama: suffix = "ollama"
-        case .openai: suffix = "OpenAI"
-        case .claude: suffix = "Claude"
+        switch cfg.provider {
+        case .llamacpp:
+            let name = LLMConfig.llamaModels.first { $0.id == cfg.llamaModel }?.name ?? "Local Model"
+            return "\(name) · local"
+        case .ollama: return "\(cfg.ollamaModel) · ollama"
+        case .openai: return "\(cfg.openaiModel) · OpenAI"
+        case .claude: return "\(cfg.claudeModel) · Claude"
         }
-        return "\(LLMClient.shared.currentModel) · \(suffix)"
+    }
+
+    /// A FLAT, searchable list of every ready-to-use model: each DOWNLOADED local
+    /// llama model (so you can switch 30B ↔ 4B etc.), the Ollama model, and cloud
+    /// models when a key is configured. Feeds the type-to-search model switcher.
+    static func allSwitchableChoices() -> [ModelChoice] {
+        let cfg = LLMConfig.load()
+        var out: [ModelChoice] = []
+        let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+        for m in LLMConfig.llamaModels {
+            guard FileManager.default.fileExists(atPath: modelsDir + "/" + m.filename) else { continue }
+            out.append(ModelChoice(provider: .llamacpp, model: m.id, label: m.name,
+                                   isActive: cfg.provider == .llamacpp && cfg.llamaModel == m.id))
+        }
+        if !cfg.ollamaModel.isEmpty {
+            out.append(ModelChoice(provider: .ollama, model: cfg.ollamaModel, label: cfg.ollamaModel,
+                                   isActive: cfg.provider == .ollama))
+        }
+        let openaiKey = cfg.openaiAPIKey.isEmpty ? (cfg.providerKeys["openai"] ?? "") : cfg.openaiAPIKey
+        if !openaiKey.isEmpty {
+            var models = LLMConfig.openaiModels.filter { $0 != "Custom..." }
+            for um in cfg.userModels where um.provider == "openai" && !models.contains(um.name) { models.append(um.name) }
+            if !models.contains(cfg.openaiModel) { models.insert(cfg.openaiModel, at: 0) }
+            for m in models { out.append(ModelChoice(provider: .openai, model: m, label: m,
+                                                     isActive: cfg.provider == .openai && cfg.openaiModel == m)) }
+        }
+        let claudeKey = cfg.claudeAPIKey.isEmpty ? (cfg.providerKeys["anthropic"] ?? "") : cfg.claudeAPIKey
+        if !claudeKey.isEmpty {
+            var models = LLMConfig.claudeModels.filter { $0 != "Custom..." }
+            for um in cfg.userModels where um.provider == "claude" && !models.contains(um.name) { models.append(um.name) }
+            if !models.contains(cfg.claudeModel) { models.insert(cfg.claudeModel, at: 0) }
+            for m in models { out.append(ModelChoice(provider: .claude, model: m, label: m,
+                                                     isActive: cfg.provider == .claude && cfg.claudeModel == m)) }
+        }
+        return out
     }
 
     // MARK: In-chat model selector (header pill dropdown)
@@ -253,8 +287,16 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         }
 
         cfg.provider = choice.provider
+        var restartLocalModel: LLMConfig.LlamaModel?
         switch choice.provider {
-        case .llamacpp: break                       // local slot has no model id to set
+        case .llamacpp:
+            // choice.model is the llama model id. If it changed, we must rewrite the
+            // launch-agent plist and reload llama-server with the new weights.
+            if cfg.llamaModel != choice.model,
+               let m = LLMConfig.llamaModels.first(where: { $0.id == choice.model }) {
+                cfg.llamaModel = choice.model
+                restartLocalModel = m
+            }
         case .ollama:   cfg.ollamaModel = choice.model
         case .openai:   cfg.openaiModel = choice.model
         case .claude:   cfg.claudeModel = choice.model
@@ -262,13 +304,21 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         cfg.save()
         LLMClient.shared.reloadConfig()
         modelLabel = AgentChatViewModel.makeModelLabel()
+        // Restart the local server for the new model OFF the main thread (bootout+
+        // bootstrap are quick, but the weights then load in the background — the
+        // pill already reflects the new model; the first message waits for /health).
+        if let m = restartLocalModel {
+            DispatchQueue.global(qos: .userInitiated).async {
+                DependencyManager.shared.switchLocalModelAndRestart(m)
+            }
+        }
     }
 
     /// True when `choice` already matches the active model in `cfg` (provider
     /// already verified equal by the caller).
     private static func choiceMatchesActive(_ cfg: LLMConfig, _ choice: ModelChoice) -> Bool {
         switch choice.provider {
-        case .llamacpp: return true
+        case .llamacpp: return cfg.llamaModel == choice.model
         case .ollama:   return cfg.ollamaModel == choice.model
         case .openai:   return cfg.openaiModel == choice.model
         case .claude:   return cfg.claudeModel == choice.model
@@ -2159,34 +2209,10 @@ struct ModelMenuPill: View {
     let label: String
     let didCompact: Bool
     let onSelect: (ModelChoice) -> Void
+    @State private var showPalette = false
 
     var body: some View {
-        Menu {
-            // Only AVAILABLE models are listed: the local model, the Ollama model,
-            // and any cloud provider that has a key configured. To use a different
-            // model, "Other model…" opens Settings to add a key / pick one.
-            ForEach(AgentChatViewModel.modelChoiceGroups()) { group in
-                Section(group.provider.displayName) {
-                    ForEach(group.choices) { choice in
-                        Button {
-                            onSelect(choice)
-                        } label: {
-                            if choice.isActive {
-                                Label(choice.label, systemImage: "checkmark")
-                            } else {
-                                Text(choice.label)
-                            }
-                        }
-                    }
-                }
-            }
-            Divider()
-            Button {
-                (NSApplication.shared.delegate as? AppDelegate)?.showSettings()
-            } label: {
-                Label("Other model…  (opens Settings)", systemImage: "slider.horizontal.3")
-            }
-        } label: {
+        Button { showPalette.toggle() } label: {
             HStack(spacing: 5) {
                 Circle().fill(ChatPalette.green).frame(width: 7, height: 7)
                 Text(label)
@@ -2212,10 +2238,112 @@ struct ModelMenuPill: View {
             .clipShape(Capsule())
             .contentShape(Capsule())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
-        .help("Switch the active model / provider")
+        .help("Switch the active model — type to search")
+        .popover(isPresented: $showPalette, arrowEdge: .top) {
+            ModelSwitcherPalette(onSelect: { onSelect($0) }, onDismiss: { showPalette = false })
+        }
+    }
+}
+
+/// A type-to-search model switcher (command-palette style). Lists every ready
+/// model — each downloaded local llama model + configured cloud models — with a
+/// live-filtered list. Type to narrow, ↑/↓ to move, ↩ to switch, click to switch.
+struct ModelSwitcherPalette: View {
+    let onSelect: (ModelChoice) -> Void
+    let onDismiss: () -> Void
+    @State private var query = ""
+    @State private var selected = 0
+    @FocusState private var focused: Bool
+    private let choices = AgentChatViewModel.allSwitchableChoices()
+
+    private var filtered: [ModelChoice] {
+        guard !query.isEmpty else { return choices }
+        return choices.filter {
+            $0.label.localizedCaseInsensitiveContains(query)
+                || $0.provider.displayName.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12)).foregroundColor(.secondary)
+                TextField("Search models…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .focused($focused)
+                    .onSubmit { commit() }
+                    .onChange(of: query) { _, _ in selected = 0 }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(Array(filtered.enumerated()), id: \.element.id) { idx, choice in
+                            row(choice, highlighted: idx == selected)
+                                .id(idx)
+                                .contentShape(Rectangle())
+                                .onTapGesture { onSelect(choice); onDismiss() }
+                        }
+                        if filtered.isEmpty {
+                            Text("No models match “\(query)”")
+                                .font(.system(size: 12)).foregroundColor(.secondary)
+                                .padding(.vertical, 16)
+                        }
+                    }
+                    .padding(6)
+                }
+                .onChange(of: selected) { _, s in withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(s, anchor: .center) } }
+            }
+            Divider()
+            Button {
+                (NSApplication.shared.delegate as? AppDelegate)?.showSettings(); onDismiss()
+            } label: {
+                Label("Manage models…", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 300, height: 340)
+        .background(
+            // Invisible keyboard handlers so ↑/↓ move the highlight even while the
+            // search field keeps focus (Enter commits via the field's onSubmit).
+            Group {
+                Button("") { selected = max(0, selected - 1) }
+                    .keyboardShortcut(.upArrow, modifiers: [])
+                Button("") { selected = min(max(0, filtered.count - 1), selected + 1) }
+                    .keyboardShortcut(.downArrow, modifiers: [])
+            }.opacity(0).allowsHitTesting(false)
+        )
+        .onAppear { focused = true }
+    }
+
+    private func commit() {
+        let list = filtered
+        guard !list.isEmpty else { onDismiss(); return }
+        let idx = list.indices.contains(selected) ? selected : 0
+        onSelect(list[idx]); onDismiss()
+    }
+
+    @ViewBuilder private func row(_ c: ModelChoice, highlighted: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: c.isActive ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 12))
+                .foregroundColor(c.isActive ? .green : Color.secondary.opacity(0.35))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(c.label).font(.system(size: 12.5, weight: .medium)).lineLimit(1)
+                Text(c.provider.displayName).font(.system(size: 10)).foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(highlighted ? Color.accentColor.opacity(0.18) : Color.clear))
     }
 }
 

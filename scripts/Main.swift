@@ -82,6 +82,7 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
     private var settings: SettingsWindowController?
     private var bubble: BubbleWindowController?
     private var history: HistoryWindowController?
+    private var modelSwitchWindow: NSWindow?
 
     init(state: String) { self.state = state }
 
@@ -107,6 +108,16 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
             s.showWindow()
             settings = s
             centerOnPrimary(s.window)
+        case "modelswitch":
+            // Render the type-to-search model switcher standalone for a screenshot.
+            let host = NSHostingView(rootView: ModelSwitcherPalette(
+                onSelect: { _ in }, onDismiss: {}))
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 340),
+                               styleMask: [.titled], backing: .buffered, defer: false)
+            win.contentView = host
+            win.makeKeyAndOrderFront(nil)
+            centerOnPrimary(win)
+            modelSwitchWindow = win
         case "history":
             let h = HistoryWindowController()
             // No AppDelegate/popup in --debug-show; just log instead of reopening.

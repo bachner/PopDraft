@@ -320,6 +320,23 @@ class DependencyManager {
         createLlamaLaunchAgent(model: model)
     }
 
+    /// Switch the local llama.cpp model live: rewrite the LaunchAgent plist for the
+    /// new model, then bootout+bootstrap so llama-server reloads with it. Used by
+    /// the in-chat model switcher so the user can change local models without
+    /// opening Settings. The server takes a few seconds to reload the new weights.
+    func switchLocalModelAndRestart(_ model: LLMConfig.LlamaModel) {
+        createLlamaLaunchAgent(model: model)
+        let uid = getuid()
+        let plist = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+        // bootout (ok if not currently loaded) then bootstrap → reloads the plist.
+        let out = Process(); out.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        out.arguments = ["bootout", "gui/\(uid)/com.popdraft.llama-server"]
+        try? out.run(); out.waitUntilExit()
+        let boot = Process(); boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        boot.arguments = ["bootstrap", "gui/\(uid)", plist]
+        try? boot.run(); boot.waitUntilExit()
+    }
+
     private func runShellCommand(_ command: String, timeout: TimeInterval = 0, trackProcess: Bool = false) -> String {
         let process = Process()
         let pipe = Pipe()
