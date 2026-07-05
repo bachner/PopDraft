@@ -255,15 +255,17 @@ class DependencyManager {
             .replacingOccurrences(of: "'", with: "&apos;")
     }
 
-    private func createLlamaLaunchAgent(model: LLMConfig.LlamaModel? = nil) {
+    private func createLlamaLaunchAgent(model: LLMConfig.LlamaModel? = nil, filename: String? = nil) {
         let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
 
-        let selectedModel = model ?? getCurrentModel()
+        // The gguf file to run: an explicit filename (a user-downloaded model),
+        // else the given built-in model, else the configured current model.
+        let modelFilename = filename ?? (model ?? getCurrentModel()).filename
         // XML-escape the path before embedding it in the plist (defense-in-depth against
         // a stray `<`, `&`, or quote in a model filename). PR3 also validates HF filenames
         // up front, but the legacy download path reaches here too.
-        let rawModelPath = NSString(string: "~/.popdraft/models/\(selectedModel.filename)").expandingTildeInPath
+        let rawModelPath = NSString(string: "~/.popdraft/models/\(modelFilename)").expandingTildeInPath
         let modelPath = Self.xmlEscape(rawModelPath)
         let llamaServerPath = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server")
             ? "/opt/homebrew/bin/llama-server"
@@ -325,7 +327,13 @@ class DependencyManager {
     /// the in-chat model switcher so the user can change local models without
     /// opening Settings. The server takes a few seconds to reload the new weights.
     func switchLocalModelAndRestart(_ model: LLMConfig.LlamaModel) {
-        createLlamaLaunchAgent(model: model)
+        switchLocalModelFileAndRestart(model.filename)
+    }
+
+    /// Switch the local server to a specific gguf FILE (a user-downloaded model
+    /// that isn't in the built-in list) and restart it.
+    func switchLocalModelFileAndRestart(_ filename: String) {
+        createLlamaLaunchAgent(filename: filename)
         let uid = getuid()
         let plist = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
         // bootout (ok if not currently loaded) then bootstrap → reloads the plist.
@@ -335,6 +343,16 @@ class DependencyManager {
         let boot = Process(); boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         boot.arguments = ["bootstrap", "gui/\(uid)", plist]
         try? boot.run(); boot.waitUntilExit()
+    }
+
+    /// The gguf FILE the local server is currently configured to run, read from
+    /// the launch-agent plist (the source of truth for the active local model).
+    func activeLocalModelFilename() -> String? {
+        let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+        guard let dict = NSDictionary(contentsOfFile: plistPath),
+              let args = dict["ProgramArguments"] as? [String],
+              let mi = args.firstIndex(of: "-m"), mi + 1 < args.count else { return nil }
+        return (args[mi + 1] as NSString).lastPathComponent
     }
 
     private func runShellCommand(_ command: String, timeout: TimeInterval = 0, trackProcess: Bool = false) -> String {

@@ -888,6 +888,13 @@ struct SettingsView: View {
                             .font(.system(size: 11, design: .monospaced))
                             .lineLimit(1)
                         Spacer()
+                        if isUserModelActive(m) {
+                            Text("Active")
+                                .font(.system(size: 10, weight: .medium)).foregroundColor(.green)
+                        } else if m.filename != nil {
+                            Button("Use") { activateUserModel(m) }
+                                .buttonStyle(.borderless).controlSize(.small)
+                        }
                         Button(action: { removeUserModel(m) }) {
                             Image(systemName: "trash")
                                 .font(.system(size: 10))
@@ -1469,11 +1476,12 @@ struct SettingsView: View {
                 DispatchQueue.main.async {
                     self.downloadProgress = 95
                     self.downloadStatus = "Configuring server…"
-                    // Register as a user model + make it active.
-                    let ref = ModelRef(provider: "llamacpp", name: repo, quant: file.quant.isEmpty ? nil : file.quant, source: "huggingface")
-                    if !self.userModels.contains(where: { $0.name == ref.name && $0.quant == ref.quant }) {
-                        self.userModels.append(ref)
-                    }
+                    // Register as a user model + make it active. Record the local
+                    // FILENAME so it can be re-selected later (from the model
+                    // dropdown / the in-chat switcher).
+                    let ref = ModelRef(provider: "llamacpp", name: repo, quant: file.quant.isEmpty ? nil : file.quant, source: "huggingface", filename: destFilename)
+                    self.userModels.removeAll { $0.name == ref.name && $0.quant == ref.quant }
+                    self.userModels.append(ref)
                 }
                 // Point the llama-server LaunchAgent at the freshly downloaded file.
                 let model = LLMConfig.LlamaModel(
@@ -1514,6 +1522,27 @@ struct SettingsView: View {
 
     private func removeUserModel(_ model: ModelRef) {
         userModels.removeAll { $0.name == model.name && $0.quant == model.quant && $0.source == model.source }
+    }
+
+    /// True when this user model's gguf file is the one the local server runs now.
+    private func isUserModelActive(_ m: ModelRef) -> Bool {
+        guard let fn = m.filename else { return false }
+        return DependencyManager.shared.activeLocalModelFilename() == fn
+    }
+
+    /// Make a downloaded user model the active local model: point the llama-server
+    /// launch agent at its file and reload. Also flips the active provider to
+    /// llama.cpp so the change takes effect immediately.
+    private func activateUserModel(_ m: ModelRef) {
+        guard let fn = m.filename else { return }
+        selectedProvider = .llamacpp
+        var cfg = LLMConfig.load()
+        cfg.provider = .llamacpp
+        cfg.save()
+        LLMClient.shared.reloadConfig()
+        DispatchQueue.global(qos: .userInitiated).async {
+            DependencyManager.shared.switchLocalModelFileAndRestart(fn)
+        }
     }
 
     // MARK: - PR3: Cloud key validation

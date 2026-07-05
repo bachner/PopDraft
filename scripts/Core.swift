@@ -15,12 +15,15 @@ struct ModelRef: Codable, Equatable {
     var name: String              // model name or HF repo (e.g. "user/repo")
     var quant: String?            // optional quantization (e.g. "Q4_K_M")
     var source: String            // e.g. "huggingface", "ollama", "cloud"
+    var filename: String?         // local gguf filename (for downloaded llamacpp models)
 
-    init(provider: String, name: String, quant: String? = nil, source: String = "huggingface") {
+    init(provider: String, name: String, quant: String? = nil, source: String = "huggingface",
+         filename: String? = nil) {
         self.provider = provider
         self.name = name
         self.quant = quant
         self.source = source
+        self.filename = filename
     }
 
     init(from decoder: Decoder) throws {
@@ -29,6 +32,7 @@ struct ModelRef: Codable, Equatable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         quant = try c.decodeIfPresent(String.self, forKey: .quant)
         source = try c.decodeIfPresent(String.self, forKey: .source) ?? "huggingface"
+        filename = try c.decodeIfPresent(String.self, forKey: .filename)
     }
 }
 

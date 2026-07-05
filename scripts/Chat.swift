@@ -160,7 +160,14 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         let cfg = LLMConfig.load()
         switch cfg.provider {
         case .llamacpp:
-            let name = LLMConfig.llamaModels.first { $0.id == cfg.llamaModel }?.name ?? "Local Model"
+            let active = DependencyManager.shared.activeLocalModelFilename()
+            if let m = LLMConfig.llamaModels.first(where: { $0.filename == active }) {
+                return "\(m.name) · local"
+            }
+            if let um = cfg.userModels.first(where: { $0.filename == active }) {
+                return "\(um.name)\(um.quant.map { " · \($0)" } ?? "") · local"
+            }
+            let name = LLMConfig.llamaModels.first { $0.id == cfg.llamaModel }?.name ?? (active ?? "Local Model")
             return "\(name) · local"
         case .ollama: return "\(cfg.ollamaModel) · ollama"
         case .openai: return "\(cfg.openaiModel) · OpenAI"
@@ -169,16 +176,30 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     }
 
     /// A FLAT, searchable list of every ready-to-use model: each DOWNLOADED local
-    /// llama model (so you can switch 30B ↔ 4B etc.), the Ollama model, and cloud
-    /// models when a key is configured. Feeds the type-to-search model switcher.
+    /// model — built-in AND user-added-from-Hugging-Face (keyed by gguf FILENAME) —
+    /// plus the Ollama model and cloud models when a key is configured. Feeds the
+    /// type-to-search model switcher.
     static func allSwitchableChoices() -> [ModelChoice] {
         let cfg = LLMConfig.load()
+        let activeFile = DependencyManager.shared.activeLocalModelFilename()
         var out: [ModelChoice] = []
         let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+        var seenFiles = Set<String>()
+        // Built-in models that are downloaded — keyed by their gguf FILENAME.
         for m in LLMConfig.llamaModels {
             guard FileManager.default.fileExists(atPath: modelsDir + "/" + m.filename) else { continue }
-            out.append(ModelChoice(provider: .llamacpp, model: m.id, label: m.name,
-                                   isActive: cfg.provider == .llamacpp && cfg.llamaModel == m.id))
+            seenFiles.insert(m.filename)
+            out.append(ModelChoice(provider: .llamacpp, model: m.filename, label: m.name,
+                                   isActive: cfg.provider == .llamacpp && activeFile == m.filename))
+        }
+        // User-downloaded local models (from the HF "Add a local model" flow).
+        for um in cfg.userModels where um.provider == "llamacpp" || um.source == "huggingface" {
+            guard let fn = um.filename, !fn.isEmpty, !seenFiles.contains(fn),
+                  FileManager.default.fileExists(atPath: modelsDir + "/" + fn) else { continue }
+            seenFiles.insert(fn)
+            let label = um.name + (um.quant.map { " · \($0)" } ?? "")
+            out.append(ModelChoice(provider: .llamacpp, model: fn, label: label,
+                                   isActive: cfg.provider == .llamacpp && activeFile == fn))
         }
         if !cfg.ollamaModel.isEmpty {
             out.append(ModelChoice(provider: .ollama, model: cfg.ollamaModel, label: cfg.ollamaModel,
@@ -287,38 +308,42 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         }
 
         cfg.provider = choice.provider
-        var restartLocalModel: LLMConfig.LlamaModel?
+        var restartLocalFile: String?
         switch choice.provider {
         case .llamacpp:
-            // choice.model is the llama model id. If it changed, we must rewrite the
-            // launch-agent plist and reload llama-server with the new weights.
-            if cfg.llamaModel != choice.model,
-               let m = LLMConfig.llamaModels.first(where: { $0.id == choice.model }) {
-                cfg.llamaModel = choice.model
-                restartLocalModel = m
+            // choice.model is now the gguf FILENAME (built-in OR user model). Point
+            // the config's built-in id at the matching built-in when there is one,
+            // and rewrite+reload the server for this file.
+            if let builtin = LLMConfig.llamaModels.first(where: { $0.filename == choice.model }) {
+                cfg.llamaModel = builtin.id
             }
+            restartLocalFile = choice.model
         case .ollama:   cfg.ollamaModel = choice.model
         case .openai:   cfg.openaiModel = choice.model
         case .claude:   cfg.claudeModel = choice.model
         }
         cfg.save()
         LLMClient.shared.reloadConfig()
-        modelLabel = AgentChatViewModel.makeModelLabel()
         // Restart the local server for the new model OFF the main thread (bootout+
         // bootstrap are quick, but the weights then load in the background — the
-        // pill already reflects the new model; the first message waits for /health).
-        if let m = restartLocalModel {
+        // pill updates once the plist is rewritten; the first message waits for
+        // /health).
+        if let file = restartLocalFile {
             DispatchQueue.global(qos: .userInitiated).async {
-                DependencyManager.shared.switchLocalModelAndRestart(m)
+                DependencyManager.shared.switchLocalModelFileAndRestart(file)
+                DispatchQueue.main.async { self.modelLabel = AgentChatViewModel.makeModelLabel() }
             }
+        } else {
+            modelLabel = AgentChatViewModel.makeModelLabel()
         }
     }
 
     /// True when `choice` already matches the active model in `cfg` (provider
-    /// already verified equal by the caller).
+    /// already verified equal by the caller). Local models compare by FILENAME
+    /// against the actually-running server file.
     private static func choiceMatchesActive(_ cfg: LLMConfig, _ choice: ModelChoice) -> Bool {
         switch choice.provider {
-        case .llamacpp: return cfg.llamaModel == choice.model
+        case .llamacpp: return DependencyManager.shared.activeLocalModelFilename() == choice.model
         case .ollama:   return cfg.ollamaModel == choice.model
         case .openai:   return cfg.openaiModel == choice.model
         case .claude:   return cfg.claudeModel == choice.model
