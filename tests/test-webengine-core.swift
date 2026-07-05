@@ -389,8 +389,9 @@ test("Web tool JSON-Schema constants are valid JSON") {
 
 test("Browser tool JSON-Schema constants are valid JSON") {
     let expectedNames = ["browser_open", "browser_click", "browser_type",
-                         "browser_read", "browser_screenshot", "browser_back"]
-    assert(WebToolSchemas.browserAll.count == 6, "six browser tool schemas")
+                         "browser_read", "browser_screenshot", "browser_back",
+                         "browser_scroll", "browser_evaluate"]
+    assert(WebToolSchemas.browserAll.count == 8, "eight browser tool schemas")
     var names: [String] = []
     for (i, schema) in WebToolSchemas.browserAll.enumerated() {
         guard let data = schema.data(using: .utf8),
@@ -420,6 +421,13 @@ test("Browser tool JSON-Schema constants are valid JSON") {
     let type = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserType)
     let typeReq = (type?.parametersSchema["required"] as? [String]) ?? []
     assert(typeReq.contains("target") && typeReq.contains("text"), "browser_type requires target+text")
+    // browser_evaluate requires a script; browser_scroll has no required params.
+    let evaluate = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserEvaluate)
+    let evaluateReq = (evaluate?.parametersSchema["required"] as? [String]) ?? []
+    assert(evaluateReq == ["script"], "browser_evaluate requires script")
+    let scroll = ToolSpec.fromOpenAIJSON(WebToolSchemas.browserScroll)
+    let scrollReq = (scroll?.parametersSchema["required"] as? [String]) ?? []
+    assert(scrollReq.isEmpty, "browser_scroll has no required params")
 }
 
 // MARK: - BrowserTargets: selector-vs-text classification + safe JS embedding

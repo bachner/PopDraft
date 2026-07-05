@@ -1904,6 +1904,43 @@ final class BrowserSession {
         return (try? await wv.evaluateJavaScript(script) as? String) ?? ""
     }
 
+    /// Run `script` (a scroll trigger), then wait `waitNs` for lazy-loaded
+    /// (JS/AJAX) content to fetch + render. No navigation is expected — SPA content
+    /// injection mutates the DOM in place — so we just pause; the caller re-snapshots.
+    func scrollAndWait(_ script: String, waitNs: UInt64) async throws {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        _ = try? await wv.evaluateJavaScript(script)
+        if waitNs > 0 { try await Task.sleep(nanoseconds: waitNs) }
+    }
+
+    /// Evaluate ARBITRARY caller-supplied JS on the current page and coerce ANY
+    /// result type to a String (backing `browser_evaluate`). Unlike `evaluate`,
+    /// numbers/bools are stringified and arrays/objects JSON-encoded, so the model
+    /// can grab e.g. `document.documentElement.innerHTML` or a computed value.
+    /// A JS error propagates (the tool layer turns it into a readable message).
+    func evaluateAny(_ script: String) async throws -> String {
+        guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
+        let result = try await wv.evaluateJavaScript(script)
+        return BrowserSession.coerce(result)
+    }
+
+    /// Coerce a JS `evaluateJavaScript` result (`Any?`) to a String. Strings pass
+    /// through; true booleans (distinguished from 0/1 via CFBoolean) render
+    /// true/false; other numbers stringify; JSON-serializable arrays/objects are
+    /// encoded; everything else falls back to `String(describing:)`.
+    nonisolated static func coerce(_ value: Any?) -> String {
+        guard let value = value else { return "" }
+        if let s = value as? String { return s }
+        if let n = value as? NSNumber {
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue ? "true" : "false" }
+            return n.stringValue
+        }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value),
+           let s = String(data: data, encoding: .utf8) { return s }
+        return String(describing: value)
+    }
+
     /// Take a snapshot PNG of the current page (delegates frame sizing to caller).
     func snapshot(fullPage: Bool, scrollHeightScript: String) async throws -> (Data, Int) {
         guard let wv = webView else { throw WebEngineError.navigationFailed("no page open") }
@@ -2733,6 +2770,49 @@ final class WebEngine {
         return try await browserSnapshotState(action: "went back to \(session.currentURL())")
     }
 
+    /// `browser_scroll` — scroll the CURRENT session page to trigger lazy-loaded
+    /// (JS/AJAX-rendered) content — infinite-scroll grids, deferred images, etc. —
+    /// wait for it to fetch + paint, then return a fresh `BrowserState`. Follow with
+    /// `browser_read` / `browser_screenshot` to capture the now-populated DOM.
+    /// `to`: "bottom" (default) or "top"; `pixels` overrides with a relative scroll;
+    /// `steps` repeats the scroll+wait to page through progressive loaders (1–10).
+    func browserScroll(to: String?, pixels: Int?, steps: Int) async throws -> BrowserState {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let n = min(max(steps, 1), 10)
+        // Give lazy content time to fetch + render after each scroll (≥700ms).
+        let waitNs = UInt64(max(config.webSettleMs, 700)) * 1_000_000
+        let js: String
+        let label: String
+        if let px = pixels {
+            js = "window.scrollBy(0, \(px));"
+            label = "scrolled \(px)px"
+        } else if to?.lowercased() == "top" {
+            js = "window.scrollTo(0, 0);"
+            label = "scrolled to top"
+        } else {
+            js = "window.scrollTo(0, document.body.scrollHeight);"
+            label = "scrolled to bottom"
+        }
+        for _ in 0..<n { try await session.scrollAndWait(js, waitNs: waitNs) }
+        let action = n > 1 ? "\(label) (\(n)×)" : label
+        return try await browserSnapshotState(action: action)
+    }
+
+    /// `browser_evaluate` — run arbitrary JavaScript in the CURRENT session page and
+    /// return its (string-coerced, char-capped) result. Lets the model grab the
+    /// fully-rendered DOM (`document.documentElement.innerHTML`) or a computed value
+    /// after JS has run. Runs in the page's content world (no native access).
+    func browserEvaluate(script: String, maxChars: Int) async throws -> String {
+        let session = browserSession
+        guard session.hasPage else { throw WebEngineError.navigationFailed("no page open — call browser_open first") }
+        let raw = try await session.evaluateAny(script)
+        let cap = maxChars > 0 ? maxChars : 8000
+        guard raw.count > cap else { return raw }
+        let idx = raw.index(raw.startIndex, offsetBy: cap)
+        return String(raw[..<idx]) + "\n…(truncated to \(cap) chars)"
+    }
+
     /// Decode a `{ok, ...}` JSON result from a bundled action script into
     /// (ok, stringified-fields, error). All values are flattened to strings so the
     /// caller can read them uniformly. `nonisolated` + pure (no engine state).
@@ -2767,6 +2847,8 @@ final class WebEngine {
     static let browserReadToolSchema = WebToolSchemas.browserRead
     static let browserScreenshotToolSchema = WebToolSchemas.browserScreenshot
     static let browserBackToolSchema = WebToolSchemas.browserBack
+    static let browserScrollToolSchema = WebToolSchemas.browserScroll
+    static let browserEvaluateToolSchema = WebToolSchemas.browserEvaluate
 }
 
 // =====================================================================
@@ -3052,6 +3134,42 @@ struct BrowserBackTool: AgentTool {
     }
 }
 
+/// `browser_scroll` — scroll the current page to trigger lazy-loaded content.
+struct BrowserScrollTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserScroll, fallbackName: "browser_scroll", fallbackDescription: "Scroll the current page to load dynamic content.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let to = d["to"] as? String
+        var pixels: Int? = nil
+        if let n = d["pixels"] as? Int { pixels = n }
+        else if let n = d["pixels"] as? NSNumber { pixels = n.intValue }
+        var steps = 1
+        if let n = d["steps"] as? Int { steps = n }
+        else if let n = d["steps"] as? NSNumber { steps = n.intValue }
+        return formatBrowserState(try await WebEngine.shared.browserScroll(to: to, pixels: pixels, steps: steps))
+    }
+}
+
+/// `browser_evaluate` — run JS in the current page and return the result.
+struct BrowserEvaluateTool: AgentTool {
+    var spec: ToolSpec { webToolSpec(WebToolSchemas.browserEvaluate, fallbackName: "browser_evaluate", fallbackDescription: "Run JavaScript on the current page and return its result.") }
+    func invoke(_ args: JSONObject) async throws -> String {
+        let d = args.dictionary
+        let script = (d["script"] as? String) ?? ""
+        guard !script.isEmpty else { return "Error: 'script' is required (JavaScript to run on the current page)." }
+        var maxChars = 0
+        if let n = d["max_chars"] as? Int { maxChars = n }
+        else if let n = d["max_chars"] as? NSNumber { maxChars = n.intValue }
+        do {
+            return try await WebEngine.shared.browserEvaluate(script: script, maxChars: maxChars)
+        } catch {
+            // A JS syntax/runtime error is a normal outcome — surface it as text
+            // rather than a tool crash so the model can adjust its script.
+            return "Error evaluating JavaScript: \(error.localizedDescription)"
+        }
+    }
+}
+
 // MARK: - Web tool self-registration
 
 /// Self-registration of the web + interactive-browser tools. Gated on the same
@@ -3075,6 +3193,7 @@ enum WebTools {
                     // browser_* (Playwright-style persistent session)
                     BrowserOpenTool(), BrowserClickTool(), BrowserTypeTool(),
                     BrowserReadTool(), BrowserScreenshotTool(), BrowserBackTool(),
+                    BrowserScrollTool(), BrowserEvaluateTool(),
                 ]
             }))
     }

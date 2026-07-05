@@ -225,6 +225,7 @@ AgentToolCatalog.installBuiltins = {
             "web_search", "web_open", "web_read", "web_screenshot", "web_extract",
             "browser_open", "browser_click", "browser_type",
             "browser_read", "browser_screenshot", "browser_back",
+            "browser_scroll", "browser_evaluate",
         ].map { _StubTool(_name: $0) } }))
     // Confirm-gated Mac-control group — gated on enableMacControl.
     AgentToolCatalog.register(BuiltinToolGroup(
