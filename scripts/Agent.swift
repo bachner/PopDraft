@@ -1256,7 +1256,10 @@ struct PopDraftAgent {
         let tz = TimeZone.current.identifier
         return """
         CURRENT DATE & TIME: \(stamp) (\(tz), the user's local time). Treat this as \
-        ground truth for anything time-sensitive.
+        ground truth for anything time-sensitive. You ALREADY KNOW the current \
+        date/time from this line — do NOT call the current_datetime tool just to \
+        find out what day/time it is; only use it if you need a precise machine \
+        timestamp for a computation.
 
         YOUR TRAINING KNOWLEDGE IS DATED. Your built-in knowledge has a cutoff in the \
         PAST, so what you "remember" about recent products, models, prices, releases, \
@@ -1314,10 +1317,13 @@ struct PopDraftAgent {
 
     WHEN TO USE TOOLS — read this first. Prefer the FEWEST tools necessary, and \
     NEVER call a tool when you can answer directly.
-    - PURE TEXT TASKS — translate, rewrite, fix grammar, summarize, rephrase, \
-    explain, format, or extract from text the user already gave you — need NO \
-    tools. Just produce the result. Do NOT call web_search / web_open / web_read \
-    / web_* / browser_* for these.
+    - PURE TEXT TASKS — translate, rewrite, improve, articulate, fix grammar, \
+    summarize, rephrase, explain, format, or extract from text the user already \
+    gave you — need ZERO tools. Just produce the transformed text directly. Do NOT \
+    call web_search / web_* / browser_* — and do NOT call current_datetime, \
+    calculator, current_context, or any other tool. "Improve this text… only \
+    output the improved text" means: reply with ONLY the improved text, no tool \
+    calls at all.
     - GENERAL KNOWLEDGE you already know — answer DIRECTLY, no tools.
     - Use web_search / browse tools ONLY when the user explicitly asks you to \
     search or look something up online, OR the question genuinely needs current, \
