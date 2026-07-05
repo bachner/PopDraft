@@ -41,6 +41,29 @@ struct PopDraftMain {
             return
         }
 
+        // Diagnostic: read the frontmost app's selected text via the AX path and
+        // print it, then exit. Drive a target app into place first, then run this.
+        if CLIArgs.has("--debug-capture", in: args) {
+            fputs("debug-capture: AXIsProcessTrusted=\(AXIsProcessTrusted())\n", stderr)
+            let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            fputs("debug-capture: frontmost=\(front)\n", stderr)
+            // Select-all in the frontmost app (clean Cmd+A) so there IS a selection.
+            let src = CGEventSource(stateID: .hidSystemState)
+            for k: CGKeyCode in [0x3A, 0x3D, 0x3B, 0x3E, 0x38, 0x3C] {
+                let u = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: false); u?.flags = []; u?.post(tap: .cghidEventTap)
+            }
+            usleep(30000)
+            let aD = CGEvent(keyboardEventSource: src, virtualKey: 0x00, keyDown: true); aD?.flags = .maskCommand; aD?.post(tap: .cghidEventTap)
+            let aU = CGEvent(keyboardEventSource: src, virtualKey: 0x00, keyDown: false); aU?.flags = .maskCommand; aU?.post(tap: .cghidEventTap)
+            usleep(150000)
+            if let ax = PopupWindowController.accessibilitySelectedText() {
+                fputs("debug-capture: AX selected text after Cmd+A = \(ax.count) chars: \(String(ax.prefix(120)))\n", stderr)
+            } else {
+                fputs("debug-capture: AX selected text = nil (app exposes no selection)\n", stderr)
+            }
+            return
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

@@ -832,7 +832,35 @@ class PopupWindowController: NSWindowController {
         }
     }
 
+    /// Read the currently-focused UI element's selected text via the Accessibility
+    /// API (system-wide → focused element → kAXSelectedTextAttribute). Returns nil
+    /// if the focused app doesn't expose a text selection.
+    static func accessibilitySelectedText() -> String? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focused = focusedRef else { return nil }
+        let element = focused as! AXUIElement
+        var selRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selRef) == .success,
+              let text = selRef as? String else { return nil }
+        return text
+    }
+
     private func captureSelectedText() {
+        // METHOD 1 — Accessibility API: read the focused element's selected text
+        // directly (no clipboard, no synthetic keystrokes, no modifier pollution).
+        // Most reliable for native apps + many others.
+        let frontNameForLog = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        Logger.shared.info("captureSelectedText: frontmost = \(frontNameForLog)")
+        if let axText = Self.accessibilitySelectedText(), !axText.isEmpty {
+            previousApp = NSWorkspace.shared.frontmostApplication
+            clipboardText = axText
+            Logger.shared.info("captureSelectedText: \(axText.count) chars via Accessibility API")
+            return
+        }
+        Logger.shared.info("captureSelectedText: AX API empty; falling back to synthetic Cmd+C in \(frontNameForLog)")
+
         let pasteboard = NSPasteboard.general
 
         // Save current clipboard content
@@ -851,6 +879,19 @@ class PopupWindowController: NSWindowController {
         // Strategy: try CGEvent Cmd+C first (works for Chrome, native apps),
         // then fall back to AppleScript Edit > Copy menu (works for Electron apps like Slack)
         let source = CGEventSource(stateID: .hidSystemState)
+
+        // The triggering hotkey (Option+Space, or Ctrl+Option+<key>) may still have
+        // its modifier keys PHYSICALLY HELD when we get here — which turns the
+        // synthesized Cmd+C into Cmd+Option+C (etc.) and copies nothing, so we'd see
+        // an empty selection and wrongly open the chat. Release any held
+        // Option/Control/Shift first so the synthetic copy is a clean Cmd+C.
+        for modKey: CGKeyCode in [0x3A, 0x3D, 0x3B, 0x3E, 0x38, 0x3C] {  // L/R Option, Control, Shift
+            let up = CGEvent(keyboardEventSource: source, virtualKey: modKey, keyDown: false)
+            up?.flags = []
+            up?.post(tap: .cghidEventTap)
+        }
+        usleep(30000)  // 30ms for the modifier releases to register before Cmd+C
+
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
         keyDown?.flags = .maskCommand
         keyDown?.post(tap: .cghidEventTap)
@@ -882,6 +923,7 @@ class PopupWindowController: NSWindowController {
         // Check if clipboard changed (meaning text was selected and copied)
         if pasteboard.changeCount != savedChangeCount {
             clipboardText = pasteboard.string(forType: .string) ?? ""
+            Logger.shared.info("captureSelectedText: \(clipboardText.count) chars via synthetic copy / AppleScript")
 
             // Restore original clipboard
             pasteboard.clearContents()
@@ -889,8 +931,9 @@ class PopupWindowController: NSWindowController {
                 pasteboard.setData(data, forType: type)
             }
         } else {
-            // No selection - clipboard unchanged, don't use clipboard as fallback
+            // No method produced a selection.
             clipboardText = ""
+            Logger.shared.info("captureSelectedText: 0 chars — AX + Cmd+C + AppleScript all empty in \(frontNameForLog)")
         }
     }
 
