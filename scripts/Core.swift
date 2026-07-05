@@ -2590,9 +2590,47 @@ enum WebToolSchemas {
     }
     """
 
+    static let browserScroll = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_scroll",
+        "description": "Scroll the CURRENT session page to trigger content that loads dynamically as you scroll (infinite-scroll feeds, video grids, deferred images rendered by JavaScript/AJAX). Waits for the new content to load, then returns the updated page state — follow with browser_read or browser_screenshot to capture what appeared. Use this when browser_read shows only the header/nav and the main content area looks empty.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": { "type": "string", "enum": ["bottom", "top"], "description": "Scroll to the bottom (default, to load more) or back to the top.", "default": "bottom" },
+            "pixels": { "type": "integer", "description": "Optional: scroll by this many pixels relative to the current position (positive = down, negative = up) instead of to bottom/top." },
+            "steps": { "type": "integer", "description": "Repeat the scroll+wait this many times to page through a progressive loader (1-10).", "default": 1 }
+          },
+          "required": []
+        }
+      }
+    }
+    """
+
+    static let browserEvaluate = """
+    {
+      "type": "function",
+      "function": {
+        "name": "browser_evaluate",
+        "description": "Run JavaScript in the CURRENT session page and return its result as text. Use this to read the FULLY-RENDERED DOM after client-side JS has run (e.g. \\"document.documentElement.innerHTML\\" or \\"document.querySelector('.video-grid').innerText\\"), or to compute a value the page exposes. The script's return value is stringified (objects/arrays become JSON) and char-capped. Runs in the page's content world — no filesystem or native access.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "script": { "type": "string", "description": "JavaScript to evaluate on the current page. The value of the last expression is returned (e.g. \\"document.title\\", \\"document.body.innerText\\")." },
+            "max_chars": { "type": "integer", "description": "Hard cap on returned characters.", "default": 8000 }
+          },
+          "required": ["script"]
+        }
+      }
+    }
+    """
+
     /// Interactive browser tool schemas, in registration order.
     static let browserAll: [String] = [
         browserOpen, browserClick, browserType, browserRead, browserScreenshot, browserBack,
+        browserScroll, browserEvaluate,
     ]
 }
 

@@ -140,6 +140,13 @@ if [ "${RUN_GUI_TESTS:-0}" = "1" ]; then
     # TEST-ONLY: allow the SSRF guard to reach the loopback fixture on THIS port.
     # The shipping app never sets this, so its SSRF protection is unchanged.
     export PD_WEB_ALLOW_LOOPBACK_PORT="$PORT"
+    # TEST HYGIENE: redirect ALL on-disk state (config / sessions / web-cache /
+    # shots) to a throwaway dir. WebEngine.shared derives its cache/shots dir from
+    # LLMConfig.configDir, which honors PD_CONFIG_DIR — without this, the GUI test's
+    # screenshot()/read() calls dump fixture PNGs and cache entries straight into
+    # the user's real ~/.popdraft/web-cache/. Cleaned up after the run.
+    GCFG="$(mktemp -d /tmp/popdraft-webgui-cfg.XXXXXX)"
+    export PD_CONFIG_DIR="$GCFG"
 
     # Stage the GUI test as the module's main.swift so its top-level code is the
     # entry point, then co-compile it with ALL of the real app's sources EXCEPT
@@ -167,6 +174,7 @@ if [ "${RUN_GUI_TESTS:-0}" = "1" ]; then
     fi
     rm -rf "$GSTAGE"
     rm -f "$GBIN"
+    rm -rf "$GCFG"
   fi
 
   kill "$SRV_PID" 2>/dev/null

@@ -252,6 +252,23 @@ func runTests() async {
         R.check(FileManager.default.fileExists(atPath: shot.path) && shot.width > 0,
                 "browser_screenshot: PNG written (\(shot.width)x\(shot.height))")
 
+        // scroll the page (static fixture: just verifies it runs + re-snapshots)
+        let sc = try await engine.browserScroll(to: "bottom", pixels: nil, steps: 2)
+        R.check(sc.finalURL.contains("/article"), "browser_scroll: stays on /article (\(sc.finalURL))")
+        R.check(sc.action.lowercased().contains("scroll"), "browser_scroll: action describes the scroll (\(sc.action))")
+
+        // evaluate JS in the page and coerce results of several types
+        let title = try await engine.browserEvaluate(script: "document.title", maxChars: 8000)
+        R.check(title.contains("Article"), "browser_evaluate(string): returns document.title (\(title))")
+        let num = try await engine.browserEvaluate(script: "1 + 2", maxChars: 100)
+        R.check(num == "3", "browser_evaluate(number): 1+2 coerces to \"3\" (got \"\(num)\")")
+        let boolv = try await engine.browserEvaluate(script: "document.body != null", maxChars: 100)
+        R.check(boolv == "true", "browser_evaluate(bool): coerces to \"true\" (got \"\(boolv)\")")
+        let arr = try await engine.browserEvaluate(script: "[1,2,3]", maxChars: 100)
+        R.check(arr.contains("[1,2,3]") || arr.contains("[1, 2, 3]"), "browser_evaluate(array): JSON-encoded (\(arr))")
+        let dom = try await engine.browserEvaluate(script: "document.documentElement.innerHTML", maxChars: 200)
+        R.check(dom.contains("truncated"), "browser_evaluate: long DOM is char-capped (\(dom.count) chars)")
+
         // back to the portal
         let s3 = try await engine.browserBack()
         R.check(s3.finalURL.contains("/portal"), "browser_back: returned to /portal (\(s3.finalURL))")

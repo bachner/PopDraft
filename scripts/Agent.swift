@@ -1348,6 +1348,15 @@ struct PopDraftAgent {
     CSS selector, browser_read the page, browser_back to go back. The browser \
     session persists across these calls, and each result lists the clickable \
     elements you can act on next.
+    - DYNAMIC / JS-RENDERED PAGES: many sites (feeds, video grids, infinite scroll) \
+    load their real content with JavaScript AFTER the page loads, so browser_read \
+    or a screenshot right away shows only the header/nav with an empty content \
+    area. When that happens, call browser_scroll (to:"bottom", and raise `steps` \
+    to page through progressive loaders) to trigger the content, THEN browser_read \
+    / browser_screenshot. To grab the fully-rendered DOM or a computed value \
+    directly, use browser_evaluate (e.g. script:"document.documentElement.innerHTML" \
+    or a querySelector). Prefer browser_screenshot with full_page:true to capture a \
+    tall page in one shot.
     - After EACH tool result, reassess: decide whether you have enough to answer, \
     or whether one more tool call is genuinely needed. Don't repeat the same \
     search over and over — if a search returns results, READ them and answer.
