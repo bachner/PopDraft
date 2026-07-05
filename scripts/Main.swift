@@ -83,6 +83,7 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
     private var bubble: BubbleWindowController?
     private var history: HistoryWindowController?
     private var modelSwitchWindow: NSWindow?
+    private var updateProgressCtl: UpdateProgressWindowController?
 
     init(state: String) { self.state = state }
 
@@ -108,6 +109,15 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
             s.showWindow()
             settings = s
             centerOnPrimary(s.window)
+        case "update":
+            // Render the update progress window in a "downloading" state.
+            let c = UpdateProgressWindowController()
+            c.model.title = "Downloading update…"
+            c.model.detail = "62%"
+            c.model.indeterminate = false
+            c.model.progress = 0.62
+            c.show(checking: false)
+            updateProgressCtl = c
         case "modelswitch":
             // Render the type-to-search model switcher standalone for a screenshot.
             let host = NSHostingView(rootView: ModelSwitcherPalette(

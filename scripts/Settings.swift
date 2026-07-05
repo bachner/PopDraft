@@ -259,7 +259,7 @@ struct SettingsView: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
         }
-        .frame(width: 560, height: 620)
+        .frame(width: 560, height: 680)
         .background(LiquidGlassBackground(cornerRadius: 16, shadow: false))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .onAppear {
@@ -761,30 +761,30 @@ struct SettingsView: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
 
-            // Provider-specific settings + the new validation panes.
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    switch selectedProvider {
-                    case .llamacpp:
-                        llamacppSettings
-                        Divider()
-                        localModelSection
-                    case .ollama:
-                        ollamaSettings
-                    case .openai:
-                        openaiSettings
-                        Divider()
-                        cloudModelSection
-                    case .claude:
-                        claudeSettings
-                        Divider()
-                        cloudModelSection
-                    }
+            // Provider-specific settings + the validation panes. NOT a nested
+            // ScrollView — the whole tab already scrolls (SettingsView.body). A
+            // fixed inner height clipped the Hugging Face add/validation/download
+            // rows (the "Not found" status + quant picker + Download button).
+            VStack(alignment: .leading, spacing: 12) {
+                switch selectedProvider {
+                case .llamacpp:
+                    llamacppSettings
+                    Divider()
+                    localModelSection
+                case .ollama:
+                    ollamaSettings
+                case .openai:
+                    openaiSettings
+                    Divider()
+                    cloudModelSection
+                case .claude:
+                    claudeSettings
+                    Divider()
+                    cloudModelSection
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
             }
-            .frame(maxHeight: 230)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
         }
     }
 

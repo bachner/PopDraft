@@ -385,6 +385,15 @@ class DependencyManager {
 
 // MARK: - Update Manager
 
+/// The outcome of a manual update check, handed to the caller so it can show the
+/// right feedback (offer to install / "up to date" / error) instead of the old
+/// silent behavior where a manual check that found an update showed nothing.
+enum UpdateCheckResult {
+    case available(String)   // a newer version exists
+    case upToDate
+    case failed(String)
+}
+
 class UpdateManager: NSObject, URLSessionDownloadDelegate {
     static let shared = UpdateManager()
 
@@ -392,8 +401,17 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
     private(set) var latestVersion: String?
     private(set) var downloadURL: String?
     private(set) var isDownloading = false
+    private(set) var isInstalling = false
     private(set) var downloadProgress: Double = 0
     var onUpdateStatusChanged: (() -> Void)?
+
+    /// A short human-readable phase for the progress window / menu.
+    var phaseText: String {
+        if isInstalling { return "Installing…" }
+        if isDownloading { return "Downloading update… \(Int(downloadProgress * 100))%" }
+        if updateAvailable { return "Update available: v\(latestVersion ?? "?")" }
+        return "Up to date"
+    }
 
     private let githubAPI = "https://api.github.com/repos/bachner/PopDraft/releases/latest"
     private let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
@@ -411,12 +429,16 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
         checkForUpdates(silent: true)
     }
 
-    func checkForUpdates(silent: Bool) {
+    func checkForUpdates(silent: Bool, completion: ((UpdateCheckResult) -> Void)? = nil) {
         guard let url = URL(string: githubAPI) else { return }
 
         var request = URLRequest(url: url)
         request.setValue("PopDraft/\(AppVersion.current)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 15
+
+        func finish(_ result: UpdateCheckResult) {
+            DispatchQueue.main.async { self.onUpdateStatusChanged?(); completion?(result) }
+        }
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
@@ -427,18 +449,14 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
 
             if let error = error {
                 Logger.shared.error("Update check failed: \(error.localizedDescription)")
-                if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not connect to GitHub. Please check your internet connection.") }
-                }
+                finish(.failed("Could not connect to GitHub. Please check your internet connection."))
                 return
             }
 
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tagName = json["tag_name"] as? String else {
-                if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "Update Check Failed", message: "Could not parse update information.") }
-                }
+                finish(.failed("Could not parse update information."))
                 return
             }
 
@@ -461,17 +479,16 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
                 self.latestVersion = remoteVersion
                 self.downloadURL = dmgURL
                 Logger.shared.info("Update available: v\(remoteVersion)")
-                DispatchQueue.main.async { self.onUpdateStatusChanged?() }
-                if silent {
-                    DispatchQueue.main.async { self.downloadAndInstall() }
-                }
+                // NOTE: a silent (launch) check NO LONGER auto-downloads+installs+
+                // relaunches — that was disruptive. It just marks the update
+                // available (the menu shows "Update available: vX"); the user
+                // installs on their terms via the menu.
+                finish(.available(remoteVersion))
             } else {
                 self.updateAvailable = false
                 self.latestVersion = nil
                 self.downloadURL = nil
-                if !silent {
-                    DispatchQueue.main.async { self.showAlert(title: "You're Up to Date", message: "PopDraft \(AppVersion.current) is the latest version.") }
-                }
+                finish(.upToDate)
             }
         }.resume()
     }
@@ -525,6 +542,11 @@ class UpdateManager: NSObject, URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         let dmgPath = "/tmp/PopDraft-update.dmg"
         let dmgURL = URL(fileURLWithPath: dmgPath)
+
+        // Download finished → move into the "installing" phase.
+        isDownloading = false
+        isInstalling = true
+        onUpdateStatusChanged?()
 
         do {
             // Remove any existing file
@@ -765,6 +787,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var historyController: HistoryWindowController?
     var onboardingController: OnboardingWindowController?
     var updateMenuItem: NSMenuItem?
+    var updateProgress: UpdateProgressWindowController?
     var serverStatusMenuItem: NSMenuItem?
 
     /// PR5: "Recent" submenu listing recently saved sessions. Rebuilt lazily each
@@ -944,6 +967,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Set up update manager
         UpdateManager.shared.onUpdateStatusChanged = { [weak self] in
             self?.refreshUpdateMenuItem()
+            self?.updateProgress?.refresh()
         }
         UpdateManager.shared.checkOnLaunchIfNeeded()
 
@@ -1174,17 +1198,66 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func checkForUpdatesMenu() {
         let mgr = UpdateManager.shared
-        if mgr.updateAvailable && !mgr.isDownloading {
-            let alert = NSAlert()
-            alert.messageText = "Update Available"
-            alert.informativeText = "PopDraft v\(mgr.latestVersion ?? "?") is available. You have v\(AppVersion.current).\n\nDownload and install now?"
-            alert.addButton(withTitle: "Update")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                mgr.downloadAndInstall()
+        // Already downloading/installing → just bring the progress window forward.
+        if mgr.isDownloading || mgr.isInstalling {
+            ensureUpdateProgress().show(checking: false)
+            return
+        }
+        // Already know an update is available (e.g. from the silent launch check)
+        // → go straight to the install prompt.
+        if mgr.updateAvailable {
+            promptInstallUpdate()
+            return
+        }
+        // Fresh manual check: show a "Checking…" window, then react to the result
+        // (this is the fix for "nothing happens" — a manual check that found an
+        // update used to only relabel the menu, showing the user nothing).
+        let progress = ensureUpdateProgress()
+        progress.show(checking: true)
+        mgr.checkForUpdates(silent: false) { [weak self] result in
+            guard let self = self else { return }
+            progress.hide()
+            switch result {
+            case .available:
+                self.promptInstallUpdate()
+            case .upToDate:
+                self.showUpdateAlert(title: "You're Up to Date",
+                                     message: "PopDraft \(AppVersion.current) is the latest version.")
+            case .failed(let reason):
+                self.showUpdateAlert(title: "Update Check Failed", message: reason)
             }
-        } else if !mgr.isDownloading {
-            mgr.checkForUpdates(silent: false)
+        }
+    }
+
+    private func ensureUpdateProgress() -> UpdateProgressWindowController {
+        if let c = updateProgress { return c }
+        let c = UpdateProgressWindowController()
+        updateProgress = c
+        return c
+    }
+
+    private func showUpdateAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// "Update Available — Install Now / Later". On Install Now, start the download
+    /// and show the live progress window (Downloading % → Installing → relaunch).
+    private func promptInstallUpdate() {
+        let mgr = UpdateManager.shared
+        let alert = NSAlert()
+        alert.messageText = "Update Available"
+        alert.informativeText = "PopDraft v\(mgr.latestVersion ?? "?") is available — you have v\(AppVersion.current).\n\nInstall it now? PopDraft will relaunch when finished."
+        alert.addButton(withTitle: "Install Now")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            let progress = ensureUpdateProgress()
+            progress.show(checking: false)
+            progress.refresh()
+            mgr.downloadAndInstall()
         }
     }
 
