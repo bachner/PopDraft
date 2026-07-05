@@ -92,8 +92,18 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
         switch state {
         case "bubble":
             let b = BubbleWindowController()
+            // Wire the click → chat path exactly like production (AppDelegate),
+            // so the orb-pop → chat-bloom transition can be exercised here too.
+            let p = PopupWindowController()
+            b.onExpand = { [weak b, weak p] in
+                let origin = b?.orbScreenCenter
+                b?.hideWithPop()
+                p?.showChat(from: origin)
+            }
+            p.onDidDismiss = { [weak b] in b?.show() }
             b.show(animated: false)
             bubble = b
+            popup = p
             centerOnPrimary(b.window)
         case "menu":
             let p = PopupWindowController()

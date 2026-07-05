@@ -2793,6 +2793,13 @@ struct ChatView: View {
 /// fallback (radial-gradient sphere + sparkle + soft glow) so it ALWAYS shows,
 /// even for a bare source install with no bundled art.
 ///
+/// The orb is ALIVE: a `TimelineView` drives a slow breath (scale), a gentle
+/// float (vertical bob), a pulsing halo, a light arc that orbits the rim,
+/// twinkling sparkles, and a softly beating status dot. The periods are
+/// deliberately unrelated so the motion never reads as a repeating loop. Honors
+/// Reduce Motion (renders one static frame), and `freezeTime` pins the phase
+/// for deterministic offscreen snapshots.
+///
 /// The hosting panel is non-key (it must never steal focus), so this view cannot
 /// receive SwiftUI key/tap events the usual way — clicks are delivered via a
 /// local mouse-down handler in the controller, which calls `onExpand`.
@@ -2805,31 +2812,86 @@ struct BubbleView: View {
     /// state deterministically for the offscreen PNG snapshots.
     var forceHover: Bool = false
 
+    /// When set, render the live animation at this fixed phase (seconds) instead
+    /// of the wall clock — used by the headless screenshot renderer so captures
+    /// stay deterministic.
+    var freezeTime: Double? = nil
+
     @State private var isHovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var hovered: Bool { forceHover || isHovering }
 
     var body: some View {
-        ZStack {
-            orb
-            // Small "ready" status dot at the lower-right, like an online badge.
-            Circle()
-                .fill(Color.green)
-                .frame(width: 11, height: 11)
-                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1.5))
-                .shadow(color: Color.green.opacity(0.6), radius: 3)
-                .offset(x: Self.diameter * 0.30, y: Self.diameter * 0.30)
+        Group {
+            if let t = freezeTime {
+                frame(at: t)
+            } else if reduceMotion {
+                frame(at: 0)
+            } else {
+                // 30fps is plenty for motion this slow, and keeps the always-on
+                // orb cheap.
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                    frame(at: timeline.date.timeIntervalSinceReferenceDate)
+                }
+            }
         }
         // Leave headroom around the orb for the glow + hover scale so nothing clips.
         .frame(width: Self.diameter + 24, height: Self.diameter + 24)
-        .scaleEffect(hovered ? 1.06 : 1.0)
+        .scaleEffect(hovered ? 1.08 : 1.0)
         .animation(.spring(response: 0.28, dampingFraction: 0.6), value: hovered)
         .onHover { hovering in isHovering = hovering }
         .help("PopDraft — click or press the hotkey to open")
     }
 
+    // MARK: Live animation
+
+    /// One frame of the living orb at absolute time `t`. Everything derives from
+    /// `t` via layered sines, so the view stays pure and any single frame can be
+    /// rendered deterministically.
+    private func frame(at t: Double) -> some View {
+        let breathe = 1.0 + 0.022 * sin(t * 2 * .pi / 3.6)   // slow breath
+        let bob = 1.6 * sin(t * 2 * .pi / 4.7)               // gentle float
+        let glowPulse = 0.5 + 0.5 * sin(t * 2 * .pi / 2.9)   // halo beat, 0…1
+        let dotPulse = 0.5 + 0.5 * sin(t * 2 * .pi / 2.2)    // status beat, 0…1
+
+        return ZStack {
+            // Breathing halo behind the sphere.
+            Circle()
+                .fill(
+                    RadialGradient(
+                        gradient: Gradient(colors: [
+                            Color(red: 0.55, green: 0.60, blue: 1.0)
+                                .opacity(hovered ? 0.55 : 0.26 + 0.20 * glowPulse),
+                            Color.clear
+                        ]),
+                        center: .center,
+                        startRadius: Self.diameter * 0.18,
+                        endRadius: Self.diameter * 0.62
+                    )
+                )
+                .frame(width: Self.diameter + 22, height: Self.diameter + 22)
+                .blur(radius: 3)
+
+            orb(at: t)
+                .scaleEffect(breathe)
+
+            // Small "ready" status dot at the lower-right, like an online badge —
+            // beating softly so the orb reads as alive even at rest.
+            Circle()
+                .fill(Color.green)
+                .frame(width: 11, height: 11)
+                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1.5))
+                .shadow(color: Color.green.opacity(0.45 + 0.35 * dotPulse),
+                        radius: 2.5 + 1.5 * dotPulse)
+                .scaleEffect(0.94 + 0.10 * dotPulse)
+                .offset(x: Self.diameter * 0.30, y: Self.diameter * 0.30)
+        }
+        .offset(y: bob)
+    }
+
     @ViewBuilder
-    private var orb: some View {
+    private func orb(at t: Double) -> some View {
         ZStack {
             if let orb = AppAssets.bubbleOrb {
                 // Bundled brand orb (carries its own coloring/glow).
@@ -2840,15 +2902,42 @@ struct BubbleView: View {
                     .frame(width: Self.diameter, height: Self.diameter)
                     .shadow(color: Color.black.opacity(0.25), radius: 6, y: 2)
             } else {
-                drawnOrb
+                drawnOrb(at: t)
             }
         }
+        // Comet-like light arc gliding around the rim — over the bundled art and
+        // the drawn fallback alike.
+        .overlay(shimmer(at: t))
+    }
+
+    /// A soft arc of light that orbits the sphere's rim once every ~9s.
+    private func shimmer(at t: Double) -> some View {
+        Circle()
+            .trim(from: 0, to: 0.22)
+            .stroke(
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color.white.opacity(0),
+                        Color.white.opacity(0.55),
+                        Color.white.opacity(0)
+                    ]),
+                    startPoint: .leading,
+                    endPoint: .trailing
+                ),
+                style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+            )
+            .frame(width: Self.diameter - 5, height: Self.diameter - 5)
+            .rotationEffect(.degrees(t * 360.0 / 9.0))
+            .blur(radius: 0.6)
     }
 
     /// Drawn Liquid-Glass fallback orb: a radial-gradient sphere with a glossy
-    /// highlight, a thin rim, and a small 4-point sparkle.
-    private var drawnOrb: some View {
-        ZStack {
+    /// highlight, a thin rim, and twinkling 4-point sparkles.
+    private func drawnOrb(at t: Double) -> some View {
+        let twinkle = 0.5 + 0.5 * sin(t * 2 * .pi / 1.9)          // main sparkle
+        let twinkle2 = 0.5 + 0.5 * sin(t * 2 * .pi / 2.7 + 2.1)   // counter-phase mini
+
+        return ZStack {
             // Sphere body.
             Circle()
                 .fill(
@@ -2883,12 +2972,20 @@ struct BubbleView: View {
                 .stroke(Color.white.opacity(0.35), lineWidth: 1)
                 .frame(width: Self.diameter, height: Self.diameter)
 
-            // Sparkle (4-point star) at the upper-right.
+            // Sparkle (4-point star) at the upper-right, twinkling.
             SparkleShape()
-                .fill(Color.white.opacity(0.95))
+                .fill(Color.white.opacity(0.55 + 0.45 * twinkle))
                 .frame(width: Self.diameter * 0.30, height: Self.diameter * 0.30)
+                .scaleEffect(0.85 + 0.20 * twinkle)
                 .offset(x: Self.diameter * 0.20, y: -Self.diameter * 0.20)
-                .shadow(color: Color.white.opacity(0.8), radius: 3)
+                .shadow(color: Color.white.opacity(0.5 + 0.4 * twinkle), radius: 3)
+
+            // A second, smaller sparkle on an unrelated phase for depth.
+            SparkleShape()
+                .fill(Color.white.opacity(0.25 + 0.45 * twinkle2))
+                .frame(width: Self.diameter * 0.14, height: Self.diameter * 0.14)
+                .scaleEffect(0.8 + 0.3 * twinkle2)
+                .offset(x: -Self.diameter * 0.16, y: Self.diameter * 0.10)
         }
         .shadow(color: Color.black.opacity(0.30), radius: 6, y: 2)
     }
@@ -2913,6 +3010,23 @@ struct SparkleShape: Shape {
         p.closeSubpath()
         return p
     }
+}
+
+/// A `CATransform3D` that scales by `s` while keeping `point` fixed. Written for
+/// AppKit view backing layers, whose `anchorPoint` is `.zero` — the fixed point
+/// is achieved with an explicit translate-then-scale, so the caller never has to
+/// touch `anchorPoint`/`position`. Shared by the bubble pop/bounce and the chat
+/// bloom/dismiss transitions.
+func layerScale(_ s: CGFloat, around point: CGPoint) -> CATransform3D {
+    var t = CATransform3DMakeTranslation((1 - s) * point.x, (1 - s) * point.y, 0)
+    t = CATransform3DScale(t, s, s, 1)
+    return t
+}
+
+/// True when the user asked macOS to minimize motion — transitions degrade to
+/// plain fades and the orb renders a static frame.
+var systemReduceMotion: Bool {
+    NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
 }
 
 /// A borderless, NON-ACTIVATING panel that hosts the corner orb. Unlike
@@ -2965,6 +3079,8 @@ final class BubbleWindowController: NSWindowController {
 
         let host = BubbleClickHostingView(rootView: BubbleView())
         host.frame = NSRect(origin: .zero, size: size)
+        // Layer-backed so the pop/bounce transitions can animate its transform.
+        host.wantsLayer = true
         host.onClick = { [weak self] in self?.onExpand?() }
         panel.contentView = host
         hostingView = host
@@ -3024,14 +3140,41 @@ final class BubbleWindowController: NSWindowController {
 
     // MARK: Show / hide
 
-    /// Show the orb in its corner, fading in. Does NOT activate the app.
+    /// The orb's current center in screen coordinates — the point the expanded
+    /// chat "blooms" out of. Nil when the orb isn't on screen.
+    var orbScreenCenter: NSPoint? {
+        guard isShown, let f = window?.frame else { return nil }
+        return NSPoint(x: f.midX, y: f.midY)
+    }
+
+    /// Remove any leftover pop/bounce transform animation from the orb's layer.
+    private func clearOrbAnimations() {
+        hostingView?.layer?.removeAnimation(forKey: "orbPop")
+        hostingView?.layer?.removeAnimation(forKey: "orbBounceIn")
+    }
+
+    /// Show the orb in its corner. Does NOT activate the app. Animated, it lands
+    /// with a springy bounce-in (scale from 0.45 + fade) so returning from the
+    /// chat feels like the orb settling back — a plain fade under Reduce Motion.
     func show(animated: Bool = true) {
         guard let window = window else { return }
         pinToCorner(animated: false)
         isShown = true
+        clearOrbAnimations()
         if animated {
             window.alphaValue = 0
             window.orderFrontRegardless()
+            if let host = hostingView, let layer = host.layer, !systemReduceMotion {
+                let spring = CASpringAnimation(keyPath: "transform")
+                spring.fromValue = NSValue(caTransform3D: layerScale(
+                    0.45, around: CGPoint(x: host.bounds.midX, y: host.bounds.midY)))
+                spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+                spring.mass = 1
+                spring.stiffness = 280
+                spring.damping = 16
+                spring.duration = spring.settlingDuration
+                layer.add(spring, forKey: "orbBounceIn")
+            }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.22
                 window.animator().alphaValue = 1
@@ -3050,12 +3193,48 @@ final class BubbleWindowController: NSWindowController {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.16
                 window.animator().alphaValue = 0
-            }, completionHandler: { [weak window] in
-                window?.orderOut(nil)
+            }, completionHandler: { [weak self] in
+                // A show() during the fade supersedes this hide — leave it up.
+                guard let self = self, !self.isShown else { return }
+                self.window?.orderOut(nil)
             })
         } else {
             window.orderOut(nil)
         }
+    }
+
+    /// Hide by "popping" — the orb swells and fades under the cursor as the chat
+    /// blooms out of its corner (the click transition's first half). Degrades to
+    /// the plain fade under Reduce Motion.
+    func hideWithPop() {
+        guard let window = window, isShown else { return }
+        guard !systemReduceMotion else {
+            hide(animated: true)
+            return
+        }
+        isShown = false
+        if let host = hostingView, let layer = host.layer {
+            let pop = CABasicAnimation(keyPath: "transform")
+            pop.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+            pop.toValue = NSValue(caTransform3D: layerScale(
+                1.45, around: CGPoint(x: host.bounds.midX, y: host.bounds.midY)))
+            pop.duration = 0.18
+            pop.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            pop.fillMode = .forwards
+            pop.isRemovedOnCompletion = false
+            layer.add(pop, forKey: "orbPop")
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            // A show() during the pop supersedes this hide — leave it up (and
+            // don't strip the bounce-in it just started).
+            guard let self = self, !self.isShown else { return }
+            self.clearOrbAnimations()
+            self.window?.orderOut(nil)
+        })
     }
 
     var isVisible: Bool { isShown }
