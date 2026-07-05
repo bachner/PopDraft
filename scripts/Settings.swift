@@ -127,6 +127,7 @@ struct SettingsView: View {
     @State private var hfValidation: ModelValidation? = nil
     @State private var hfFiles: [GGUFFile] = []
     @State private var hfSelectedFile: String = ""
+    @State private var hfSuggestions: [HFSearchHit] = []
     @State private var hfDebounceTask: Task<Void, Never>? = nil
     @State private var userModels: [ModelRef] = []
 
@@ -805,6 +806,41 @@ struct SettingsView: View {
             // Live chip
             hfValidationChip
 
+            // Search suggestions — when the field isn't a valid exact repo, list
+            // matching GGUF models so the user can pick one to download.
+            if !hfSuggestions.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Matching models on Hugging Face — click to select")
+                        .font(.system(size: 10, weight: .medium)).foregroundColor(.secondary)
+                    ForEach(hfSuggestions) { hit in
+                        Button {
+                            hfRepoInput = hit.id
+                            scheduleHFValidation(hit.id)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "cube.box")
+                                    .font(.system(size: 10)).foregroundColor(.accentColor)
+                                Text(hit.id)
+                                    .font(.system(size: 11, design: .monospaced)).lineLimit(1)
+                                if hit.gated {
+                                    Image(systemName: "lock.fill")
+                                        .font(.system(size: 8)).foregroundColor(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                                Text(formatDownloads(hit.downloads))
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.vertical, 2)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.06)))
+            }
+
             // Quant picker + download (only when valid & files listed)
             if let v = hfValidation, v.isUsable, !hfFiles.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1324,6 +1360,7 @@ struct SettingsView: View {
             hfValidating = false
             hfValidation = nil
             hfFiles = []
+            hfSuggestions = []
             return
         }
         // Clear stale state so the chip / quant picker don't show old data mid-debounce.
@@ -1333,17 +1370,21 @@ struct SettingsView: View {
         hfDebounceTask = Task { [repo] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             if Task.isCancelled { return }
-            let validation = await ModelValidator.validateHFRepo(repo)
-            // `let` (not `var`) so the value isn't a mutable capture in the closures below
-            // — older CI Swift rejects capturing a mutated var in concurrent code.
+            // Validate an exact `owner/repo` (if it looks like one) AND search HF for
+            // matching GGUF repos — so a plain name like "gemma" yields suggestions.
+            async let validationTask = ModelValidator.validateHFRepo(repo)
+            async let suggestionsTask = ModelValidator.searchHFRepos(repo, limit: 12)
+            let validation = await validationTask
+            let suggestions = await suggestionsTask
             let files: [GGUFFile] = validation.isUsable ? await ModelValidator.listGGUFFiles(repo) : []
             if Task.isCancelled { return }
             await MainActor.run {
                 hfValidating = false
                 hfValidation = validation
                 hfFiles = files
-                // Prefer the smallest file with a KNOWN size; size-unknown (0-byte) GGUFs
-                // (e.g. sharded parts) shouldn't win the default selection.
+                // Hide suggestions once the field IS a valid exact repo (the quant
+                // picker takes over); otherwise show them as download candidates.
+                hfSuggestions = validation.isUsable ? [] : suggestions
                 if let first = smallestUsableFile(files) {
                     hfSelectedFile = first.filename
                 } else if let first = files.first {
@@ -1356,6 +1397,13 @@ struct SettingsView: View {
     /// The smallest GGUF file with a known (>0) size, used for the default quant pick.
     private func smallestUsableFile(_ files: [GGUFFile]) -> GGUFFile? {
         files.filter { $0.sizeBytes > 0 }.min(by: { $0.sizeBytes < $1.sizeBytes })
+    }
+
+    /// Compact download count for a search suggestion (e.g. "12.3k ↓").
+    private func formatDownloads(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM ↓", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fk ↓", Double(n) / 1_000) }
+        return "\(n) ↓"
     }
 
     /// Download the chosen GGUF file from the validated HF repo and register it as a user model.

@@ -554,6 +554,13 @@ struct GGUFFile: Equatable {
     var sizeBytes: Int64
 }
 
+/// A Hugging Face model-search hit (a GGUF repo the user could download).
+struct HFSearchHit: Equatable, Identifiable {
+    let id: String           // "owner/repo"
+    let downloads: Int
+    let gated: Bool
+}
+
 /// The result of validating a local (Hugging Face GGUF) model reference.
 struct ModelValidation: Equatable {
     enum State: Equatable {
@@ -825,6 +832,40 @@ enum ModelValidator {
             return parseHFTree(data)
         } catch {
             return []
+        }
+    }
+
+    /// Search Hugging Face for GGUF models matching `query`, most-downloaded first.
+    /// Powers the "suggest which to download" list so the user can type a name
+    /// (e.g. "gemma") instead of an exact `owner/repo` id.
+    static func searchHFRepos(_ query: String, limit: Int = 12, token: String? = nil) async -> [HFSearchHit] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 2,
+              let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://huggingface.co/api/models?search=\(encoded)&filter=gguf&sort=downloads&direction=-1&limit=\(max(1, limit))") else {
+            return []
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        if let token = token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            return parseHFSearch(data)
+        } catch {
+            return []
+        }
+    }
+
+    /// Parse `GET /api/models?search=…` into search hits (pure; unit-tested).
+    static func parseHFSearch(_ data: Data) -> [HFSearchHit] {
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return arr.compactMap { m in
+            guard let id = (m["id"] as? String) ?? (m["modelId"] as? String), id.contains("/") else { return nil }
+            let downloads = (m["downloads"] as? Int) ?? 0
+            let gated = (m["gated"] as? Bool) ?? ((m["gated"] as? String).map { $0 != "false" } ?? false)
+            return HFSearchHit(id: id, downloads: downloads, gated: gated)
         }
     }
 
