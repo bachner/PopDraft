@@ -2313,8 +2313,9 @@ final class WebEngine {
               let vqd = ImageSearchParser.parseVQD(html) else {
             return []
         }
-        // Step 2: the i.js JSON endpoint (US English, off-strict-safe-search).
-        let apiURL = "https://duckduckgo.com/i.js?l=us-en&o=json&q=\(encoded)&vqd=\(vqd)&f=,,,,,&p=1"
+        // Step 2: the i.js JSON endpoint (US English). `p=-1` = safe search OFF
+        // (unfiltered results); `p=1` would be strict SFW, `p=-2` moderate.
+        let apiURL = "https://duckduckgo.com/i.js?l=us-en&o=json&q=\(encoded)&vqd=\(vqd)&f=,,,,,&p=-1"
         let (jsonData, jsonStatus) = try await get(apiURL, referer: tokenURL)
         guard jsonStatus == 200, let json = String(data: jsonData, encoding: .utf8) else { return [] }
         return ImageSearchParser.parseDDGImageJSON(json, maxResults: q.maxResults)
@@ -2325,9 +2326,10 @@ final class WebEngine {
     /// and extract `<img>` sources via `WebJS.imageExtractScript`.
     private func browseImageSERP(_ q: SearchQuery) async throws -> [ImageResult] {
         let encoded = q.query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q.query
+        // Safe search OFF on both engines: Bing `adlt=off`, DuckDuckGo `kp=-1`.
         let serps = [
-            "https://www.bing.com/images/search?q=\(encoded)",
-            "https://duckduckgo.com/?q=\(encoded)&iax=images&ia=images",
+            "https://www.bing.com/images/search?q=\(encoded)&adlt=off",
+            "https://duckduckgo.com/?q=\(encoded)&iax=images&ia=images&kp=-1",
         ]
         for serp in serps {
             guard let url = URL(string: serp) else { continue }
