@@ -845,10 +845,15 @@ enum ModelValidator {
     /// Powers the "suggest which to download" list so the user can type a name
     /// (e.g. "gemma") instead of an exact `owner/repo` id.
     static func searchHFRepos(_ query: String, limit: Int = 12, token: String? = nil) async -> [HFSearchHit] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard q.count >= 2,
-              let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://huggingface.co/api/models?search=\(encoded)&filter=gguf&sort=downloads&direction=-1&limit=\(max(1, limit))") else {
+        let q0 = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q0.count >= 2 else { return [] }
+        // If the user typed `owner/name`, search by the NAME part only. GGUF
+        // conversions almost always live under a DIFFERENT owner (mradermacher,
+        // bartowski, …), so searching the full `owner/name` returns just the
+        // (often safetensors-only) base repo and hides the downloadable GGUFs.
+        let term = q0.contains("/") ? String(q0.split(separator: "/").last ?? Substring(q0)) : q0
+        guard let encoded = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://huggingface.co/api/models?search=\(encoded)&filter=gguf&sort=downloads&direction=-1&limit=\(max(1, limit) * 2)") else {
             return []
         }
         var req = URLRequest(url: url)
@@ -858,10 +863,21 @@ enum ModelValidator {
         }
         do {
             let (data, _) = try await URLSession.shared.data(for: req)
-            return parseHFSearch(data)
+            return rankHFSearchHits(parseHFSearch(data), limit: limit)
         } catch {
             return []
         }
+    }
+
+    /// HF's `filter=gguf` is loose — it returns some repos with NO `.gguf` files
+    /// (the safetensors base repo, NVFP4 forks, …). Real GGUF conversions almost
+    /// always have "GGUF" in the repo name, so prefer those; if none do, fall back
+    /// to the raw list. Sorted by downloads within each group. (Pure; unit-tested.)
+    static func rankHFSearchHits(_ hits: [HFSearchHit], limit: Int) -> [HFSearchHit] {
+        let ggufNamed = hits.filter { $0.id.lowercased().contains("gguf") }
+        let ranked = (ggufNamed.isEmpty ? hits : ggufNamed)
+            .sorted { $0.downloads > $1.downloads }
+        return Array(ranked.prefix(max(1, limit)))
     }
 
     /// Parse `GET /api/models?search=…` into search hits (pure; unit-tested).
