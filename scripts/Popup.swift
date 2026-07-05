@@ -956,6 +956,7 @@ class PopupWindowController: NSWindowController {
         Logger.shared.info("showAtMouseLocation: entry")
         // Minimize the corner bubble (if enabled) as we transition to the panel.
         onWillShow?()
+        resetPresentation()
 
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
@@ -1034,9 +1035,14 @@ class PopupWindowController: NSWindowController {
     /// user's first message. The corner bubble uses THIS (not `showAtMouseLocation`)
     /// so clicking the orb goes straight to chat, while the hotkey opens the action
     /// menu. Two distinct, predictable entry points.
-    func showChat() {
+    ///
+    /// `sourcePoint` is the orb's center in screen coordinates: when set, the
+    /// chat window "blooms" out of that point (spring scale + fade) instead of
+    /// just appearing.
+    func showChat(from sourcePoint: NSPoint? = nil) {
         Logger.shared.info("showChat: entry (bubble → chat)")
         onWillShow?()
+        resetPresentation()
 
         // Fresh invocation state (mirror showAtMouseLocation's reset). No capture:
         // the bubble is the assistant, not a text-action on a selection.
@@ -1051,15 +1057,19 @@ class PopupWindowController: NSWindowController {
         presentedMessageCount = nil
 
         enterChat(seedUser: "", selectedText: nil, autoRun: false)
+        // Order front invisible, then bloom in (fade + spring-scale from the orb).
+        window?.alphaValue = 0
         window?.makeKeyAndOrderFront(nil)
         startKeyboardMonitoring()
         NSApp.activate(ignoringOtherApps: true)
+        animateChatBloom(from: sourcePoint)
     }
 
     func showWithAction(actionID: String) {
         Logger.shared.info("showWithAction: \(actionID)")
         // Minimize the corner bubble (if enabled) as we transition to the panel.
         onWillShow?()
+        resetPresentation()
 
         // Capture selected text by simulating Cmd+C
         captureSelectedText()
@@ -1122,6 +1132,62 @@ class PopupWindowController: NSWindowController {
         selectAction(action)
     }
 
+    // MARK: - Presentation transitions (bubble ⇄ chat)
+
+    /// Bumped on every show/dismiss so a pending animated dismissal's completion
+    /// can tell it was superseded and must not order out the (re)shown window.
+    private var presentationGeneration = 0
+
+    private static let bloomAnimationKey = "popdraft.bloom"
+    private static let dismissAnimationKey = "popdraft.dismiss"
+
+    /// Drop any in-flight bloom/dismiss animation and restore the window to full
+    /// visibility. Every show path calls this so a panel caught mid-transition
+    /// can't come back dimmed or scaled.
+    private func resetPresentation() {
+        presentationGeneration &+= 1
+        guard let window = window else { return }
+        window.alphaValue = 1
+        if let layer = window.contentView?.layer {
+            layer.removeAnimation(forKey: Self.bloomAnimationKey)
+            layer.removeAnimation(forKey: Self.dismissAnimationKey)
+        }
+    }
+
+    /// "Bloom" the just-shown chat window out of `sourcePoint` (screen
+    /// coordinates — the corner orb's center): the content spring-scales up
+    /// anchored toward the orb while the window fades in. With no source point
+    /// it blooms from its own center; under Reduce Motion it only fades.
+    /// Expects the window to be on screen with `alphaValue == 0`.
+    private func animateChatBloom(from sourcePoint: NSPoint?) {
+        guard let window = window else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.20
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+        }
+        guard !systemReduceMotion, let content = window.contentView else { return }
+        content.wantsLayer = true
+        guard let layer = content.layer else { return }
+
+        // Where to grow from, in the content view's coordinate space. The orb
+        // sits outside the window's frame, so this point may be (deliberately)
+        // outside the bounds — the transform still anchors the growth toward it.
+        var anchor = CGPoint(x: content.bounds.midX, y: content.bounds.midY)
+        if let p = sourcePoint {
+            anchor = content.convert(window.convertPoint(fromScreen: p), from: nil)
+        }
+
+        let spring = CASpringAnimation(keyPath: "transform")
+        spring.fromValue = NSValue(caTransform3D: layerScale(0.20, around: anchor))
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        spring.mass = 1
+        spring.stiffness = 240
+        spring.damping = 22
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: Self.bloomAnimationKey)
+    }
+
     func dismiss() {
         // PR8: stop any in-flight agent run before tearing down.
         chatViewModel?.cancel()
@@ -1135,7 +1201,52 @@ class PopupWindowController: NSWindowController {
 
         stopTTSStatusPolling()
         stopKeyboardMonitoring()
+
+        // The chat closes with a quick shrink + fade, and the bubble then
+        // bounces back in — the click transition's reverse. The transient
+        // action menu still vanishes instantly.
+        var animateOut = false
+        if case .chat = state {
+            animateOut = window?.isVisible == true && !systemReduceMotion
+        }
+
+        guard animateOut, let window = window else {
+            finishDismiss()
+            return
+        }
+
+        presentationGeneration &+= 1
+        let generation = presentationGeneration
+        if let content = window.contentView, let layer = content.layer {
+            let shrink = CABasicAnimation(keyPath: "transform")
+            shrink.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+            shrink.toValue = NSValue(caTransform3D: layerScale(
+                0.92, around: CGPoint(x: content.bounds.midX,
+                                      y: content.bounds.midY)))
+            shrink.duration = 0.15
+            shrink.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            shrink.fillMode = .forwards
+            shrink.isRemovedOnCompletion = false
+            layer.add(shrink, forKey: Self.dismissAnimationKey)
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            // A show during the fade supersedes this dismissal — its
+            // resetPresentation() already restored alpha/transform.
+            guard let self = self, self.presentationGeneration == generation else { return }
+            self.finishDismiss()
+        })
+    }
+
+    /// Tear-down shared by the instant and animated dismiss paths: order out,
+    /// restore presentation state, refocus the previous app, restore the bubble.
+    private func finishDismiss() {
         window?.orderOut(nil)
+        window?.alphaValue = 1
+        window?.contentView?.layer?.removeAnimation(forKey: Self.dismissAnimationKey)
 
         // Refocus the previous app
         if let app = previousApp {
@@ -1867,6 +1978,7 @@ class PopupWindowController: NSWindowController {
         // result view). An unchanged session won't be re-saved on dismiss
         // (`presentedMessageCount` guard); a new turn grows it and re-saves.
         onWillShow?()
+        resetPresentation()
         // Remember the app to refocus on dismiss (reopen skips captureSelectedText,
         // which is where `previousApp` is normally set).
         previousApp = NSWorkspace.shared.frontmostApplication
