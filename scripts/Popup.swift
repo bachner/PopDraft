@@ -1389,6 +1389,9 @@ class PopupWindowController: NSWindowController {
             // PR8: any non-Copy LLM action now opens the full chat, seeded with the
             // action applied to the selection. The agent loop produces the first
             // assistant turn (continuable), instead of the old single-shot result.
+            // These are pure text transformations (Improve / Fix grammar / …), so
+            // the auto-run turn is tool-less — the model can't spuriously call
+            // summarize_text / current_datetime on a plain rewrite.
             let capturedText = clipboardText
             let seed = capturedText.isEmpty
                 ? action.prompt
@@ -1396,7 +1399,8 @@ class PopupWindowController: NSWindowController {
             enterChat(
                 seedUser: seed,
                 selectedText: capturedText.isEmpty ? nil : capturedText,
-                autoRun: true)
+                autoRun: true,
+                suppressToolsFirstTurn: true)
 
         case .agent:
             runAgent(action: action)
@@ -1429,7 +1433,8 @@ class PopupWindowController: NSWindowController {
     /// the fixed chat panel, and (optionally) start generating. Shared by the
     /// "Ask Agent" action, any non-Copy action routed to chat, and the
     /// empty-selection hotkey.
-    private func enterChat(seedUser: String, selectedText: String?, autoRun: Bool) {
+    private func enterChat(seedUser: String, selectedText: String?, autoRun: Bool,
+                           suppressToolsFirstTurn: Bool = false) {
         let now = Date().timeIntervalSince1970
         var messages: [ChatMessage] = [
             ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
@@ -1443,12 +1448,14 @@ class PopupWindowController: NSWindowController {
             selectedText: selectedText,
             messages: messages)
         session.refreshTitle()
-        presentChat(for: session, autoRun: autoRun)
+        presentChat(for: session, autoRun: autoRun, suppressToolsFirstTurn: suppressToolsFirstTurn)
     }
 
     /// Present `ChatView` for an existing/seeded session and size the panel.
-    private func presentChat(for session: ChatSession, autoRun: Bool) {
+    private func presentChat(for session: ChatSession, autoRun: Bool,
+                             suppressToolsFirstTurn: Bool = false) {
         let vm = AgentChatViewModel(session: session, store: sessionStore)
+        vm.suppressToolsOnNextRun = suppressToolsFirstTurn
         chatViewModel = vm
         // The chat's own save point: the controller persists on copy/minimize.
         currentSession = session

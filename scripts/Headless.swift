@@ -34,6 +34,7 @@ private struct AgentOnceOptions {
     var screenshotDir: String?
     var maxIterations: Int?
     var timeoutSeconds: Int = 120
+    var noTools: Bool = false
 }
 
 /// Tiny `--flag value` parser (shared by both modes). Recognizes `--flag value`
@@ -89,6 +90,7 @@ enum HeadlessRunner {
         o.screenshotDir = CLIArgs.value("--screenshot-dir", in: args)
         o.maxIterations = CLIArgs.value("--max-iterations", in: args).flatMap { Int($0) }
         if let t = CLIArgs.value("--timeout", in: args).flatMap({ Int($0) }), t > 0 { o.timeoutSeconds = t }
+        o.noTools = CLIArgs.has("--no-tools", in: args)
         return o
     }
 
@@ -211,7 +213,8 @@ enum HeadlessRunner {
                 let outcome = try await PopDraftAgent.run(
                     session: session, config: config,
                     confirmer: nil,                 // no UI → confirm-gated cmds can't run
-                    onTextDelta: nil, onProgress: onProgress)
+                    onTextDelta: nil, onProgress: onProgress,
+                    disableTools: opts.noTools)
                 finalText = outcome.finalText
                 iterations = outcome.iterations
                 if outcome.stoppedAtMax { exitStatus = "max_iterations" }

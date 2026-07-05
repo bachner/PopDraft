@@ -137,6 +137,13 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// The text of the last user message sent (for Up-arrow recall in the input).
     private(set) var lastSentUserMessage: String = ""
 
+    /// When true, the NEXT `run()` offers NO tools. Set for the auto-run of a pure
+    /// text-transformation action (Improve / Fix grammar / Translate / …) so a
+    /// small model can't reach for summarize_text / current_datetime on a plain
+    /// rewrite. Auto-clears after that one run, so follow-up chat turns the user
+    /// types get the full toolset back.
+    var suppressToolsOnNextRun: Bool = false
+
     init(session: ChatSession, store: SessionStore) {
         self.session = session
         self.store = store
@@ -380,6 +387,10 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
 
         let snapshot = session
         let appConfig = AppConfig.load(dir: LLMConfig.configDir)
+        // Consume the one-shot "no tools" flag (set for a pure text-transformation
+        // action's auto-run). Cleared here so any follow-up turn gets tools back.
+        let disableTools = suppressToolsOnNextRun
+        suppressToolsOnNextRun = false
 
         // Surface a tiny note if this turn's transcript is large enough that the
         // agent will compact older messages to stay under the context window. The
@@ -414,7 +425,8 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                 let outcome = try await PopDraftAgent.run(
                     session: snapshot, config: appConfig,
                     confirmer: self.confirmBroker,
-                    onTextDelta: onDelta, onProgress: onProgress)
+                    onTextDelta: onDelta, onProgress: onProgress,
+                    disableTools: disableTools)
                 guard self.generation == gen else { return }  // superseded → drop
                 var saved = outcome.session
                 // Item 7: re-append any user messages the person typed WHILE this

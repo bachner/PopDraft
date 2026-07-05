@@ -1470,9 +1470,17 @@ struct PopDraftAgent {
         config: AppConfig,
         confirmer: (any MacControlConfirmer)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil,
-        onProgress: ToolProgressHook? = nil
+        onProgress: ToolProgressHook? = nil,
+        disableTools: Bool = false
     ) async throws -> AgentLoop.Outcome {
-        let (registry, mcpClients) = await buildRegistry(config: config, confirmer: confirmer)
+        // Pure text-transformation actions (Improve / Fix grammar / Translate / …)
+        // must NOT call tools — offering them just invites a small model to reach
+        // for summarize_text / current_datetime / etc. on a plain rewrite. An empty
+        // registry means the model literally CANNOT call a tool; it just produces
+        // the transformed text. Follow-up chat turns run with the full registry.
+        let (registry, mcpClients): (ToolRegistry, MCPClientHolder) = disableTools
+            ? (ToolRegistry(), MCPClientHolder())
+            : await buildRegistry(config: config, confirmer: confirmer)
         // Shut MCP servers down when the turn ends, however it ends — INCLUDING any
         // started mid-turn by `add_mcp_server` (the holder is appended to live).
         defer { mcpClients.shutdownAll() }
