@@ -315,6 +315,28 @@ func runTests() async {
         R.check(false, "browser_open loopback blocked but non-WebEngineError: \(error)")
     }
 
+    // --- regression: a page with a srcdoc iframe (about:srcdoc) loads fine ---
+    // Previously the navigation-delegate SSRF guard fail-closed on the iframe's
+    // about:srcdoc sub-navigation → "Blocked host (SSRF / private address):
+    // about:srcdoc". The outer page must now open + read without error.
+    do {
+        let s = try await engine.browserOpen(URL(string: "\(b)/srcdoc")!)
+        R.check(s.finalURL.contains("/srcdoc"), "srcdoc: outer page opened (\(s.finalURL))")
+        R.check(s.title.contains("Srcdoc"), "srcdoc: outer page title parsed (\(s.title))")
+        // A screenshot exercises the load path (loadAndSettle) too — must not throw.
+        let shot = try await engine.screenshot(URL(string: "\(b)/srcdoc")!, fullPage: false)
+        R.check(FileManager.default.fileExists(atPath: shot.path),
+                "srcdoc: screenshot of a srcdoc-iframe page succeeds (no SSRF block)")
+    } catch let e as WebEngineError {
+        if case .blockedHost(let h) = e {
+            R.check(false, "srcdoc iframe wrongly blocked as SSRF host: \(h)")
+        } else {
+            R.check(false, "srcdoc page load threw: \(e)")
+        }
+    } catch {
+        R.check(false, "srcdoc page load threw: \(error)")
+    }
+
     // =====================================================================
     // download_file: SSRF-gated fetch + write to disk (uses the loopback fixture
     // via the test-loopback escape hatch). The CONFIRM gate is a separate seam

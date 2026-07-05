@@ -1497,6 +1497,18 @@ enum SafetyGuard {
         return allowedSchemes.contains(scheme)
     }
 
+    /// WebKit's internal, non-network URLs — `about:blank` (reset) and
+    /// `about:srcdoc` (the document URL of an iframe whose HTML comes from its
+    /// `srcdoc` attribute), plus any other `about:` target. These never open a
+    /// socket or resolve a host, so the SSRF/host guard in the navigation
+    /// delegates MUST skip them: otherwise a legitimate srcdoc iframe on an
+    /// ordinary page fail-closes the whole load ("Blocked host: about:srcdoc").
+    /// This is only for delegate-observed sub-navigations — the top-level URL the
+    /// agent asks to open is still held to `isSchemeAllowed` (http/https/about:blank).
+    static func isNonNetworkNavigation(_ url: URL) -> Bool {
+        return url.scheme?.lowercased() == "about"
+    }
+
     /// Classify a literal IP string (v4 or v6). Returns true if the address is
     /// one we must refuse to fetch: loopback, RFC1918, link-local, ULA, the
     /// unspecified address, or the cloud metadata endpoint.
