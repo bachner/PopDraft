@@ -151,6 +151,14 @@ struct LLMConfig {
 
     static let llamaModels: [LlamaModel] = [
         LlamaModel(
+            id: "qwen3-30b-a3b",
+            name: "Qwen3 30B-A3B (recommended)",
+            size: "~18.6GB",
+            languages: "119 languages",
+            url: "https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+            filename: "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+        ),
+        LlamaModel(
             id: "qwen3.5-2b",
             name: "Qwen 3.5 2B",
             size: "~1.3GB",
@@ -185,7 +193,7 @@ struct LLMConfig {
     ]
 
     var provider: Provider = .llamacpp
-    var llamaModel: String = "qwen3.5-4b"
+    var llamaModel: String = "qwen3-30b-a3b"
     var llamacppURL: String = "http://localhost:10819"
     var ollamaURL: String = "http://localhost:11434"
     var ollamaModel: String = "qwen3.5:4b"

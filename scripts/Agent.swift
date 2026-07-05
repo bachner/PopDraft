@@ -12,6 +12,44 @@ import WebKit
 import CryptoKit
 import Network
 
+// MARK: - Agent trace log
+
+/// Human-readable, step-by-step trace of the agent loop, written to
+/// `~/.popdraft/agent-trace.log`. The pure `AgentLoop` emits one line per event
+/// (the model's thinking, each tool call + arguments, each tool result, the final
+/// answer) into this sink, so a wrong conclusion can be traced to the exact
+/// search query and result that produced it. Thread-safe (called from the async
+/// loop); the file self-rotates past ~4 MB so it can't grow unbounded.
+enum AgentTrace {
+    static let path = NSString(string: "~/.popdraft/agent-trace.log").expandingTildeInPath
+    private static let lock = NSLock()
+    private static let maxBytes = 4 * 1024 * 1024
+    private static let stampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
+    static func write(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        let stamped = "[\(stampFormatter.string(from: Date()))] \(line)\n"
+        let url = URL(fileURLWithPath: path)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? Int, size > maxBytes {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        if let fh = try? FileHandle(forWritingTo: url) {
+            fh.seekToEndOfFile()
+            fh.write(Data(stamped.utf8))
+            try? fh.close()
+        } else {
+            let dir = NSString(string: "~/.popdraft").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? Data(stamped.utf8).write(to: url)
+        }
+    }
+}
+
 // MARK: - LLM Client
 
 class LLMClient {
@@ -634,7 +672,14 @@ class LLMClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey = apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        request.timeoutInterval = 180
+        // Per-request timeout. Default 180s, but very large local models (e.g. a
+        // 235B streaming experts from SSD) can spend minutes just on prefill of a
+        // long agentic context, so allow an override via POPDRAFT_HTTP_TIMEOUT_SEC.
+        if let t = ProcessInfo.processInfo.environment["POPDRAFT_HTTP_TIMEOUT_SEC"], let secs = Double(t), secs > 0 {
+            request.timeoutInterval = secs
+        } else {
+            request.timeoutInterval = 180
+        }
 
         var body: [String: Any] = [
             "messages": openAIMessagesJSON(messages),
@@ -1191,7 +1236,45 @@ enum BuiltinTools {
 /// action — returns the final answer plus the updated session.
 struct PopDraftAgent {
     /// Default system prompt seeding the agent.
-    static let systemPrompt = """
+    /// The agent's system prompt. COMPUTED (not a constant) so every new session
+    /// is stamped with the CURRENT date/time and an anti-stale-knowledge directive:
+    /// a local/older model otherwise answers "what exists / recent prices / events"
+    /// from its training cutoff and confidently contradicts reality (and even live
+    /// search results). The date is ground truth; tool results beat memory.
+    static var systemPrompt: String {
+        return currentContextPreamble() + "\n\n" + systemPromptBase
+    }
+
+    /// A fresh preamble with today's date/time (local) + the rule that the model's
+    /// built-in knowledge is dated and must yield to the date above and to tool
+    /// results. Regenerated on each access so it's always current.
+    static func currentContextPreamble() -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US")
+        df.dateFormat = "EEEE, d MMMM yyyy, HH:mm"
+        let stamp = df.string(from: Date())
+        let tz = TimeZone.current.identifier
+        return """
+        CURRENT DATE & TIME: \(stamp) (\(tz), the user's local time). Treat this as \
+        ground truth for anything time-sensitive.
+
+        YOUR TRAINING KNOWLEDGE IS DATED. Your built-in knowledge has a cutoff in the \
+        PAST, so what you "remember" about recent products, models, prices, releases, \
+        people's current roles, and world events may be OUT OF DATE or wrong. Rules:
+        - NEVER tell the user that a product, model, feature, event, or release \
+        "doesn't exist yet", "isn't out", "hasn't happened", or "isn't available" \
+        based on your own memory. If you're unsure whether something current exists, \
+        web_search FIRST, then answer from what you find.
+        - When a web/tool result CONFLICTS with what you remember, TRUST THE TOOL \
+        RESULT — it reflects today; your memory does not. Do not "correct" fresh \
+        search results with stale assumptions or warn the user that real, current \
+        facts are mistaken.
+        - For prices, availability, "the latest X", recent news, or anything that \
+        changes over time, verify with the web tools rather than recalling.
+        """
+    }
+
+    static let systemPromptBase = """
     You are PopDraft, a helpful desktop assistant. You can call tools to search \
     and read the web, to DRIVE a live browser (navigate, click, type, read), and \
     to transform text. You also have local OS tools: get the current date/time \
@@ -1397,7 +1480,11 @@ struct PopDraftAgent {
         let runner = ToolRunner(
             maxConcurrent: max(1, config.webMaxRenderers),
             perToolTimeoutMs: perToolTimeout)
-        let loop = AgentLoop(maxIterations: config.agentSettings.maxIterations, runner: runner)
+        var loop = AgentLoop(maxIterations: config.agentSettings.maxIterations, runner: runner)
+        // Full step-by-step trace → ~/.popdraft/agent-trace.log (thinking, every
+        // tool call + args, every result, final answer). Lets a wrong conclusion be
+        // traced to the exact search/result that drove it.
+        loop.trace = { AgentTrace.write($0) }
 
         let modelCall: AgentLoop.ModelCall = { messages, toolsBoxed in
             let tools = unboxTools(toolsBoxed)

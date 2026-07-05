@@ -33,6 +33,7 @@ private struct AgentOnceOptions {
     var outPath: String?
     var screenshotDir: String?
     var maxIterations: Int?
+    var timeoutSeconds: Int = 120
 }
 
 /// Tiny `--flag value` parser (shared by both modes). Recognizes `--flag value`
@@ -87,6 +88,7 @@ enum HeadlessRunner {
         o.outPath = CLIArgs.value("--out", in: args)
         o.screenshotDir = CLIArgs.value("--screenshot-dir", in: args)
         o.maxIterations = CLIArgs.value("--max-iterations", in: args).flatMap { Int($0) }
+        if let t = CLIArgs.value("--timeout", in: args).flatMap({ Int($0) }), t > 0 { o.timeoutSeconds = t }
         return o
     }
 
@@ -179,9 +181,10 @@ enum HeadlessRunner {
         // partial transcript and exit(1). If the run finishes first it cancels
         // this task — `Task.sleep` then THROWS, so we must NOT fall through to
         // the timeout emit on cancellation (else a fast run reports "timeout").
+        let timeoutSeconds = opts.timeoutSeconds
         let timeoutTask = Task { @MainActor [providerLabel, modelLabel] in
             do {
-                try await Task.sleep(nanoseconds: 120_000_000_000)  // 120s
+                try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
             } catch {
                 return  // cancelled (run completed) — do nothing
             }
@@ -191,7 +194,7 @@ enum HeadlessRunner {
                 wallMs: Int(Date().timeIntervalSince(startWall) * 1000),
                 provider: providerLabel, model: modelLabel, seed: opts.seed)
             emit(json, to: opts.outPath)
-            FileHandle.standardError.write(Data("agent-once: hard timeout after 120s\n".utf8))
+            FileHandle.standardError.write(Data("agent-once: hard timeout after \(timeoutSeconds)s\n".utf8))
             exit(1)
         }
 

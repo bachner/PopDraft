@@ -880,17 +880,29 @@ class PopupWindowController: NSWindowController {
         // then fall back to AppleScript Edit > Copy menu (works for Electron apps like Slack)
         let source = CGEventSource(stateID: .hidSystemState)
 
-        // The triggering hotkey (Option+Space, or Ctrl+Option+<key>) may still have
-        // its modifier keys PHYSICALLY HELD when we get here — which turns the
-        // synthesized Cmd+C into Cmd+Option+C (etc.) and copies nothing, so we'd see
-        // an empty selection and wrongly open the chat. Release any held
-        // Option/Control/Shift first so the synthetic copy is a clean Cmd+C.
+        // The triggering hotkey (Option+Space, or Ctrl+Option+<key>) is almost
+        // always STILL PHYSICALLY HELD when we get here. A synthetic keyUp can't
+        // override a physically-held key, so a Cmd+C posted now is delivered as
+        // Cmd+Option+C and copies NOTHING — this is exactly why terminals (iTerm2)
+        // showed an empty selection. Wait, briefly, for the user to actually lift
+        // the hotkey modifiers, then post a CLEAN Cmd+C. The user releases within a
+        // few dozen ms of the shortcut firing, so this is imperceptible.
+        var waitedMs = 0
+        while waitedMs < 600 {  // hard cap ~600ms so we never hang the menu
+            let held = CGEventSource.flagsState(.combinedSessionState)
+            if !held.contains(.maskAlternate), !held.contains(.maskControl),
+               !held.contains(.maskShift), !held.contains(.maskCommand) { break }
+            usleep(15000)  // 15ms
+            waitedMs += 15
+        }
+        // Belt-and-suspenders: post synthetic modifier keyUps too (helps if the
+        // physical release lands between our poll and the Cmd+C), then settle.
         for modKey: CGKeyCode in [0x3A, 0x3D, 0x3B, 0x3E, 0x38, 0x3C] {  // L/R Option, Control, Shift
             let up = CGEvent(keyboardEventSource: source, virtualKey: modKey, keyDown: false)
             up?.flags = []
             up?.post(tap: .cghidEventTap)
         }
-        usleep(30000)  // 30ms for the modifier releases to register before Cmd+C
+        usleep(20000)  // 20ms settle before Cmd+C
 
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
         keyDown?.flags = .maskCommand
@@ -906,10 +918,13 @@ class PopupWindowController: NSWindowController {
         }
 
         // If CGEvent Cmd+C didn't work, fall back to AppleScript Edit > Copy menu
+        // (helps Electron apps like Slack). CRITICAL: do NOT `activate` the target
+        // app here — it is ALREADY frontmost while we capture (our panel is
+        // non-activating), and activating it yanks focus back so our menu appears
+        // BEHIND it and feels like "nothing happened". System Events can click the
+        // menu of a running process without bringing it to the front.
         if pasteboard.changeCount == savedChangeCount {
             let script = NSAppleScript(source: """
-                tell application "\(frontName)" to activate
-                delay 0.1
                 tell application "System Events"
                     tell process "\(frontName)"
                         click menu item "Copy" of menu "Edit" of menu bar 1
@@ -917,7 +932,7 @@ class PopupWindowController: NSWindowController {
                 end tell
             """)
             script?.executeAndReturnError(nil)
-            usleep(300000)  // 300ms for Electron apps
+            usleep(180000)  // 180ms for Electron apps
         }
 
         // Check if clipboard changed (meaning text was selected and copied)
@@ -958,20 +973,12 @@ class PopupWindowController: NSWindowController {
         chatViewModel = nil
         presentedMessageCount = nil
 
-        // PR8: with the bubble enabled and NO text selected, the hotkey opens the
-        // agent chat directly (empty, awaiting the user's first message). With the
-        // bubble disabled, keep today's behavior (action list). With text selected,
-        // it's always the action list (the user picks an action → chat).
-        let bubbleEnabled = LLMConfig.load().bubble.enabled
-        if bubbleEnabled && clipboardText.isEmpty {
-            Logger.shared.info("showAtMouseLocation: no selection + bubble enabled → opening chat")
-            enterChat(seedUser: "", selectedText: nil, autoRun: false)
-            window?.makeKeyAndOrderFront(nil)
-            startKeyboardMonitoring()
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-        Logger.shared.info("showAtMouseLocation: showing action menu (selection=\(!clipboardText.isEmpty), bubble=\(bubbleEnabled))")
+        // The hotkey ALWAYS shows the action menu — it's the single, predictable
+        // entry point. The menu's primary (first, highlighted) row is "Ask Agent",
+        // which opens chat; with text selected the other actions operate on it.
+        // (Previously an empty selection jumped straight to chat, which surprised
+        // users who expected the menu — removed per direct feedback.)
+        Logger.shared.info("showAtMouseLocation: showing action menu (selection=\(!clipboardText.isEmpty))")
         resetPanelForMenu()
         state = .actionList
         updateView()
@@ -1009,12 +1016,43 @@ class PopupWindowController: NSWindowController {
 
         updateView()
         window?.setFrame(frame, display: true)
+        // Make the app active FIRST, then force the panel to the very front. A
+        // non-activating panel from an accessory app can otherwise land behind the
+        // app the user was in (e.g. a terminal we just clicked the Copy menu of) —
+        // orderFrontRegardless guarantees it's on top regardless of activation.
+        NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
 
         // Start monitoring keyboard
         startKeyboardMonitoring()
         updateView()
-        // Make the app active so we can receive key events
+        Logger.shared.info("showAtMouseLocation: menu shown — visible=\(window?.isVisible ?? false) key=\(window?.isKeyWindow ?? false) frame=\(window?.frame ?? .zero)")
+    }
+
+    /// Open the agent chat directly — a fresh, blank conversation awaiting the
+    /// user's first message. The corner bubble uses THIS (not `showAtMouseLocation`)
+    /// so clicking the orb goes straight to chat, while the hotkey opens the action
+    /// menu. Two distinct, predictable entry points.
+    func showChat() {
+        Logger.shared.info("showChat: entry (bubble → chat)")
+        onWillShow?()
+
+        // Fresh invocation state (mirror showAtMouseLocation's reset). No capture:
+        // the bubble is the assistant, not a text-action on a selection.
+        clipboardText = ""
+        searchText = ""
+        selectedIndex = 0
+        customPromptText = ""
+        resultText = ""
+        currentSession = nil
+        didSaveCurrentSession = false
+        chatViewModel = nil
+        presentedMessageCount = nil
+
+        enterChat(seedUser: "", selectedText: nil, autoRun: false)
+        window?.makeKeyAndOrderFront(nil)
+        startKeyboardMonitoring()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -1373,13 +1411,17 @@ class PopupWindowController: NSWindowController {
     /// becomes the first assistant turn, and the user can keep chatting.
     private func runAgent(action: Action) {
         let capturedText = clipboardText
-        let userRequest = action.prompt
-        let userContent = capturedText.isEmpty
-            ? userRequest
-            : "\(userRequest)\n\nSelected text:\n\(capturedText)"
+        // No selection → open a BLANK chat awaiting the user's first message
+        // (don't auto-run the "…using the selected text as context" meta-prompt
+        // against nothing). With a selection, seed it and auto-run the agent.
+        if capturedText.isEmpty {
+            enterChat(seedUser: "", selectedText: nil, autoRun: false)
+            return
+        }
+        let userContent = "\(action.prompt)\n\nSelected text:\n\(capturedText)"
         enterChat(
             seedUser: userContent,
-            selectedText: capturedText.isEmpty ? nil : capturedText,
+            selectedText: capturedText,
             autoRun: true)
     }
 

@@ -62,14 +62,11 @@ class ActionManager {
         actions.filter { $0.isEnabled }.sorted { $0.order < $1.order }
     }
 
-    // Actions for popup including custom prompt sentinel at end
+    // Actions for the popup menu. "Custom prompt…" was removed — "Ask Agent"
+    // (the primary first row) opens a blank agent chat you can type anything into,
+    // which fully replaces the old free-form custom-prompt row.
     var popupActions: [Action] {
-        var result = visibleActions
-        if customPromptEnabled {
-            result.append(Action(id: "custom_prompt", name: "Custom prompt...", icon: "ellipsis.circle.fill",
-                                 prompt: "", shortcut: customPromptShortcut))
-        }
-        return result
+        return visibleActions
     }
 
     func filteredActions(searchText: String) -> [Action] {
@@ -173,6 +170,7 @@ class ActionManager {
             actions = actionsFile.actions
             customPromptShortcut = actionsFile.customPromptShortcut
             customPromptEnabled = actionsFile.customPromptEnabled ?? true
+            ensureAskAgentPresent()
             return
         }
 
@@ -185,6 +183,21 @@ class ActionManager {
         // Unreadable — seed defaults
         actions = ActionManager.defaultActions
         customPromptShortcut = "P"
+        save()
+    }
+
+    /// Ensure the built-in "Ask Agent" action exists. Saved action files written
+    /// before "Ask Agent" became a default won't contain it, so it never appeared
+    /// in the menu for existing users. Insert it at the front (order 0), the
+    /// visually-primary row, and bump every other action down by one.
+    private func ensureAskAgentPresent() {
+        guard !actions.contains(where: { $0.id == "ask_agent" }) else { return }
+        guard let askAgent = ActionManager.defaultActions.first(where: { $0.id == "ask_agent" }) else { return }
+        for i in actions.indices { actions[i].order += 1 }
+        var a = askAgent
+        a.order = 0
+        a.isEnabled = true
+        actions.insert(a, at: 0)
         save()
     }
 

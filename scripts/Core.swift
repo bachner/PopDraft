@@ -3572,9 +3572,25 @@ struct AgentLoop {
     var maxIterations: Int
     var runner: ToolRunner
 
+    /// Optional human-readable trace sink. When set (the app wires it to the
+    /// on-disk trace log), the loop emits a step-by-step account of EVERY turn:
+    /// the model's thinking, each tool call with its arguments, each tool result
+    /// (truncated), and the final answer — so a wrong conclusion can be traced to
+    /// exactly which search/result drove it. Pure core stays testable: tests leave
+    /// it nil and see no behavior change.
+    var trace: (@Sendable (String) -> Void)?
+
     init(maxIterations: Int = 6, runner: ToolRunner = ToolRunner()) {
         self.maxIterations = max(1, maxIterations)
         self.runner = runner
+    }
+
+    /// Truncate a possibly-huge tool result / message for the trace log so a single
+    /// search dump doesn't bloat the file, while keeping enough to debug.
+    private static func traceTrunc(_ s: String, _ limit: Int = 1600) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count <= limit { return t }
+        return String(t.prefix(limit)) + "  …[+\(t.count - limit) chars truncated]"
     }
 
     /// The outcome of a loop run.
@@ -3606,8 +3622,15 @@ struct AgentLoop {
         var lastText = ""
         var iterations = 0
 
+        if let trace = trace {
+            let lastUser = working.messages.last(where: { $0.role == "user" })?.content ?? ""
+            trace("════════ AGENT RUN START ════════  (model max \(maxIterations) iterations)")
+            trace("USER REQUEST: \(Self.traceTrunc(lastUser, 700))")
+        }
+
         while iterations < maxIterations {
             iterations += 1
+            trace?("──── iteration \(iterations)/\(maxIterations) ────")
             // Re-fetch the tools array EACH iteration: a tool can register MORE
             // tools into the live registry mid-loop (e.g. `add_mcp_server` starts
             // an MCP server and registers its tools), so the model must see the
@@ -3621,6 +3644,18 @@ struct AgentLoop {
             let turn = try await Self.callCompacted(
                 working.messages, toolsJSON, call: call, compaction: compaction)
 
+            if let trace = trace {
+                if let th = turn.thinking, !th.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    trace("THINKING: \(Self.traceTrunc(th, 1400))")
+                }
+                if let c = turn.content, !c.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    trace("MODEL TEXT: \(Self.traceTrunc(c, 800))")
+                }
+                trace(turn.toolCalls.isEmpty
+                    ? "DECISION: answer directly (no tools)"
+                    : "DECISION: call \(turn.toolCalls.count) tool(s)")
+            }
+
             // No tools requested → final answer.
             if turn.toolCalls.isEmpty {
                 let text = turn.content ?? ""
@@ -3633,6 +3668,8 @@ struct AgentLoop {
                    working.messages.contains(where: { $0.role == "tool" }) {
                     if let synth = try? await synthesizeFinal(&working, finalize: finalize),
                        !synth.isEmpty {
+                        trace?("FINAL ANSWER (synthesized): \(Self.traceTrunc(synth, 1400))")
+                        trace?("════════ AGENT RUN END ════════  (\(iterations + 1) model calls)\n")
                         return Outcome(session: working, finalText: synth,
                                        iterations: iterations + 1, stoppedAtMax: false)
                     }
@@ -3641,6 +3678,8 @@ struct AgentLoop {
                 working.messages.append(ChatMessage(
                     role: "assistant", content: text, thinking: turn.thinking))
                 working.updatedAt = Date().timeIntervalSince1970
+                trace?("FINAL ANSWER: \(Self.traceTrunc(text, 1400))")
+                trace?("════════ AGENT RUN END ════════  (\(iterations) model calls)\n")
                 return Outcome(session: working, finalText: text,
                                iterations: iterations, stoppedAtMax: false)
             }
@@ -3654,6 +3693,12 @@ struct AgentLoop {
                 content: turn.content ?? "",
                 toolCalls: toolCalls,
                 thinking: turn.thinking))
+
+            if let trace = trace {
+                for (i, pc) in turn.toolCalls.enumerated() {
+                    trace("  ▶ CALL[\(i)] \(pc.name)  args=\(Self.traceTrunc(pc.argumentsJSONString, 700))")
+                }
+            }
 
             // Notify the UI a batch of tool calls is starting (one "running" card
             // each), keyed by the same positional id we'll stamp on the tool
@@ -3712,6 +3757,14 @@ struct AgentLoop {
                 results[toRunIndexed[k].index] = r
             }
 
+            if let trace = trace {
+                for (i, r) in results.enumerated() {
+                    guard let r = r else { continue }
+                    let tag = r.isError ? "✖ ERROR " : "✓ RESULT"
+                    trace("  \(tag)[\(i)] \(r.name): \(Self.traceTrunc(r.content))")
+                }
+            }
+
             // Emit exactly one role:"tool" message per original call, in order.
             // Normalize a blank id to a positional one so the wire stays
             // consistent even if the model collided / blanked ids.
@@ -3748,11 +3801,15 @@ struct AgentLoop {
            working.messages.contains(where: { $0.role == "tool" }) {
             if let synth = try? await synthesizeFinal(&working, finalize: finalize, compaction: compaction),
                !synth.isEmpty {
+                trace?("FINAL ANSWER (synthesized after hitting iteration cap): \(Self.traceTrunc(synth, 1400))")
+                trace?("════════ AGENT RUN END — stopped at max iterations ════════\n")
                 return Outcome(session: working, finalText: synth,
                                iterations: iterations + 1, stoppedAtMax: true)
             }
         }
         working.updatedAt = Date().timeIntervalSince1970
+        trace?("FINAL ANSWER (iteration cap): \(Self.traceTrunc(lastText, 1400))")
+        trace?("════════ AGENT RUN END — stopped at max iterations ════════\n")
         return Outcome(session: working, finalText: lastText,
                        iterations: iterations, stoppedAtMax: true)
     }

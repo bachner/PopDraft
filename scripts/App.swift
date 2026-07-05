@@ -288,6 +288,8 @@ class DependencyManager {
         <string>\(port)</string>
         <string>-ngl</string>
         <string>99</string>
+        <string>-np</string>
+        <string>1</string>
         <string>--jinja</string>
         <string>-fa</string>
         <string>on</string>
@@ -296,7 +298,7 @@ class DependencyManager {
         <string>-ctv</string>
         <string>q4_0</string>
         <string>-c</string>
-        <string>200000</string>
+        <string>131072</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -839,7 +841,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // bubble is enabled, so the disabled case is byte-for-byte today's flow.
         bubbleController = BubbleWindowController()
         bubbleController?.onExpand = { [weak self] in
-            self?.popupController?.showAtMouseLocation()
+            // Clicking the orb opens the agent chat directly (the hotkey is the
+            // action-menu entry point; the bubble is the chat one).
+            self?.popupController?.showChat()
         }
         popupController?.onWillShow = { [weak self] in
             // Hide the orb while the expanded panel is open.
