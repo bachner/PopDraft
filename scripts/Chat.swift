@@ -61,6 +61,7 @@ struct ToolCallState: Identifiable, Equatable {
 /// A decoded, render-ready view of a tool result (built off the result string).
 enum ToolResultPreview: Equatable {
     case search([SearchResult])
+    case images([ImageResult])   // image_search → render actual thumbnails
     case read(title: String, snippet: String)
     case screenshot(path: String)
     case extract(title: String, chunks: [String])
@@ -706,6 +707,12 @@ enum ToolResultDecoder {
             if let d = data, let arr = try? JSONDecoder().decode([SearchResult].self, from: d) {
                 return .search(Array(arr.prefix(5)))
             }
+        case "image_search":
+            // Render the actual images in the card so the user SEES them even if a
+            // (small) model just lists the titles as text instead of embedding them.
+            if let d = data, let arr = try? JSONDecoder().decode([ImageResult].self, from: d) {
+                return .images(Array(arr.prefix(8)))
+            }
         case "web_read":
             // web_read returns Markdown with a "# Title\nURL: ..." header.
             let (title, snippet) = parseReadMarkdown(content)
@@ -1254,6 +1261,32 @@ struct ToolCallCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 11, weight: .semibold)).foregroundColor(ChatPalette.ink).lineLimit(1)
                 Text(host(url)).font(.system(size: 9.5)).foregroundColor(ChatPalette.blue)
+            }
+        case .images(let imgs):
+            // A wrapping grid of thumbnails (clickable → opens the source page), so
+            // image_search visibly SHOWS pictures regardless of the model's text.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96, maximum: 130), spacing: 6)],
+                      alignment: .leading, spacing: 6) {
+                ForEach(Array(imgs.enumerated()), id: \.offset) { _, im in
+                    AsyncImage(url: URL(string: im.thumbnailURL.isEmpty ? im.imageURL : im.thumbnailURL)) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().interpolation(.medium).scaledToFill()
+                        case .failure:
+                            ZStack { Color.secondary.opacity(0.1); Image(systemName: "photo").foregroundColor(.secondary) }
+                        default:
+                            ZStack { Color.secondary.opacity(0.08); ProgressView().controlSize(.small) }
+                        }
+                    }
+                    .frame(width: 118, height: 84)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .help(im.title)
+                    .onTapGesture {
+                        if let u = URL(string: im.sourcePage.isEmpty ? im.imageURL : im.sourcePage) {
+                            NSWorkspace.shared.open(u)
+                        }
+                    }
+                }
             }
         case .screenshot(let path):
             screenshotThumb(path)
