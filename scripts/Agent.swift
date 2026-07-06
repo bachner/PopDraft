@@ -1367,9 +1367,11 @@ struct PopDraftAgent {
     - PHOTOS / PICTURES / IMAGES — when the user asks to find / show / see a \
     photo, picture, image, or what someone or something LOOKS LIKE, call \
     `image_search` (NOT web_search). Your reply MUST then EMBED the actual images \
-    as inline Markdown: output one `![title](imageURL)` per line using each \
-    result's `imageURL` (https) — these `![](...)` lines are the ONLY thing that \
-    makes images appear, so they are REQUIRED. Output ~4–6 image lines (optionally \
+    as inline Markdown: output one `![title](embedURL)` per line using each \
+    result's `embedURL` field — ALWAYS use `embedURL`, NOT `imageURL` (the full-size \
+    `imageURL` is often hotlink-protected and renders as a broken icon; `embedURL` \
+    is the one that reliably displays). These `![](...)` lines are the ONLY thing \
+    that makes images appear, so they are REQUIRED. Output ~4–6 image lines (optionally \
     ONE short intro sentence) and NOTHING ELSE. Do NOT instead write a numbered \
     list of titles / captions / "source:" lines describing the photos — a text \
     description shows the user no image and is wrong here.

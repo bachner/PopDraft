@@ -78,6 +78,20 @@ JS_RENDERED_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+# A page whose body content lives inside a `srcdoc` iframe. WebKit loads that
+# subframe with the URL `about:srcdoc`; the navigation-delegate SSRF guard must
+# skip it (it never opens a socket). Regression fixture for the false-positive
+# "Blocked host (SSRF / private address): about:srcdoc".
+SRCDOC_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Srcdoc Host Page</title></head>
+<body>
+  <h1>Outer Host Page</h1>
+  <iframe srcdoc="&lt;p&gt;Inline iframe body from the srcdoc attribute.&lt;/p&gt;" width="400" height="120"></iframe>
+  <p>The outer page finished loading even though it embeds an about:srcdoc iframe.</p>
+</body>
+</html>"""
+
 AD_HEAVY_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Ad Heavy Article</title></head>
@@ -198,6 +212,8 @@ def make_handler():
                 self._send(200, search_results_html(q))
             elif path == "/jsrendered":
                 self._send(200, JS_RENDERED_HTML)
+            elif path == "/srcdoc":
+                self._send(200, SRCDOC_HTML)
             elif path == "/adheavy":
                 self._send(200, AD_HEAVY_HTML)
             elif path == "/redirect":

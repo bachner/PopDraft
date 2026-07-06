@@ -112,6 +112,7 @@ struct SettingsView: View {
     // PR9: agent Mac-control settings.
     @State private var macControlEnabled: Bool = false
     @State private var autoApproveSafeReadOnly: Bool = false
+    @State private var autoApproveAll: Bool = false
     @State private var mcpServers: [MCPServerConfig] = []
     @State private var selectedLlamaModel: String = "qwen3.5-2b"
     @State private var isDownloadingModel: Bool = false
@@ -465,6 +466,25 @@ struct SettingsView: View {
                     .toggleStyle(.switch)
                     .padding(10)
                     .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+                    .cornerRadius(6)
+
+                    Toggle(isOn: $autoApproveAll) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "bolt.shield.fill")
+                                    .foregroundColor(.red)
+                                Text("Allow everything automatically")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            Text("Run EVERY proposed action — shell commands, AppleScripts, clipboard/app actions, file reads — with NO approval prompt. The hard denylist (sudo, rm -rf /, curl | sh, fork bombs, shutdown, …) is still enforced and those are always refused. Only enable this if you fully trust what you ask the agent to do.")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(10)
+                    .background(Color.red.opacity(autoApproveAll ? 0.12 : 0.06))
                     .cornerRadius(6)
 
                     if !mcpServers.isEmpty {
@@ -1775,6 +1795,7 @@ struct SettingsView: View {
         // PR9: Mac-control + MCP.
         macControlEnabled = config.agentSettings.enableMacControl
         autoApproveSafeReadOnly = config.agentSettings.autoApproveSafeReadOnly
+        autoApproveAll = config.agentSettings.autoApproveAll
         mcpServers = config.mcpServers
         settingsActions = ActionManager.shared.actions
         customPromptShortcut = ActionManager.shared.customPromptShortcut
@@ -1843,6 +1864,7 @@ struct SettingsView: View {
         var agent = AppConfig.load(dir: LLMConfig.configDir).agentSettings
         agent.enableMacControl = macControlEnabled
         agent.autoApproveSafeReadOnly = autoApproveSafeReadOnly
+        agent.autoApproveAll = autoApproveAll
         config.agentSettings = agent
         config.mcpServers = mcpServers
         onSave(config)

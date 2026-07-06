@@ -44,6 +44,23 @@ test("Scheme allowlist") {
     assert(!SafetyGuard.isSchemeAllowed(u("about:settings")), "about:settings blocked (only blank)")
 }
 
+// MARK: - SSRF: non-network navigations (delegate host-check exemption)
+
+test("Non-network navigation exemption (about:srcdoc etc.)") {
+    func u(_ s: String) -> URL { URL(string: s)! }
+    // The navigation-delegate SSRF guard must SKIP about: URLs — they never open
+    // a socket. Regression: a srcdoc iframe (about:srcdoc) fail-closed the load.
+    assert(SafetyGuard.isNonNetworkNavigation(u("about:blank")), "about:blank is non-network")
+    assert(SafetyGuard.isNonNetworkNavigation(u("about:srcdoc")), "about:srcdoc is non-network (the bug)")
+    assert(SafetyGuard.isNonNetworkNavigation(u("ABOUT:SrcDoc")), "about: match is case-insensitive")
+    // Real network URLs are still subject to the host check (NOT exempt).
+    assert(!SafetyGuard.isNonNetworkNavigation(u("https://example.com")), "https is network — still guarded")
+    assert(!SafetyGuard.isNonNetworkNavigation(u("http://169.254.169.254/latest")), "http metadata still guarded")
+    // The top-level scheme allowlist is unchanged: about:srcdoc is NOT a valid
+    // page to open directly (only the sub-navigation delegate exempts it).
+    assert(!SafetyGuard.isSchemeAllowed(u("about:srcdoc")), "about:srcdoc still not openable as a top-level URL")
+}
+
 // MARK: - WebEngineError messages: unresolvable host is distinct from an SSRF block
 
 test("unresolvableHost reads as 'wrong URL', not a security block") {
