@@ -48,6 +48,15 @@ struct AgentSettings: Codable, Equatable {
     /// may run WITHOUT the confirm dialog. Everything else always confirms; the
     /// hard denylist always applies. Default OFF. (PR9)
     var autoApproveSafeReadOnly: Bool
+    /// "Allow everything automatically": when true, EVERY confirm-gated action
+    /// (run_shell / run_applescript / clipboard_write / open_app_or_url / file
+    /// reads / …) is auto-approved WITHOUT the Approve/Edit/Deny card. The hard
+    /// denylist (sudo, rm -rf /, curl|sh, fork bomb, dd, shutdown, …) STILL
+    /// applies — every gate checks it BEFORE reaching the confirmer — so genuinely
+    /// dangerous commands are refused regardless of this flag. Only takes effect
+    /// when a live UI sink is present (headless has none → still denies), so it
+    /// can never let the eval/headless path auto-execute. Default OFF.
+    var autoApproveAll: Bool
     /// Headless/eval safety: when true, Mac-control tools NEVER execute — they
     /// record "would execute: <cmd> (awaiting confirm)" and return. Used by a
     /// future headless eval where there is no UI to confirm. Default OFF. (PR9)
@@ -70,12 +79,14 @@ struct AgentSettings: Codable, Equatable {
          enableMacControl: Bool = false,
          enableWebSearch: Bool = true,
          autoApproveSafeReadOnly: Bool = false,
+         autoApproveAll: Bool = false,
          macControlDryRun: Bool = false,
          contextTokens: Int = 0) {
         self.maxIterations = maxIterations
         self.enableMacControl = enableMacControl
         self.enableWebSearch = enableWebSearch
         self.autoApproveSafeReadOnly = autoApproveSafeReadOnly
+        self.autoApproveAll = autoApproveAll
         self.macControlDryRun = macControlDryRun
         self.contextTokens = contextTokens
     }
@@ -86,6 +97,7 @@ struct AgentSettings: Codable, Equatable {
         enableMacControl = try c.decodeIfPresent(Bool.self, forKey: .enableMacControl) ?? false
         enableWebSearch = try c.decodeIfPresent(Bool.self, forKey: .enableWebSearch) ?? true
         autoApproveSafeReadOnly = try c.decodeIfPresent(Bool.self, forKey: .autoApproveSafeReadOnly) ?? false
+        autoApproveAll = try c.decodeIfPresent(Bool.self, forKey: .autoApproveAll) ?? false
         macControlDryRun = try c.decodeIfPresent(Bool.self, forKey: .macControlDryRun) ?? false
         // 0 ⇒ auto-detect at run time. A negative/garbage value also means auto.
         let ctx = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0

@@ -154,6 +154,9 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         rebuildVisible()
         // PR9: receive Mac-control confirmation requests as our sink.
         confirmBroker.sink = self
+        // "Allow everything automatically" — auto-approve confirm cards (denylist
+        // still enforced upstream). Re-synced at each run in case it's toggled.
+        confirmBroker.autoApproveAll = cfg.agentSettings.autoApproveAll
     }
 
     /// A compact "Model · provider" label for the header.
@@ -463,6 +466,9 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
 
         let snapshot = session
         let appConfig = AppConfig.load(dir: LLMConfig.configDir)
+        // Keep the confirm broker's auto-approve in sync with the latest config so
+        // toggling "allow everything automatically" mid-session takes effect now.
+        confirmBroker.autoApproveAll = appConfig.agentSettings.autoApproveAll
         // Consume the one-shot "no tools" flag (set for a pure text-transformation
         // action's auto-run). Cleared here so any follow-up turn gets tools back.
         let disableTools = suppressToolsOnNextRun

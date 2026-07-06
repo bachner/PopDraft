@@ -65,6 +65,15 @@ final class FakeConfirmer: MacControlConfirmer {
     }
 }
 
+// A sink that records whether a confirmation card was ever presented — used to
+// prove "allow everything automatically" auto-approves WITHOUT showing a card.
+@MainActor
+final class RecordingSink: MacControlBroker.Sink {
+    var presentedCount = 0
+    func present(_ request: ConfirmationRequest) { presentedCount += 1 }
+    func withdraw(id: String) {}
+}
+
 // ----------------------------------------------------------------------------
 // The suite (on the MainActor, so awaiting the confirmer seam is safe).
 // ----------------------------------------------------------------------------
@@ -205,6 +214,41 @@ func runSuite() async {
     check(cwNoText.hasPrefix("Error:"), "clipboard_write without 'text' errors")
     let openNoTarget = (try? await OpenAppOrURLTool(gate: approveGate).invoke(JSONObject([:]))) ?? "THREW"
     check(openNoTarget.hasPrefix("Error:"), "open_app_or_url without 'target' errors")
+
+    // --- "allow everything automatically" (autoApproveAll) ------------------
+    section("allow everything automatically")
+
+    // (1) Broker with autoApproveAll auto-approves WITHOUT presenting a card.
+    let autoSink = RecordingSink()
+    let autoBroker = MacControlBroker()
+    autoBroker.sink = autoSink
+    autoBroker.autoApproveAll = true
+    let autoReq = ConfirmationRequest(id: "a1", kind: .shell, command: "echo hi", explanation: "")
+    let autoDecision = await autoBroker.requestConfirmation(autoReq)
+    check(autoDecision == .approve, "autoApproveAll → request is auto-approved")
+    check(autoSink.presentedCount == 0, "autoApproveAll → no confirmation card was presented")
+
+    // (2) Even with autoApproveAll, a live gate still enforces the hard denylist
+    //     (it's checked BEFORE the broker), so dangerous commands never run.
+    let autoGate = LocalActionGate(confirmer: autoBroker)
+    let autoDanger = await autoGate.confirm(command: "sudo rm -rf /", explanation: "x")
+    if case .denied(let r) = autoDanger {
+        check(r.lowercased().contains("denylist"), "autoApproveAll still blocks denylisted commands (\(r))")
+    } else {
+        check(false, "autoApproveAll must NOT bypass the denylist for 'sudo rm -rf /'")
+    }
+    // A safe command under autoApproveAll resolves straight to .approved.
+    let autoSafe = await autoGate.confirm(command: "open https://apple.com", explanation: "x")
+    if case .approved = autoSafe { check(true, "autoApproveAll approves a safe action with no prompt") }
+    else { check(false, "autoApproveAll should approve a safe action") }
+
+    // (3) Headless safety: autoApproveAll with NO sink still DENIES (never runs
+    //     without a real UI present).
+    let headlessBroker = MacControlBroker()
+    headlessBroker.autoApproveAll = true   // no sink set
+    let headlessDecision = await headlessBroker.requestConfirmation(
+        ConfirmationRequest(id: "h1", kind: .shell, command: "echo hi", explanation: ""))
+    check(headlessDecision == .deny, "autoApproveAll with no sink still denies (headless can't auto-run)")
 
     // --- tool specs ---------------------------------------------------------
     section("tool specs")
