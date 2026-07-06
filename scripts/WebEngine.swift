@@ -752,8 +752,9 @@ final class NavigationBridge: NSObject, WKNavigationDelegate {
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url {
-            // about:blank is allowed (reset); everything else passes the guard.
-            if url.absoluteString.lowercased() != "about:blank" {
+            // Non-network URLs (about:blank reset, about:srcdoc iframes) never open
+            // a socket — skip the SSRF/host guard; everything else passes it.
+            if !SafetyGuard.isNonNetworkNavigation(url) {
                 // A redirect re-uses the same navigation; count it and cap.
                 if navigationAction.navigationType == .other && webView.isLoading {
                     redirectCount += 1
@@ -791,7 +792,7 @@ final class NavigationBridge: NSObject, WKNavigationDelegate {
             return
         }
         // Re-validate the committed response URL's host (catches a late rebind).
-        if let url = response.url, url.absoluteString.lowercased() != "about:blank" {
+        if let url = response.url, !SafetyGuard.isNonNetworkNavigation(url) {
             if let check = responseHostCheck, check(url) == false {
                 decisionHandler(.cancel)
                 resolve(.failure(WebEngineError.blockedHost(url.host ?? url.absoluteString)))
@@ -1996,7 +1997,7 @@ final class SessionGuardDelegate: NSObject, WKNavigationDelegate {
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url,
-           url.absoluteString.lowercased() != "about:blank",
+           !SafetyGuard.isNonNetworkNavigation(url),
            policyCheck(url) == false {
             decisionHandler(.cancel)
             return
@@ -2013,7 +2014,7 @@ final class SessionGuardDelegate: NSObject, WKNavigationDelegate {
             decisionHandler(.cancel)
             return
         }
-        if let url = response.url, url.absoluteString.lowercased() != "about:blank",
+        if let url = response.url, !SafetyGuard.isNonNetworkNavigation(url),
            responseHostCheck(url) == false {
             decisionHandler(.cancel)
             return
