@@ -1,0 +1,68 @@
+# Auto-merge PRs once CI is green — so branches ship to main via PR without a
+# manual click. Runs AFTER the "Build DMG" workflow finishes on a pull request:
+# if that run succeeded and the PR is an owner-authored, non-draft PR, it is
+# squash-merged and its branch deleted.
+#
+# Scope / safety:
+#   - Only fires for `Build DMG` runs triggered by `pull_request` (not pushes/tags).
+#   - Only merges when the CI run's conclusion is `success`.
+#   - Only merges PRs authored by the repository owner and NOT drafts. A PR from a
+#     fork or another author is left alone. Mark a PR "draft" to hold it back.
+#   - Uses the built-in GITHUB_TOKEN (no extra secrets). Merges by GITHUB_TOKEN do
+#     not retrigger workflows, so this can't loop; releases are still cut
+#     separately by pushing a `v*` tag.
+#
+# Bootstrap: this file only takes effect once it is on the default branch (main).
+# The first merge that lands it is manual; every PR after that auto-merges.
+name: Auto-merge green PRs
+
+on:
+  workflow_run:
+    workflows: ["Build DMG"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge the PR for this branch (owner, non-draft, CI green)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          echo "CI (Build DMG) succeeded for branch: $BRANCH"
+
+          pr_json="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+                      --json number,author,isDraft,mergeStateStatus -q '.[0] // empty')"
+          if [ -z "$pr_json" ]; then
+            echo "No open PR for branch '$BRANCH' — nothing to merge."
+            exit 0
+          fi
+
+          num="$(echo "$pr_json"    | jq -r '.number')"
+          author="$(echo "$pr_json" | jq -r '.author.login')"
+          draft="$(echo "$pr_json"  | jq -r '.isDraft')"
+
+          if [ "$author" != "$OWNER" ]; then
+            echo "PR #$num is authored by '$author' (not owner '$OWNER') — skipping."
+            exit 0
+          fi
+          if [ "$draft" = "true" ]; then
+            echo "PR #$num is a draft — skipping (mark it ready to auto-merge)."
+            exit 0
+          fi
+
+          echo "Auto-merging PR #$num…"
+          gh pr merge "$num" --repo "$REPO" --squash --delete-branch
+          echo "Merged PR #$num into main."
