@@ -1586,9 +1586,48 @@ final class ScrollForwardingWebView: WKWebView {
 /// diagrams (```mermaid blocks) inside a `WKWebView`. The web view auto-reports
 /// its rendered height back so the SwiftUI parent can size the bubble exactly.
 ///
+/// Serves `pdimg:<hash>.<ext>` image references — emitted by the agent for
+/// `image_search` results whose full-size original was downloaded into the
+/// images cache — back to the message WebView as raw bytes. This is how
+/// hotlink-protected images render: instead of the WebView fetching the source
+/// CDN directly (which 403s a cross-origin `<img>`), it asks this handler, which
+/// reads the already-downloaded file from disk. Path is validated by
+/// `ImageEmbed.filename(fromRef:)` (hex.ext only — no traversal). Stateless, so
+/// one shared instance backs every message WebView.
+final class PDImageSchemeHandler: NSObject, WKURLSchemeHandler {
+    static let shared = PDImageSchemeHandler()
+
+    /// The images cache dir, derived from the same config dir the engine writes
+    /// to (honors PD_CONFIG_DIR), so this stays correct under the test sandbox.
+    private static var imagesDir: String {
+        ((LLMConfig.configDir as NSString).appendingPathComponent("web-cache") as NSString)
+            .appendingPathComponent("images")
+    }
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let reqURL = task.request.url,
+              let filename = ImageEmbed.filename(fromRef: reqURL.absoluteString) else {
+            task.didFailWithError(URLError(.badURL)); return
+        }
+        let path = (Self.imagesDir as NSString).appendingPathComponent(filename)
+        guard let data = FileManager.default.contents(atPath: path) else {
+            task.didFailWithError(URLError(.fileDoesNotExist)); return
+        }
+        let resp = URLResponse(url: reqURL,
+                               mimeType: ImageEmbed.mimeType(forFilename: filename),
+                               expectedContentLength: data.count, textEncodingName: nil)
+        task.didReceive(resp)
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+}
+
 /// Self-contained & offline: marked / mermaid / highlight.js + CSS are inlined
-/// from the bundle, so the web view never loads anything over the network. Links
-/// open in the user's browser instead of navigating the (local) document.
+/// from the bundle, so the web view never loads anything over the network except
+/// agent-embedded https images and locally-served `pdimg:` images. Links open in
+/// the user's browser instead of navigating the (local) document.
 ///
 /// `@MainActor` so its `NSViewRepresentable` methods (which SwiftUI always calls
 /// on the main actor) can touch the main-actor-isolated `Coordinator` (e.g.
@@ -1616,6 +1655,9 @@ struct MarkdownWebView: NSViewRepresentable {
         // user's cookies, or the filesystem (and we keep image/HTML sources to
         // https:/data: only; never file:).
         config.websiteDataStore = .nonPersistent()
+        // Serve pdimg:<hash> refs (downloaded image_search images) from disk so
+        // hotlink-protected images render without the WebView hitting the source.
+        config.setURLSchemeHandler(PDImageSchemeHandler.shared, forURLScheme: ImageEmbed.scheme)
 
         let webView = ScrollForwardingWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -1822,12 +1864,14 @@ struct MarkdownWebView: NSViewRepresentable {
             wrap.appendChild(newpre);
             pre.replaceWith(wrap);
           });
-          // Sanitize images: only https:/data: sources may load — never file: or
-          // anything else (defense in depth on top of the no-file-access sandbox).
+          // Sanitize images: only https:/data:image/pdimg: sources may load —
+          // never file: or anything else (defense in depth on top of the
+          // no-file-access sandbox). pdimg: is our own scheme handler, which
+          // only serves validated files from the images cache dir.
           c.querySelectorAll('img').forEach(function(img){
             var src = (img.getAttribute('src')||'').trim();
             var low = src.toLowerCase();
-            if(!(low.indexOf('https:')===0 || low.indexOf('data:image/')===0)){
+            if(!(low.indexOf('https:')===0 || low.indexOf('data:image/')===0 || low.indexOf('pdimg:')===0)){
               img.removeAttribute('src');
               img.setAttribute('alt', img.getAttribute('alt') || '[blocked image]');
             }
@@ -1955,6 +1999,7 @@ struct RawMarkupWebView: NSViewRepresentable {
         config.userContentController = controller
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.websiteDataStore = .nonPersistent()
+        config.setURLSchemeHandler(PDImageSchemeHandler.shared, forURLScheme: ImageEmbed.scheme)
         let webView = ScrollForwardingWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
@@ -1997,7 +2042,7 @@ struct RawMarkupWebView: NSViewRepresentable {
           // the no-file-access sandbox); report height as each image settles.
           c.querySelectorAll('img').forEach(function(i){
             var src=(i.getAttribute('src')||'').trim().toLowerCase();
-            if(!(src.indexOf('https:')===0 || src.indexOf('data:image/')===0)){
+            if(!(src.indexOf('https:')===0 || src.indexOf('data:image/')===0 || src.indexOf('pdimg:')===0)){
               i.removeAttribute('src'); i.setAttribute('alt', i.getAttribute('alt')||'[blocked image]');
             }
             i.addEventListener('load',report); i.addEventListener('error',report);});
