@@ -44,6 +44,23 @@ test("Scheme allowlist") {
     assert(!SafetyGuard.isSchemeAllowed(u("about:settings")), "about:settings blocked (only blank)")
 }
 
+// MARK: - WebEngineError messages: unresolvable host is distinct from an SSRF block
+
+test("unresolvableHost reads as 'wrong URL', not a security block") {
+    let unresolvable = WebEngineError.unresolvableHost("next.example.invalid").description
+    // Must clearly say the host couldn't be resolved…
+    assert(unresolvable.lowercased().contains("resolve"), "unresolvable message mentions resolving (\(unresolvable))")
+    assert(unresolvable.contains("next.example.invalid"), "unresolvable message names the host")
+    // …and explicitly NOT read as an SSRF/private-address block (the old behavior).
+    assert(!unresolvable.contains("SSRF"), "unresolvable message does NOT say SSRF")
+    assert(!unresolvable.contains("private address"), "unresolvable message does NOT say private address")
+    // The real SSRF block message is unchanged + still distinct.
+    let blocked = WebEngineError.blockedHost("10.0.0.5").description
+    assert(blocked.contains("SSRF") && blocked.contains("private address"), "blockedHost keeps its SSRF wording")
+    assert(WebEngineError.unresolvableHost("h") != WebEngineError.blockedHost("h"),
+           "unresolvableHost and blockedHost are distinct cases")
+}
+
 // MARK: - SSRF: IPv4 classification
 
 test("IPv4 blocked ranges") {

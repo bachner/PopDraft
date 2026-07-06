@@ -178,6 +178,24 @@ func runTests() async {
         R.check(false, "loopback blocked but non-WebEngineError: \(error)")
     }
 
+    // --- a nonexistent host reports 'unresolvable', NOT an SSRF block ---
+    // `.invalid` is reserved (RFC 2606) to never resolve → deterministic NXDOMAIN.
+    // Regression for "Blocked host (SSRF / private address): <host> (unresolvable)"
+    // wrongly framing a wrong/nonexistent URL as a security block.
+    do {
+        _ = try await engine.read(URL(string: "https://next.nonexistent-fixture.invalid/")!, maxChars: 1000)
+        R.check(false, "a nonexistent .invalid host should have thrown")
+    } catch let e as WebEngineError {
+        if case .unresolvableHost = e {
+            R.check(true, "nonexistent host → unresolvableHost (not blockedHost)")
+            R.check(!e.description.contains("SSRF"), "unresolvable message avoids SSRF wording (\(e.description))")
+        } else {
+            R.check(false, "nonexistent host should be .unresolvableHost, got: \(e)")
+        }
+    } catch {
+        R.check(false, "nonexistent host threw non-WebEngineError: \(error)")
+    }
+
     // --- file:// scheme blocked ---
     do {
         _ = try await engine.read(URL(string: "file:///etc/hosts")!, maxChars: 1000)
