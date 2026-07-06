@@ -20,6 +20,7 @@
 //   - a direct loopback/file URL is blocked by the scheme/SSRF guard.
 
 import Cocoa
+import WebKit
 
 // MARK: - Harness
 
@@ -354,6 +355,66 @@ func runTests() async {
         try? FileManager.default.removeItem(atPath: r.path)
     } catch {
         R.check(false, "download_file threw: \(error)")
+    }
+
+    // --- image_search embed: full-size download → local pdimg ref ---
+    // cacheImagesForEmbed downloads the fixture PNG (loopback hatch) and rewrites
+    // embedURL to pdimg:<hash>.png; the file must land in the images cache where
+    // the chat's pdimg: scheme handler can serve it.
+    do {
+        let seed = ImageResult(imageURL: "\(b)/afile.png", thumbnailURL: "\(b)/afile.png",
+                               sourcePage: "\(b)/portal", title: "fixture png")
+        let out = await engine.cacheImagesForEmbed([seed])
+        R.check(out.count == 1, "cacheImagesForEmbed returns one result")
+        let embed = out.first?.embedURL ?? ""
+        R.check(embed.hasPrefix("pdimg:"), "downloaded image → pdimg embedURL (\(embed))")
+        if let fn = ImageEmbed.filename(fromRef: embed) {
+            let imagesDir = ((LLMConfig.configDir as NSString).appendingPathComponent("web-cache") as NSString)
+                .appendingPathComponent("images")
+            let path = (imagesDir as NSString).appendingPathComponent(fn)
+            R.check(FileManager.default.fileExists(atPath: path), "pdimg file cached to disk (\(path))")
+            R.check(fn.hasSuffix(".png"), "cached image keeps png ext from content-type (\(fn))")
+        } else {
+            R.check(false, "embedURL was not a valid pdimg ref: \(embed)")
+        }
+    }
+    // A download that fails (blocked host) leaves embedURL as the thumbnail fallback.
+    do {
+        let seed = ImageResult(imageURL: "http://127.0.0.1:1/blocked.png", thumbnailURL: "https://proxy/iu?u=x",
+                               sourcePage: "", title: "blocked")
+        let out = await engine.cacheImagesForEmbed([seed])
+        R.check(out.first?.embedURL == "https://proxy/iu?u=x",
+                "failed download keeps thumbnail embedURL (\(out.first?.embedURL ?? "nil"))")
+    }
+
+    // --- pdimg scheme handler actually RENDERS the cached image in a WKWebView ---
+    // This is the end of the pipeline the user hit: an <img src="pdimg:…"> in an
+    // opaque-origin (baseURL nil) document must load via PDImageSchemeHandler and
+    // decode (naturalWidth > 0). Uses the same handler the chat registers.
+    do {
+        let seed = ImageResult(imageURL: "\(b)/afile.png", thumbnailURL: "",
+                               sourcePage: "\(b)/portal", title: "png")
+        let embed = (await engine.cacheImagesForEmbed([seed])).first?.embedURL ?? ""
+        if embed.hasPrefix("pdimg:") {
+            let cfg = WKWebViewConfiguration()
+            cfg.setURLSchemeHandler(PDImageSchemeHandler.shared, forURLScheme: ImageEmbed.scheme)
+            let frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+            let wv = WKWebView(frame: frame, configuration: cfg)
+            OffscreenRenderHost.shared.attach(wv, frame: frame)  // in-window so loads fire
+            wv.loadHTMLString("<html><body><img id='im' src='\(embed)'></body></html>", baseURL: nil)
+            // Poll naturalWidth (image decoded) for up to ~4s.
+            var natural = 0
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if let n = (try? await wv.evaluateJavaScript("document.getElementById('im').naturalWidth")) as? Int, n > 0 {
+                    natural = n; break
+                }
+            }
+            OffscreenRenderHost.shared.detach(wv)
+            R.check(natural > 0, "pdimg: handler served + WebKit decoded the image (naturalWidth=\(natural))")
+        } else {
+            R.check(false, "no pdimg embed available to render-test (embed=\(embed))")
+        }
     }
 
     // --- download_file: filename derived from the URL when none given ---

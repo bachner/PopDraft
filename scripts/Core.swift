@@ -1279,17 +1279,119 @@ struct SearchQuery: Equatable {
 /// One image result from `WebEngine.imageSearch`. `imageURL` is the full-size
 /// https image; `thumbnailURL` a (usually smaller) preview; `sourcePage` the
 /// page the image was found on; `title` the alt/caption text.
+///
+/// `embedURL` is the URL the model should put in `![title](embedURL)` so the
+/// image actually RENDERS in the chat. Full-size `imageURL`s are frequently
+/// hotlink-protected (the source CDN 403s a direct cross-origin load) → broken
+/// image icons; so `embedURL` defaults to the embed-friendly proxy
+/// `thumbnailURL`, and `WebEngine.imageSearch` upgrades it to a local
+/// `pdimg:<hash>.<ext>` reference once it has downloaded the full-size image into
+/// the on-disk cache (served by the chat's `pdimg:` scheme handler). Reliable now
+/// (thumbnail), full-res when the download succeeds, thumbnail fallback otherwise.
 struct ImageResult: Codable, Equatable {
     var imageURL: String
     var thumbnailURL: String
     var sourcePage: String
     var title: String
+    var embedURL: String
 
-    init(imageURL: String, thumbnailURL: String, sourcePage: String, title: String) {
+    init(imageURL: String, thumbnailURL: String, sourcePage: String, title: String, embedURL: String? = nil) {
         self.imageURL = imageURL
         self.thumbnailURL = thumbnailURL
         self.sourcePage = sourcePage
         self.title = title
+        // Default to the reliably-loadable URL: the proxy thumbnail if present,
+        // else the original (better than nothing). Overridden to pdimg:<…> after
+        // a successful full-size download.
+        self.embedURL = embedURL ?? (thumbnailURL.isEmpty ? imageURL : thumbnailURL)
+    }
+
+    // Decode legacy JSON (no embedURL) by falling back to the same default.
+    enum CodingKeys: String, CodingKey { case imageURL, thumbnailURL, sourcePage, title, embedURL }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let img = try c.decode(String.self, forKey: .imageURL)
+        let thumb = try c.decode(String.self, forKey: .thumbnailURL)
+        self.imageURL = img
+        self.thumbnailURL = thumb
+        self.sourcePage = try c.decode(String.self, forKey: .sourcePage)
+        self.title = try c.decode(String.self, forKey: .title)
+        self.embedURL = (try c.decodeIfPresent(String.self, forKey: .embedURL))
+            ?? (thumb.isEmpty ? img : thumb)
+    }
+}
+
+/// Pure helpers for the downloaded-image cache + the chat's `pdimg:` custom URL
+/// scheme (which serves those cached bytes so hotlink-protected images render).
+/// No I/O here — just naming, MIME mapping, and safe ref parsing — so it's unit
+/// tested without a WebView or the network.
+enum ImageEmbed {
+    /// Custom scheme the chat WebView registers a handler for.
+    static let scheme = "pdimg"
+
+    /// Cache filename `<key>.<ext>`. `key` is a caller-supplied content hash of
+    /// the source URL (WebEngine passes `WebCache.key(...)`; kept out of Core so
+    /// this stays Foundation-only + unit-testable). The ext drives the served
+    /// MIME so `<img>` decodes it.
+    static func cacheFilename(key: String, contentType: String?) -> String {
+        return "\(key).\(ext(forContentType: contentType))"
+    }
+
+    /// The `pdimg:<filename>` reference the model embeds and the scheme handler
+    /// resolves back to a file in the images cache dir.
+    static func ref(forFilename filename: String) -> String { "\(scheme):\(filename)" }
+
+    /// Extract the (validated) cache filename from a `pdimg:<filename>` URL.
+    /// Returns nil unless it's exactly `<hex>.<alnum-ext>` — no slashes, no
+    /// `..`, no query — so the scheme handler can't be walked outside the cache.
+    static func filename(fromRef ref: String) -> String? {
+        let lower = ref.trimmingCharacters(in: .whitespaces)
+        guard lower.lowercased().hasPrefix(scheme + ":") else { return nil }
+        let name = String(lower.dropFirst(scheme.count + 1))
+        // Strip a leading "//" if a URL form (pdimg://name) ever slips through.
+        let bare = name.hasPrefix("//") ? String(name.dropFirst(2)) : name
+        guard isSafeFilename(bare) else { return nil }
+        return bare
+    }
+
+    /// A cache filename is safe iff it's `<hex sha>.<short alnum ext>` — this is
+    /// the ONLY shape we ever mint, and it rejects path traversal / separators.
+    static func isSafeFilename(_ name: String) -> Bool {
+        guard let dot = name.firstIndex(of: "."), dot != name.startIndex else { return false }
+        let base = name[name.startIndex..<dot]
+        let ext = name[name.index(after: dot)...]
+        guard base.count >= 8, base.count <= 64,
+              base.allSatisfy({ $0.isHexDigit && ($0.isNumber || $0.isLowercase) }) else { return false }
+        guard ext.count >= 2, ext.count <= 5,
+              ext.allSatisfy({ $0.isLowercase || $0.isNumber }) else { return false }
+        return true
+    }
+
+    /// Map a response content-type to a cache file extension (default jpg).
+    static func ext(forContentType contentType: String?) -> String {
+        let ct = (contentType ?? "").lowercased()
+        if ct.contains("png") { return "png" }
+        if ct.contains("gif") { return "gif" }
+        if ct.contains("webp") { return "webp" }
+        if ct.contains("svg") { return "svg" }
+        if ct.contains("avif") { return "avif" }
+        if ct.contains("bmp") { return "bmp" }
+        return "jpg"   // jpeg / unknown → jpg
+    }
+
+    /// Map a cache filename's extension back to a MIME type for the served
+    /// response (so the WebView decodes the `<img>` correctly).
+    static func mimeType(forFilename name: String) -> String {
+        let e = (name as NSString).pathExtension.lowercased()
+        switch e {
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "svg": return "image/svg+xml"
+        case "avif": return "image/avif"
+        case "bmp": return "image/bmp"
+        default: return "image/jpeg"
+        }
     }
 }
 
@@ -2464,7 +2566,7 @@ enum WebToolSchemas {
       "type": "function",
       "function": {
         "name": "image_search",
-        "description": "Search the web for IMAGES (photos / pictures) and return a list of {imageURL, thumbnailURL, sourcePage, title}. Use this — NOT web_search — whenever the user asks to find / show / see a photo, picture, image, or what something or someone LOOKS LIKE. After it returns, present the top results to the user as inline Markdown images so they actually SEE them: ![title](imageURL) on its own line for each.",
+        "description": "Search the web for IMAGES (photos / pictures) and return a list of {imageURL, thumbnailURL, sourcePage, title, embedURL}. Use this — NOT web_search — whenever the user asks to find / show / see a photo, picture, image, or what something or someone LOOKS LIKE. After it returns, present the top results to the user as inline Markdown images so they actually SEE them: ![title](embedURL) on its own line for each. ALWAYS use the embedURL field (never imageURL) — embedURL is the URL that reliably renders in chat (a downloaded local copy or an embed-friendly thumbnail); imageURL is often hotlink-protected and shows as a broken image.",
         "parameters": {
           "type": "object",
           "properties": {

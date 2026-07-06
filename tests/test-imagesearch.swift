@@ -255,6 +255,72 @@ test("image_search + download_file schemas are valid JSON with the right names")
     assert(WebToolSchemas.all.contains(WebToolSchemas.downloadFile), "download_file in .all")
 }
 
+// MARK: - ImageResult.embedURL default + legacy decode
+
+test("ImageResult.embedURL defaults to the reliable proxy thumbnail") {
+    let r = ImageResult(imageURL: "https://cdn.example.com/full.jpg",
+                        thumbnailURL: "https://proxy.duckduckgo.com/iu/?u=x",
+                        sourcePage: "https://example.com/p", title: "t")
+    // Default embedURL = thumbnail (renders reliably), NOT the hotlink-prone original.
+    assert(r.embedURL == "https://proxy.duckduckgo.com/iu/?u=x", "embedURL defaults to thumbnailURL, got \(r.embedURL)")
+    // No thumbnail → fall back to the original rather than empty.
+    let r2 = ImageResult(imageURL: "https://cdn.example.com/full.jpg", thumbnailURL: "",
+                         sourcePage: "", title: "t")
+    assert(r2.embedURL == "https://cdn.example.com/full.jpg", "embedURL falls back to imageURL when no thumb")
+    // Explicit embedURL (e.g. a pdimg ref after download) is preserved.
+    let r3 = ImageResult(imageURL: "https://cdn.example.com/full.jpg", thumbnailURL: "https://t/x",
+                         sourcePage: "", title: "t", embedURL: "pdimg:abc123.jpg")
+    assert(r3.embedURL == "pdimg:abc123.jpg", "explicit embedURL preserved")
+}
+
+test("ImageResult decodes legacy JSON without embedURL") {
+    // A cached result from before embedURL existed must still decode (embedURL
+    // synthesized from the thumbnail) — no crash on the 5-min image cache.
+    let legacy = #"{"imageURL":"https://a/i.jpg","thumbnailURL":"https://t/i.jpg","sourcePage":"https://p","title":"x"}"#
+    let decoded = try? JSONDecoder().decode(ImageResult.self, from: Data(legacy.utf8))
+    assert(decoded != nil, "legacy ImageResult JSON decodes")
+    assert(decoded?.embedURL == "https://t/i.jpg", "legacy decode fills embedURL from thumbnail")
+    // Round-trips WITH embedURL once re-encoded.
+    if let d = decoded, let re = try? JSONEncoder().encode(d),
+       let s = String(data: re, encoding: .utf8) {
+        assert(s.contains("embedURL"), "re-encoded ImageResult includes embedURL")
+    } else { assert(false, "re-encode failed") }
+}
+
+// MARK: - ImageEmbed: cache naming, MIME mapping, safe ref parsing
+
+test("ImageEmbed extension + MIME mapping") {
+    assert(ImageEmbed.ext(forContentType: "image/png") == "png", "png ext")
+    assert(ImageEmbed.ext(forContentType: "image/jpeg") == "jpg", "jpeg→jpg ext")
+    assert(ImageEmbed.ext(forContentType: "image/webp; charset=x") == "webp", "webp ext")
+    assert(ImageEmbed.ext(forContentType: nil) == "jpg", "nil content-type → jpg")
+    assert(ImageEmbed.ext(forContentType: "application/octet-stream") == "jpg", "unknown → jpg")
+    assert(ImageEmbed.mimeType(forFilename: "abc.png") == "image/png", "png mime")
+    assert(ImageEmbed.mimeType(forFilename: "abc.webp") == "image/webp", "webp mime")
+    assert(ImageEmbed.mimeType(forFilename: "abc.jpg") == "image/jpeg", "jpg mime")
+    assert(ImageEmbed.mimeType(forFilename: "abc") == "image/jpeg", "no ext → jpeg default")
+}
+
+test("ImageEmbed ref round-trip + traversal-safe filename parsing") {
+    let key = String(repeating: "a", count: 64)  // looks like a sha256 hex
+    let filename = ImageEmbed.cacheFilename(key: key, contentType: "image/png")
+    assert(filename == "\(key).png", "cacheFilename is <key>.<ext>")
+    let ref = ImageEmbed.ref(forFilename: filename)
+    assert(ref == "pdimg:\(key).png", "ref is pdimg:<file>")
+    assert(ImageEmbed.filename(fromRef: ref) == filename, "ref → filename round-trips")
+    assert(ImageEmbed.filename(fromRef: "pdimg://\(filename)") == filename, "pdimg:// form also parses")
+    // Rejections: path traversal, separators, wrong scheme, bad shape.
+    assert(ImageEmbed.filename(fromRef: "pdimg:../../etc/passwd") == nil, "traversal rejected")
+    assert(ImageEmbed.filename(fromRef: "pdimg:\(key)/x.png") == nil, "slash rejected")
+    assert(ImageEmbed.filename(fromRef: "pdimg:..%2fx.png") == nil, "encoded traversal rejected")
+    assert(ImageEmbed.filename(fromRef: "https://evil/x.png") == nil, "wrong scheme rejected")
+    assert(ImageEmbed.filename(fromRef: "pdimg:notahash.png") == nil, "non-hex base rejected")
+    assert(ImageEmbed.filename(fromRef: "pdimg:\(key)") == nil, "missing extension rejected")
+    assert(ImageEmbed.filename(fromRef: "pdimg:\(key).PNG") == nil, "uppercase ext (never minted) rejected")
+    assert(ImageEmbed.isSafeFilename("\(key).jpg"), "canonical name is safe")
+    assert(!ImageEmbed.isSafeFilename("a.jpg"), "too-short base unsafe")
+}
+
 // MARK: - Summary
 
 print("\n----------------------------------------")

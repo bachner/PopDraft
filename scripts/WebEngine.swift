@@ -2066,6 +2066,9 @@ final class WebEngine {
     private var router: SearchRouter
     private let cache: WebCache
     private let shotsDir: String
+    /// On-disk cache of downloaded full-size image_search images, served to the
+    /// chat by the `pdimg:` scheme handler so hotlink-protected images render.
+    private let imagesDir: String
     private var config: AppConfig
     /// The persistent interactive browsing session (created on first browser_*
     /// call). Distinct from the one-shot renderer pool; survives across tool
@@ -2078,6 +2081,8 @@ final class WebEngine {
         let cacheDir = (LLMConfig.configDir as NSString).appendingPathComponent("web-cache")
         self.shotsDir = (cacheDir as NSString).appendingPathComponent("shots")
         try? FileManager.default.createDirectory(atPath: shotsDir, withIntermediateDirectories: true)
+        self.imagesDir = (cacheDir as NSString).appendingPathComponent("images")
+        try? FileManager.default.createDirectory(atPath: imagesDir, withIntermediateDirectories: true)
         self.cache = WebCache(diskDir: cacheDir)
         self.pool = RendererPool(maxRenderers: cfg.webMaxRenderers, navTimeoutMs: cfg.webNavTimeoutMs)
         self.router = SearchRouter(apiKeys: cfg.webSearch.apiKeys, preferred: cfg.webSearch.provider)
@@ -2306,9 +2311,70 @@ final class WebEngine {
                 }
                 Logger.shared.info("image_search: SERP fallback returned \(results.count) images")
             }
+            // Download the full-size images into the on-disk cache and rewrite
+            // each result's `embedURL` to a local `pdimg:<file>` ref when it
+            // succeeds. This is what makes hotlink-protected originals render in
+            // the chat (served by the pdimg: scheme handler); on failure the
+            // result keeps its proxy-thumbnail embedURL — best-effort, never
+            // fails the search.
+            results = await self.cacheImagesForEmbed(results)
             return (try? JSONEncoder().encode(results)) ?? Data("[]".utf8)
         }
         return (try? JSONDecoder().decode([ImageResult].self, from: data)) ?? []
+    }
+
+    /// Download each result's full-size `imageURL` into `imagesDir` (concurrently,
+    /// bounded, SSRF-gated, with a Referer = its source page so hotlink checks
+    /// pass) and set `embedURL = pdimg:<file>` on success. Best-effort: a failed
+    /// download leaves the result's default (proxy-thumbnail) embedURL untouched.
+    /// `internal` (not private) so the GUI test can drive it against the fixture.
+    func cacheImagesForEmbed(_ results: [ImageResult]) async -> [ImageResult] {
+        guard !results.isEmpty else { return results }
+        let dir = imagesDir
+        return await withTaskGroup(of: (Int, String?).self) { group in
+            for (i, r) in results.enumerated() {
+                group.addTask { [weak self] in
+                    guard let self = self else { return (i, nil) }
+                    let ref = await self.cacheOneImage(sourceURL: r.imageURL, referer: r.sourcePage, dir: dir)
+                    return (i, ref)
+                }
+            }
+            var out = results
+            for await (i, ref) in group {
+                if let ref = ref, i < out.count { out[i].embedURL = ref }
+            }
+            return out
+        }
+    }
+
+    /// Fetch one image (SSRF-gated, capped, desktop UA + Referer), write it to
+    /// `dir/<hash>.<ext>`, and return its `pdimg:<hash>.<ext>` ref — or nil on any
+    /// failure (blocked host, non-image content-type, HTTP error, too large).
+    private func cacheOneImage(sourceURL: String, referer: String, dir: String) async -> String? {
+        guard let url = URL(string: sourceURL) else { return nil }
+        // SSRF: only fetch validated public http(s) hosts.
+        if (try? guardURL(url)) == nil { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        req.setValue("image/avif,image/webp,image/png,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        if let ref = URL(string: referer), ref.scheme?.hasPrefix("http") == true {
+            req.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+        let session = URLSession(configuration: .ephemeral)
+        guard let (data, response) = try? await session.data(for: req) else { return nil }
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
+        let ctype = http?.value(forHTTPHeaderField: "Content-Type")
+        guard status == 200,
+              (ctype?.lowercased().hasPrefix("image/") ?? false),
+              !data.isEmpty,
+              !SizeGuard.exceeds(received: data.count, max: Self.imageSearchMaxBytes) else { return nil }
+        let key = WebCache.key(method: "GET", url: sourceURL, variant: "img")
+        let filename = ImageEmbed.cacheFilename(key: key, contentType: ctype)
+        let path = (dir as NSString).appendingPathComponent(filename)
+        guard (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else { return nil }
+        return ImageEmbed.ref(forFilename: filename)
     }
 
     /// Body cap for the DDG image-search HTTP responses (HTML token page + i.js).
