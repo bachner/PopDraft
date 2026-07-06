@@ -47,11 +47,26 @@ final class MacControlBroker: MacControlConfirmer {
 
     weak var sink: Sink?
 
+    /// "Allow everything automatically" (AgentSettings.autoApproveAll). When set,
+    /// a request is approved WITHOUT presenting a card. The caller (each gate) has
+    /// ALREADY enforced the hard denylist before reaching here, so this can only
+    /// auto-approve commands that already passed the safety denylist. Kept in sync
+    /// by the chat view-model from config; only consulted when a `sink` exists, so
+    /// the headless (no-sink) path can never auto-run.
+    var autoApproveAll: Bool = false
+
     private var pending: [String: CheckedContinuation<ConfirmationDecision, Never>] = [:]
 
     func requestConfirmation(_ request: ConfirmationRequest) async -> ConfirmationDecision {
         // No UI to confirm → deny, structurally. Nothing runs.
         guard let sink = sink else { return .deny }
+        // Opt-in "allow everything automatically": approve without a card. The
+        // denylist was already applied upstream by the gate, so dangerous commands
+        // never reach this point.
+        if autoApproveAll {
+            Logger.shared.info("[mac-control] AUTO-APPROVED (allow-everything on, \(request.kind.rawValue)): \(request.command)")
+            return .approve
+        }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<ConfirmationDecision, Never>) in
                 if Task.isCancelled {

@@ -117,7 +117,7 @@ test("JSON round-trip save -> load is stable") {
     var original = AppConfig.migrateLegacyPlaintext(legacyPlaintext)
     original.userModels = [ModelRef(provider: "llamacpp", name: "user/repo", quant: "Q4_K_M", source: "huggingface")]
     original.providerKeys = ["openai": "k1", "claude": "k2"]
-    original.agentSettings = AgentSettings(maxIterations: 9, enableMacControl: true, enableWebSearch: false)
+    original.agentSettings = AgentSettings(maxIterations: 9, enableMacControl: true, enableWebSearch: false, autoApproveAll: true)
     original.webSearch = WebSearchConfig(provider: "tavily", apiKeys: ["tavily": "tvly-1"])
     original.bubble = BubbleSettings(enabled: false, corner: "topLeft")
 
@@ -128,6 +128,7 @@ test("JSON round-trip save -> load is stable") {
     assert(loaded == original, "round-tripped config should equal the original")
     assert(loaded.userModels.first?.quant == "Q4_K_M", "userModels survive round-trip")
     assert(loaded.agentSettings.maxIterations == 9, "agentSettings survive round-trip")
+    assert(loaded.agentSettings.autoApproveAll == true, "agentSettings.autoApproveAll survives round-trip")
     assert(loaded.webSearch.provider == "tavily", "webSearch survive round-trip")
     assert(loaded.bubble.enabled == false, "bubble.enabled survives round-trip")
     assert(loaded.bubble.corner == "topLeft", "bubble.corner survives round-trip")
@@ -148,6 +149,7 @@ test("New fields default when absent from JSON") {
     assert(c.providerKeys.isEmpty, "providerKeys defaults to empty")
     assert(c.agentSettings.maxIterations == 6, "agentSettings.maxIterations defaults to 6")
     assert(c.agentSettings.enableMacControl == false, "enableMacControl defaults false")
+    assert(c.agentSettings.autoApproveAll == false, "autoApproveAll defaults false")
     assert(c.webSearch.provider == "ddg", "webSearch.provider defaults to ddg")
     // Bubble settings default when absent (enabled, pinned bottom-right).
     assert(c.bubble.enabled == true, "bubble.enabled defaults to true when absent")
