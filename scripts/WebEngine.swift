@@ -807,11 +807,25 @@ final class NavigationBridge: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if Self.isBenignCancellation(error) { resolve(.success(())); return }
         resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if Self.isBenignCancellation(error) { resolve(.success(())); return }
         resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
+    }
+
+    /// `NSURLErrorCancelled` (-999) is not a real failure: WebKit reports it for
+    /// back/forward bfcache restores (which don't do a network load) and when a
+    /// newer navigation supersedes this one. Treating it as success keeps
+    /// `browser_back` (and any superseded load) from surfacing a bogus
+    /// "Navigation failed … -999". Note: an SSRF/redirect-cap cancel resolves its
+    /// OWN precise error FIRST (in `decidePolicyFor`), so `resolve` is already
+    /// consumed and this later -999 is a no-op — it can't mask a real block.
+    private static func isBenignCancellation(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -2172,6 +2186,16 @@ final class WebEngine {
             throw WebEngineError.invalidURL(url.absoluteString)
         }
         if let reason = ssrfBlockReason(for: url) {
+            // A host that resolves to NOTHING (NXDOMAIN / DNS failure) — and isn't a
+            // literal IP or a blocked literal like localhost/*.local — is almost
+            // always a wrong or nonexistent URL, not an SSRF hit. Report it as
+            // "could not resolve" so the agent fixes the URL instead of reading it
+            // as the guard wrongly blocking a legit site. (A literal IP resolves to
+            // itself; a name that resolves to a private IP stays a blockedHost.)
+            if SafetyGuard.parseIPv4(host) == nil, SafetyGuard.parseIPv6(host) == nil,
+               !SafetyGuard.isLiteralHostBlocked(host), DNSResolver.resolve(host).isEmpty {
+                throw WebEngineError.unresolvableHost(host)
+            }
             throw WebEngineError.blockedHost(reason)
         }
     }

@@ -1546,6 +1546,7 @@ enum BrowserTargets {
 enum WebEngineError: Error, Equatable, CustomStringConvertible {
     case blockedScheme(String)
     case blockedHost(String)          // SSRF: resolved to a private/loopback/metadata IP
+    case unresolvableHost(String)     // DNS returned nothing (NXDOMAIN / lookup failed) — usually a wrong URL, NOT an SSRF block
     case invalidURL(String)
     case navigationFailed(String)
     case timeout
@@ -1558,6 +1559,7 @@ enum WebEngineError: Error, Equatable, CustomStringConvertible {
         switch self {
         case .blockedScheme(let s): return "Blocked URL scheme: \(s)"
         case .blockedHost(let h): return "Blocked host (SSRF / private address): \(h)"
+        case .unresolvableHost(let h): return "Could not resolve host: \(h). The domain may not exist (check the spelling) or DNS lookup failed — this is not a security block. Try a different URL, e.g. the site's main domain."
         case .invalidURL(let u): return "Invalid URL: \(u)"
         case .navigationFailed(let m): return "Navigation failed: \(m)"
         case .timeout: return "Navigation timed out"
