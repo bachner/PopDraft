@@ -138,6 +138,20 @@ struct SeeImageTool: AgentTool, @unchecked Sendable {
         // Resolve `source` → an ImageRef (+ a note describing what we captured).
         let imageRef: ImageRef
         var captureNote = ""
+        if let filename = ImageEmbed.filename(fromRef: rawSource) {
+            // `pdimg:<hash>.<ext>` — a downloaded image_search result already in our
+            // web-cache. Load it directly from disk (no confirm gate: the agent
+            // fetched this web image itself; it isn't a sensitive local file).
+            let imagesDir = ((LLMConfig.configDir as NSString)
+                .appendingPathComponent("web-cache") as NSString)
+                .appendingPathComponent("images")
+            let path = (imagesDir as NSString).appendingPathComponent(filename)
+            do {
+                imageRef = ImageRef(source: try VisionImageLoader.dataURI(forPath: path))
+            } catch {
+                return "Error: couldn't read the cached image (\(filename)). It may have been evicted — re-run image_search. (\(error))"
+            }
+        } else {
         switch VisionSource.parse(rawSource) {
         case .screenshot(let urlString):
             guard let url = URL(string: urlString),
@@ -182,6 +196,7 @@ struct SeeImageTool: AgentTool, @unchecked Sendable {
             } catch {
                 return "Error: \(error)."
             }
+        }
         }
 
         // Capability gate: the DEDICATED vision server (VisionServerManager, :10820)

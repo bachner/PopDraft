@@ -65,19 +65,8 @@ class HotkeyManager {
             id += 1
         }
 
-        // Register custom prompt shortcut
-        if ActionManager.shared.customPromptEnabled,
-           let cpShortcut = ActionManager.shared.customPromptShortcut,
-           let keyCode = keyCodeMap[cpShortcut.uppercased()] {
-            hotkeys.append(HotkeyConfig(
-                id: id,
-                keyCode: keyCode,
-                modifiers: UInt32(controlKey | optionKey),
-                actionID: "custom_prompt",
-                description: "Ctrl+Option+\(cpShortcut)"
-            ))
-            id += 1
-        }
+        // "Custom prompt…" was removed as an action — "Ask Agent" (⌥Space menu)
+        // supersedes it, so no dedicated Ctrl+Option+P hotkey is registered.
 
         return hotkeys
     }
