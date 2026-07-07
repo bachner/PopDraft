@@ -861,7 +861,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Create menu
         let menu = NSMenu()
         menu.delegate = self  // rebuild the Recent submenu each time the menu opens
-        menu.addItem(NSMenuItem(title: "Show Popup", action: #selector(showPopup), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Show Chat", action: #selector(showChatFromMenu), keyEquivalent: ""))
 
         // PR5: Recent sessions submenu. Populated lazily in menuNeedsUpdate(_:).
         let recentItem = NSMenuItem(title: "Recent", action: nil, keyEquivalent: "")
@@ -1069,6 +1069,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showPopup() {
         popupController?.showAtMouseLocation()
+    }
+
+    /// Menu-bar "Show Chat" — open the agent chat directly (bypassing the action
+    /// menu), the same entry point the corner bubble uses.
+    @objc func showChatFromMenu() {
+        popupController?.showChat()
     }
 
     // MARK: - Recent sessions submenu (PR5)
