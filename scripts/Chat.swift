@@ -532,10 +532,18 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                 // sees what went wrong (and the chat stays continuable). For a
                 // context-overflow that even aggressive compaction couldn't
                 // recover from, show a graceful, actionable message instead of the
-                // raw "Context size has been exceeded … error -1".
-                let msg: String = isContextOverflowError(error)
-                    ? "This conversation got too long for the model's context window, even after compacting older messages. Start a new chat or shorten what you pasted to continue."
-                    : "I hit an error: \(error.localizedDescription)"
+                // raw "Context size has been exceeded … error -1". Likewise for
+                // llama.cpp being unreachable — chatCompletion already retries
+                // through the "just switched models / still loading" window, so
+                // seeing this means it's still down after ~45s, not a transient race.
+                let msg: String
+                if isContextOverflowError(error) {
+                    msg = "This conversation got too long for the model's context window, even after compacting older messages. Start a new chat or shorten what you pasted to continue."
+                } else if error.localizedDescription == LLMClient.llamaServerDownError {
+                    msg = "The local llama.cpp server isn't responding. If you just switched models, a large one can take a while to load — try again in a bit. Otherwise, check Settings → Models to restart the server."
+                } else {
+                    msg = "I hit an error: \(error.localizedDescription)"
+                }
                 self.session.messages.append(ChatMessage(
                     role: "assistant", content: msg, isError: true))
                 self.session.updatedAt = Date().timeIntervalSince1970

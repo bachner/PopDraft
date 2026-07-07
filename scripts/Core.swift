@@ -3763,6 +3763,29 @@ func isContextOverflowError(_ error: Error) -> Bool {
     return false
 }
 
+/// Bounded retry policy for the llama.cpp "server not ready YET" window: right
+/// after switching the local model (or a fresh boot), the server socket can
+/// refuse connections for a moment, or respond 503 while the new model's weights
+/// load into memory — large local models can take tens of seconds. Without this,
+/// sending a message right after a model switch surfaces a spurious
+/// `LLAMA_SERVER_DOWN` for what is actually "still loading". The chat-completion
+/// call retries through this window instead of failing immediately; if the
+/// budget is exhausted the server really is unreachable, and the original error
+/// still surfaces. Pure decision logic (no networking) — unit-tested standalone.
+enum LlamaLoadRetry {
+    /// Total time budget to keep retrying before giving up. Deliberately generous
+    /// — a 30B+ local model can spend a while loading from disk.
+    static let maxWaitSeconds: Double = 45
+    /// Fixed delay between retries.
+    static let pollIntervalSeconds: Double = 1.5
+
+    /// Whether another attempt is worth making, given the time elapsed since the
+    /// FIRST attempt (not counting the one about to run).
+    static func shouldRetry(elapsed: Double) -> Bool {
+        return elapsed < maxWaitSeconds
+    }
+}
+
 // MARK: - AgentLoop (orchestrator)
 
 /// The tool-calling agent loop. `call` is INJECTED so tests can stub the model:
