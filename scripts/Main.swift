@@ -147,6 +147,23 @@ final class DebugShowDelegate: NSObject, NSApplicationDelegate {
             h.showWindow()
             history = h
             centerOnPrimary(h.window)
+        case "menu-after-chat":
+            // Regression harness: open chat (which switches the shared hosting view
+            // to window-driven sizing), THEN the cursor action menu via the real
+            // production path. Reports the final menu window size so we can assert it
+            // didn't collapse to 0×0 (the "invisible menu after chat" bug).
+            let p = PopupWindowController()
+            p.debugShowChat()
+            popup = p
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                p.showAtMouseLocation()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    let f = p.window?.frame ?? .zero
+                    FileHandle.standardError.write(Data(
+                        "MENU_AFTER_CHAT_SIZE \(Int(f.width))x\(Int(f.height))\n".utf8))
+                    NSApp.terminate(nil)
+                }
+            }
         default:
             FileHandle.standardError.write(Data(
                 "--debug-show: unknown state '\(state)' (use bubble|menu|chat|settings|history)\n".utf8))
