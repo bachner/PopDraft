@@ -713,6 +713,7 @@ class LLMClient {
         // models / just booted): connection-refused or a 503 while weights load.
         // Only applies to llamacpp — other providers surface their error as-is.
         let attemptStart = Date()
+        var didRestartServer = false
         var data: Data!
         var response: URLResponse!
         while true {
@@ -720,6 +721,16 @@ class LLMClient {
                 (data, response) = try await URLSession.shared.data(for: request)
             } catch {
                 if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
+                    // The socket is REFUSED — the server process is down, not merely
+                    // loading (which returns 503). Retrying the request alone never
+                    // recovers that; kick a one-time restart (bootout+bootstrap) and
+                    // keep polling through the restart + weight-load window. This is
+                    // the "asked a question right after a model change and got
+                    // 'server isn't responding'" case.
+                    if !didRestartServer {
+                        didRestartServer = true
+                        await MainActor.run { LlamaServerManager.shared.restart { _ in } }
+                    }
                     if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
                         try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
                         continue
