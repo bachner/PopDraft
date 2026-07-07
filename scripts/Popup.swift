@@ -839,6 +839,10 @@ class PopupWindowController: NSWindowController {
             if case .chat = self.state { return }
             var size = hostingView.fittingSize
             size.height = min(size.height, 400)  // Maximum height
+            // Never collapse to 0×0: if SwiftUI hasn't produced a fitting size yet
+            // (e.g. the hosting view is mid-transition from chat's window-driven
+            // mode), skip this pass rather than shrink the menu to nothing.
+            guard size.width > 1, size.height > 1 else { return }
             window.setContentSize(size)
 
             // Ensure window stays within screen bounds after resize
@@ -1946,6 +1950,16 @@ class PopupWindowController: NSWindowController {
         guard let window = window else { return }
         window.styleMask.remove(.resizable)
         window.isMovableByWindowBackground = false
+        // The chat switches the SHARED hosting view to window-driven sizing
+        // (`sizingOptions = []`, autoresize-fill) so it can be dragged. Left set,
+        // that collapses the fitting-size action menu to 0×0 (flexible content →
+        // zero fitting size) — an INVISIBLE menu after chat has been opened once.
+        // Restore intrinsic-size mode so `updateView`'s fittingSize → setContentSize
+        // sizes the menu again.
+        if let host = hostingView {
+            host.sizingOptions = .standardBounds
+            host.autoresizingMask = []
+        }
     }
 
     /// Persist the chat window's current size + position (call before tearing the
