@@ -786,7 +786,9 @@ struct SettingsView: View {
 
     private var localModelSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Add a local model from Hugging Face")
+            yourLocalModelsSection
+
+            Text("Add a model from Hugging Face")
                 .font(.system(size: 12, weight: .semibold))
 
             TextField("e.g. Qwen/Qwen2.5-7B-Instruct-GGUF", text: $hfRepoInput)
@@ -864,39 +866,60 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
 
-            // User-managed local models
-            let localUserModels = userModels.filter { $0.source == "huggingface" }
-            if !localUserModels.isEmpty {
-                Divider()
-                Text("Your local models")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.secondary)
-                ForEach(Array(localUserModels.enumerated()), id: \.offset) { _, m in
-                    HStack(spacing: 6) {
-                        Image(systemName: "cube.box.fill")
-                            .font(.system(size: 10))
-                            .foregroundColor(.accentColor)
-                        Text(m.name + (m.quant.map { " · \($0)" } ?? ""))
-                            .font(.system(size: 11, design: .monospaced))
-                            .lineLimit(1)
-                        Spacer()
-                        if isUserModelActive(m) {
-                            Text("Active")
-                                .font(.system(size: 10, weight: .medium)).foregroundColor(.green)
-                        } else if m.filename != nil {
-                            Button("Use") { activateUserModel(m) }
-                                .buttonStyle(.borderless).controlSize(.small)
-                        }
-                        Button(action: { removeUserModel(m) }) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
+    /// "Your local models" — the downloaded built-ins (excluding the recommended
+    /// one, which has its own row) plus user-added Hugging Face models. Replaces
+    /// the old full built-in catalog: only models actually on disk appear here.
+    @ViewBuilder
+    private var yourLocalModelsSection: some View {
+        let builtins = downloadedBuiltins
+        let localUserModels = userModels.filter { $0.source == "huggingface" }
+        if !builtins.isEmpty || !localUserModels.isEmpty {
+            Text("Your local models")
+                .font(.system(size: 12, weight: .semibold))
+            ForEach(builtins, id: \.id) { m in
+                HStack(spacing: 6) {
+                    Image(systemName: "cube.box.fill")
+                        .font(.system(size: 10)).foregroundColor(.accentColor)
+                    Text("\(m.name) · \(m.size)")
+                        .font(.system(size: 11)).lineLimit(1)
+                    Spacer()
+                    if isBuiltinActive(m) {
+                        Text("Active")
+                            .font(.system(size: 10, weight: .medium)).foregroundColor(.green)
+                    } else {
+                        Button("Use") { activateBuiltin(m) }
+                            .buttonStyle(.borderless).controlSize(.small)
                     }
                 }
             }
+            ForEach(Array(localUserModels.enumerated()), id: \.offset) { _, m in
+                HStack(spacing: 6) {
+                    Image(systemName: "cube.box.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.accentColor)
+                    Text(m.name + (m.quant.map { " · \($0)" } ?? ""))
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                    Spacer()
+                    if isUserModelActive(m) {
+                        Text("Active")
+                            .font(.system(size: 10, weight: .medium)).foregroundColor(.green)
+                    } else if m.filename != nil {
+                        Button("Use") { activateUserModel(m) }
+                            .buttonStyle(.borderless).controlSize(.small)
+                    }
+                    Button(action: { removeUserModel(m) }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Divider()
         }
     }
 
@@ -1138,58 +1161,7 @@ struct SettingsView: View {
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Model")
-                    .font(.system(size: 12, weight: .medium))
-                Picker("", selection: $selectedLlamaModel) {
-                    ForEach(LLMConfig.llamaModels, id: \.id) { model in
-                        Text("\(model.name) (\(model.size))").tag(model.id)
-                    }
-                }
-                .labelsHidden()
-            }
-
-            if let model = LLMConfig.llamaModels.first(where: { $0.id == selectedLlamaModel }) {
-                Text("Languages: \(model.languages)")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
-
-            // Download status
-            if isDownloadingModel {
-                VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: downloadProgress, total: 100)
-                        .progressViewStyle(.linear)
-                    Text(downloadStatus)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-            } else if !DependencyManager.shared.isModelDownloaded(selectedLlamaModel) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.system(size: 12))
-                        Text("Model not downloaded")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }
-                    Button("Download Model") {
-                        downloadSelectedModel()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                }
-            } else {
-                HStack {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                        .font(.system(size: 12))
-                    Text("Model ready")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-            }
+            recommendedModelRow
 
             // Server status
             HStack(spacing: 6) {
@@ -1275,78 +1247,95 @@ struct SettingsView: View {
         }
     }
 
-    private func downloadSelectedModel() {
-        guard let model = LLMConfig.llamaModels.first(where: { $0.id == selectedLlamaModel }) else { return }
+    // MARK: - Recommended local model (memory-based)
 
+    /// The single memory-recommended built-in, surfaced instead of the full
+    /// catalog: a "Recommended for <N>GB" header + a Download/Use/Active control
+    /// depending on whether it's already on disk and whether it's the active model.
+    private var recommendedModelRow: some View {
+        let rec = LLMConfig.recommendedLlamaModel()
+        let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+        let downloaded = FileManager.default.fileExists(atPath: modelsDir + "/" + rec.filename)
+        let active = DependencyManager.shared.activeLocalModelFilename() == rec.filename
+        let busy = isDownloadingModel && selectedLlamaModel == rec.id
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Recommended for \(LLMConfig.physicalMemoryGB())GB")
+                .font(.system(size: 12, weight: .semibold))
+            HStack(spacing: 8) {
+                Image(systemName: "star.fill").foregroundColor(.yellow).font(.system(size: 11))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(rec.name).font(.system(size: 12, weight: .medium))
+                    Text("\(rec.size) · \(rec.languages)")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
+                Spacer()
+                if busy {
+                    EmptyView()   // progress shown below
+                } else if active {
+                    Text("Active").font(.system(size: 11, weight: .medium)).foregroundColor(.green)
+                } else if downloaded {
+                    Button("Use") { activateBuiltin(rec) }.controlSize(.small)
+                } else {
+                    Button("Download & Use") { downloadRecommended() }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                }
+            }
+            if busy {
+                ProgressView(value: downloadProgress, total: 100).progressViewStyle(.linear)
+                Text(downloadStatus).font(.system(size: 10)).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// Download the memory-recommended built-in via the shared DependencyManager
+    /// path, then activate it (mirrors the in-chat switcher's download-then-switch).
+    private func downloadRecommended() {
+        let rec = LLMConfig.recommendedLlamaModel()
+        selectedLlamaModel = rec.id
         isDownloadingModel = true
         downloadProgress = 0
-        downloadStatus = "Starting download..."
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Stop llama-server if running
-            let stopProcess = Process()
-            stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]
-            try? stopProcess.run()
-            stopProcess.waitUntilExit()
-
-            // Create models directory
-            let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
-
-            let modelPath = "\(modelsDir)/\(model.filename)"
-
-            // Download using curl with progress
-            let curlProcess = Process()
-            curlProcess.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            curlProcess.arguments = ["-L", "-o", modelPath, "--progress-bar", model.url]
-
-            let pipe = Pipe()
-            curlProcess.standardError = pipe
-
-            try? curlProcess.run()
-
-            // Monitor progress
-            DispatchQueue.main.async {
-                self.downloadStatus = "Downloading \(model.name)..."
-            }
-
-            curlProcess.waitUntilExit()
-
-            if curlProcess.terminationStatus == 0 {
-                // Update config and restart server
-                DispatchQueue.main.async {
-                    self.downloadStatus = "Restarting server..."
-                    self.downloadProgress = 90
-                }
-
-                // Update LaunchAgent with new model
-                DependencyManager.shared.createLlamaLaunchAgentForModel(model)
-
-                // Start server
-                let startProcess = Process()
-                startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                startProcess.arguments = ["bootstrap", "gui/\(getuid())",
-                    NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath]
-                try? startProcess.run()
-                startProcess.waitUntilExit()
-
-                DispatchQueue.main.async {
-                    self.downloadProgress = 100
-                    self.downloadStatus = "Complete!"
-
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                        self.isDownloadingModel = false
-                    }
-                }
+        downloadStatus = "Starting download…"
+        DependencyManager.shared.downloadBuiltinModel(rec, progress: { pct, status in
+            self.downloadProgress = pct * 100
+            self.downloadStatus = status
+        }, completion: { ok in
+            if ok {
+                self.activateBuiltin(rec)
+                self.downloadProgress = 100
+                self.downloadStatus = "Ready"
             } else {
-                DispatchQueue.main.async {
-                    self.downloadStatus = "Download failed"
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        self.isDownloadingModel = false
-                    }
-                }
+                self.downloadStatus = "Download failed"
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.isDownloadingModel = false }
+        })
+    }
+
+    /// Downloaded built-in models OTHER than the recommended one (which has its own
+    /// row above) — the "Your local models" built-in half.
+    private var downloadedBuiltins: [LLMConfig.LlamaModel] {
+        let dir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+        let recFilename = LLMConfig.recommendedLlamaModel().filename
+        return LLMConfig.llamaModels.filter {
+            $0.filename != recFilename &&
+            FileManager.default.fileExists(atPath: dir + "/" + $0.filename)
+        }
+    }
+
+    private func isBuiltinActive(_ m: LLMConfig.LlamaModel) -> Bool {
+        DependencyManager.shared.activeLocalModelFilename() == m.filename
+    }
+
+    /// Make a downloaded built-in the active local model (flip provider to
+    /// llama.cpp + restart the server at its file), mirroring `activateUserModel`.
+    private func activateBuiltin(_ m: LLMConfig.LlamaModel) {
+        selectedProvider = .llamacpp
+        var cfg = LLMConfig.load()
+        cfg.provider = .llamacpp
+        cfg.llamaModel = m.id
+        cfg.save()
+        LLMClient.shared.reloadConfig()
+        DispatchQueue.global(qos: .userInitiated).async {
+            DependencyManager.shared.switchLocalModelFileAndRestart(m.filename)
         }
     }
 
@@ -1427,7 +1416,7 @@ struct SettingsView: View {
         downloadStatus = "Starting download…"
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Stop llama-server if running (mirrors downloadSelectedModel).
+            // Stop llama-server if running before swapping in the new HF model.
             let stopProcess = Process()
             stopProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             stopProcess.arguments = ["bootout", "gui/\(getuid())/com.popdraft.llama-server"]

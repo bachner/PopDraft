@@ -199,9 +199,21 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         var out: [ModelChoice] = []
         let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
         var seenFiles = Set<String>()
-        // Built-in models that are downloaded — keyed by their gguf FILENAME.
+        // The single memory-recommended built-in — ALWAYS first, downloaded or not.
+        // If it's on disk this row represents that file (so it's not re-listed
+        // below); if not, selecting it downloads first (see ModelSwitcherPalette).
+        let rec = LLMConfig.recommendedLlamaModel()
+        let recDownloaded = FileManager.default.fileExists(atPath: modelsDir + "/" + rec.filename)
+        seenFiles.insert(rec.filename)
+        out.append(ModelChoice(
+            provider: .llamacpp, model: rec.filename, label: "\(rec.name) · Recommended",
+            isActive: cfg.provider == .llamacpp && activeFile == rec.filename,
+            isRecommended: true, isDownloaded: recDownloaded))
+        // Other built-in models that are downloaded — keyed by their gguf FILENAME.
+        // (The recommended one is already listed above, so skip it here.)
         for m in LLMConfig.llamaModels {
-            guard FileManager.default.fileExists(atPath: modelsDir + "/" + m.filename) else { continue }
+            guard !seenFiles.contains(m.filename),
+                  FileManager.default.fileExists(atPath: modelsDir + "/" + m.filename) else { continue }
             seenFiles.insert(m.filename)
             out.append(ModelChoice(provider: .llamacpp, model: m.filename, label: m.name,
                                    isActive: cfg.provider == .llamacpp && activeFile == m.filename))
@@ -331,6 +343,11 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
             if let builtin = LLMConfig.llamaModels.first(where: { $0.filename == choice.model }) {
                 cfg.llamaModel = builtin.id
             }
+            // Never boot the server at a file that isn't on disk — that breaks the
+            // server. The palette downloads a not-yet-downloaded model FIRST and
+            // only then calls here; this guard is the defensive backstop.
+            let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+            guard FileManager.default.fileExists(atPath: modelsDir + "/" + choice.model) else { return }
             restartLocalFile = choice.model
         case .ollama:   cfg.ollamaModel = choice.model
         case .openai:   cfg.openaiModel = choice.model
@@ -2392,6 +2409,12 @@ struct ModelChoice: Identifiable, Equatable {
     let model: String
     let label: String
     let isActive: Bool
+    // The single memory-recommended local model gets a star + first slot.
+    var isRecommended: Bool = false
+    // Local models only: false ⇒ not yet on disk, so selecting it must DOWNLOAD
+    // first (never boot the server at a missing file). Defaults true so existing
+    // constructions (cloud + downloaded local) compile unchanged.
+    var isDownloaded: Bool = true
     var id: String { "\(provider.rawValue)::\(model)" }
 }
 
@@ -2465,6 +2488,11 @@ struct ModelSwitcherPalette: View {
     // which would call the @MainActor `allSwitchableChoices()` from a nonisolated
     // context (a build error on stricter Swift toolchains / in CI).
     @State private var choices: [ModelChoice] = []
+    // The recommended local model can be selected before it's downloaded — we then
+    // fetch it (progress shown below the list) and only switch once it's on disk.
+    @State private var downloading: ModelChoice? = nil
+    @State private var dlProgress: Double = 0
+    @State private var dlStatus: String = ""
 
     private var filtered: [ModelChoice] {
         guard !query.isEmpty else { return choices }
@@ -2495,7 +2523,7 @@ struct ModelSwitcherPalette: View {
                             row(choice, highlighted: idx == selected)
                                 .id(idx)
                                 .contentShape(Rectangle())
-                                .onTapGesture { onSelect(choice); onDismiss() }
+                                .onTapGesture { activate(choice) }
                         }
                         if filtered.isEmpty {
                             Text("No models match “\(query)”")
@@ -2506,6 +2534,14 @@ struct ModelSwitcherPalette: View {
                     .padding(6)
                 }
                 .onChange(of: selected) { _, s in withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(s, anchor: .center) } }
+            }
+            if downloading != nil {
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: dlProgress, total: 1.0).progressViewStyle(.linear)
+                    Text(dlStatus).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
             }
             Divider()
             Button {
@@ -2538,19 +2574,66 @@ struct ModelSwitcherPalette: View {
         let list = filtered
         guard !list.isEmpty else { onDismiss(); return }
         let idx = list.indices.contains(selected) ? selected : 0
-        onSelect(list[idx]); onDismiss()
+        activate(list[idx])
+    }
+
+    /// Select a choice — but a local model that isn't on disk yet (the recommended
+    /// model before its first download) DOWNLOADS first, then switches on success.
+    /// Never hands a missing file to `onSelect` (that would break the server).
+    private func activate(_ choice: ModelChoice) {
+        guard downloading == nil else { return }   // one download at a time
+        if choice.provider == .llamacpp && !choice.isDownloaded {
+            startDownload(choice)
+        } else {
+            onSelect(choice); onDismiss()
+        }
+    }
+
+    private func startDownload(_ choice: ModelChoice) {
+        guard let model = LLMConfig.llamaModels.first(where: { $0.filename == choice.model }) else {
+            dlStatus = "Model unavailable"
+            return
+        }
+        downloading = choice
+        dlProgress = 0
+        dlStatus = "Starting download…"
+        DependencyManager.shared.downloadBuiltinModel(model, progress: { pct, status in
+            dlProgress = pct
+            dlStatus = status
+        }, completion: { ok in
+            downloading = nil
+            if ok {
+                // Now on disk — hand off to the normal switch path (activates + restarts).
+                onSelect(choice)
+                onDismiss()
+            } else {
+                dlStatus = "Download failed"
+            }
+        })
     }
 
     @ViewBuilder private func row(_ c: ModelChoice, highlighted: Bool) -> some View {
+        let needsDownload = c.provider == .llamacpp && !c.isDownloaded
         HStack(spacing: 8) {
-            Image(systemName: c.isActive ? "checkmark.circle.fill" : "circle")
-                .font(.system(size: 12))
-                .foregroundColor(c.isActive ? .green : Color.secondary.opacity(0.35))
+            if downloading?.id == c.id {
+                ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 16, height: 16)
+            } else if needsDownload {
+                Image(systemName: "arrow.down.circle")
+                    .font(.system(size: 12)).foregroundColor(.accentColor)
+            } else {
+                Image(systemName: c.isActive ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundColor(c.isActive ? .green : Color.secondary.opacity(0.35))
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(c.label).font(.system(size: 12.5, weight: .medium)).lineLimit(1)
-                Text(c.provider.displayName).font(.system(size: 10)).foregroundColor(.secondary)
+                Text(needsDownload ? "\(c.provider.displayName) · tap to download" : c.provider.displayName)
+                    .font(.system(size: 10)).foregroundColor(.secondary)
             }
             Spacer(minLength: 0)
+            if c.isRecommended {
+                Image(systemName: "star.fill").font(.system(size: 9)).foregroundColor(.yellow)
+            }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6)

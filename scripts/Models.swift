@@ -192,6 +192,27 @@ struct LLMConfig {
         )
     ]
 
+    /// Physical RAM rounded to whole gigabytes — used to label the recommendation.
+    static func physicalMemoryGB() -> Int {
+        Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0).rounded())
+    }
+
+    /// The single built-in local model recommended for THIS machine, chosen purely
+    /// by physical RAM. `llamaModels` stays the definition source (filenames, ids,
+    /// urls); this only PICKS one of them so the picker can surface a single
+    /// "recommended for your Mac" row instead of the full catalog.
+    ///   >= 28 GB → qwen3-30b-a3b
+    ///   >= 12 GB → qwen3.5-4b
+    ///   else     → qwen3.5-2b
+    static func recommendedLlamaModel() -> LlamaModel {
+        let gb = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let id: String
+        if gb >= 28 { id = "qwen3-30b-a3b" }
+        else if gb >= 12 { id = "qwen3.5-4b" }
+        else { id = "qwen3.5-2b" }
+        return llamaModels.first { $0.id == id } ?? llamaModels[0]
+    }
+
     var provider: Provider = .llamacpp
     var llamaModel: String = "qwen3-30b-a3b"
     var llamacppURL: String = "http://localhost:10819"
