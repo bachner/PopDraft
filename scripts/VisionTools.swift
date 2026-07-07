@@ -184,28 +184,26 @@ struct SeeImageTool: AgentTool, @unchecked Sendable {
             }
         }
 
-        // Capability gate: if the configured model can't SEE, don't fail blankly —
-        // return the actionable "add a vision model" message (with the capture note
-        // when we did capture a screenshot, so the user sees that part worked).
-        guard VisionSupport.modelSupportsVision(config: config) else {
-            let msg = VisionSupport.noVisionModelMessage()
+        // Capability gate: the DEDICATED vision server (VisionServerManager, :10820)
+        // handles vision regardless of the main provider/model — it's usable
+        // whenever its model files are installed. If they're not, don't fail
+        // blankly: return an actionable message (with the capture note when we did
+        // capture a screenshot, so the user sees that part worked).
+        guard VisionServerManager.isAvailable else {
+            let msg = "No local vision model installed. Download Qwen3.5-0.8B (model + mmproj) to ~/.popdraft/models/."
             return captureNote.isEmpty ? msg : "\(captureNote)\n\n\(msg)"
         }
 
-        // ONE-SHOT vision turn: a focused system prompt + the user message carrying
-        // the image. Runs on the SAME provider/model the agent is using.
+        // ONE-SHOT vision turn on the DEDICATED vision server (:10820), independent
+        // of the global provider/config. The instruction is carried in the single
+        // user message alongside the image (thinking is force-disabled inside
+        // visionCompletion — the VL model is a thinking model).
         let ask = question.isEmpty
             ? "Describe this image in detail. If it is a screenshot of a website, describe its visual appearance and layout, and note anything that looks broken or off."
             : question
-        let visionMessages: [ChatMessage] = [
-            ChatMessage(role: "system",
-                        content: "You are a vision assistant. Look at the attached image and answer concisely and concretely about what you see."),
-            ChatMessage(role: "user", content: ask, images: [imageRef]),
-        ]
         do {
-            let turn = try await LLMClient.shared.chatCompletion(
-                messages: visionMessages, tools: nil, forceThinkingOff: true)
-            let analysis = (turn.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let analysis = try await LLMClient.shared.visionCompletion(text: ask, images: [imageRef])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let body = analysis.isEmpty ? "(the vision model returned no description)" : analysis
             return captureNote.isEmpty ? body : "\(captureNote)\n\n\(body)"
         } catch {

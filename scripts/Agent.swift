@@ -659,6 +659,87 @@ class LLMClient {
     /// One round against any OpenAI-compatible `/v1/chat/completions` endpoint
     /// (llama.cpp, Ollama-OpenAI, OpenAI). Non-streamed (so `tool_calls` parse
     /// reliably); pushes the final text to `onTextDelta` once.
+    /// One-shot VISION completion against the DEDICATED vision llama-server on
+    /// :10820 (`VisionServerManager`) — NOT the global provider/config. `see_image`
+    /// routes here so it can SEE regardless of what the main model is.
+    ///
+    /// The VL model is a THINKING model, so thinking MUST be disabled or it returns
+    /// an empty answer (`chat_template_kwargs.enable_thinking:false` +
+    /// `enable_thinking:false`). Retries through the connection-refused / 503 window
+    /// (via `LlamaLoadRetry`) while the vision server loads its weights.
+    func visionCompletion(text: String, images: [ImageRef]) async throws -> String {
+        let urlString = "\(VisionServerManager.endpoint)/v1/chat/completions"
+        guard let url = URL(string: urlString) else {
+            throw NSError(domain: "Invalid URL", code: -1)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 180
+
+        // llama.cpp ignores `model`; the single user message carries the image
+        // parts (VisionContent.openAIParts builds the OpenAI content array).
+        let body: [String: Any] = [
+            "model": "vision",
+            "messages": [[
+                "role": "user",
+                "content": VisionContent.openAIParts(text: text, images: images),
+            ]],
+            "stream": false,
+            "max_tokens": 500,
+            "temperature": 0,
+            "chat_template_kwargs": ["enable_thinking": false],
+            "enable_thinking": false,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        // Retry through the vision server's "still loading" window (just booted /
+        // weights loading): connection-refused or a 503.
+        let attemptStart = Date()
+        var data: Data!
+        var response: URLResponse!
+        while true {
+            do {
+                (data, response) = try await URLSession.shared.data(for: request)
+            } catch {
+                if (error as? URLError)?.code == .cannotConnectToHost {
+                    if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                        try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
+                        continue
+                    }
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+                }
+                throw error
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 503 {
+                if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                    try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
+                    continue
+                }
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+            }
+            break
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
+            throw NSError(domain: message, code: -1)
+        }
+        guard let choices = json["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let message = first["message"] as? [String: Any] else {
+            throw NSError(domain: "Invalid response", code: -1)
+        }
+        var content = (message["content"] as? String) ?? ""
+        // Strip any stray <think>…</think> the VL model might still emit.
+        if let range = content.range(of: "</think>") {
+            content = String(content[range.upperBound...])
+        }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func chatCompletionOpenAICompatible(
         urlString: String, model: String?, apiKey: String?,
         messages: [ChatMessage], tools: [[String: Any]]?, isLlamaCpp: Bool,

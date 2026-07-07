@@ -974,6 +974,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             serverStatusMenuItem?.isHidden = true
         }
 
+        // Start the DEDICATED vision llama-server (parallel :10820) whenever its
+        // model files are present — INDEPENDENT of the main provider, so `see_image`
+        // can SEE regardless of what the main model is. Off the main thread
+        // (writes the plist + runs launchctl, which block).
+        if VisionServerManager.isAvailable {
+            DispatchQueue.global(qos: .utility).async {
+                VisionServerManager.shared.ensureRunning()
+            }
+        }
+
         // Register all global hotkeys
         HotkeyManager.shared.registerAll()
 
