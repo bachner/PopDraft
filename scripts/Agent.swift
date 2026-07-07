@@ -764,7 +764,12 @@ class LLMClient {
 
         var body: [String: Any] = [
             "messages": openAIMessagesJSON(messages),
-            "stream": false,
+            // STREAMED: content arrives token-by-token (pushed live to onTextDelta,
+            // so the answer types onto the screen after any thinking), while
+            // tool_calls / reasoning are accumulated from the SSE deltas and parsed
+            // into the same AssistantTurn shape as before. This llama.cpp build
+            // streams tool_call deltas correctly (id+name then arg fragments).
+            "stream": true,
             "max_tokens": 4096,
         ]
         if let model = model { body["model"] = model }
@@ -795,11 +800,11 @@ class LLMClient {
         // Only applies to llamacpp — other providers surface their error as-is.
         let attemptStart = Date()
         var didRestartServer = false
-        var data: Data!
+        var bytesStream: URLSession.AsyncBytes!
         var response: URLResponse!
         while true {
             do {
-                (data, response) = try await URLSession.shared.data(for: request)
+                (bytesStream, response) = try await URLSession.shared.bytes(for: request)
             } catch {
                 if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
                     // The socket is REFUSED — the server process is down, not merely
@@ -830,39 +835,82 @@ class LLMClient {
             break
         }
 
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "Invalid response", code: -1)
-        }
-        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
-            throw NSError(domain: message, code: -1)
-        }
-        guard let choices = json["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any] else {
-            throw NSError(domain: "Invalid response", code: -1)
+        // A non-2xx that wasn't a retried 503: drain a little of the body for the
+        // error message, then throw.
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+            var raw = ""
+            for try await line in bytesStream.lines { raw += line; if raw.count > 2000 { break } }
+            throw NSError(domain: raw.isEmpty ? "HTTP \(http.statusCode)" : raw, code: -1)
         }
 
-        // Parse tool_calls (OpenAI / llama.cpp shape).
-        var parsedCalls: [ParsedToolCall] = []
-        if let toolCalls = message["tool_calls"] as? [[String: Any]] {
-            for (i, tc) in toolCalls.enumerated() {
-                guard let fn = tc["function"] as? [String: Any],
-                      let name = fn["name"] as? String else { continue }
-                // Normalize a blank id to a positional one: llama.cpp sometimes
-                // emits `"id":""` for parallel tool calls, and an empty id is
-                // worthless (and collides across calls). The `?? "call_\(i)"`
-                // alone only fires when the key is ABSENT, so coalesce "" too.
-                let id = (tc["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "call_\(i)"
-                // `arguments` may be a JSON string OR an object — pass raw; the
-                // loop's ToolArgs.parse tolerates both.
-                let rawArgs = fn["arguments"]
-                parsedCalls.append(ParsedToolCall(id: id, name: name, rawArguments: rawArgs))
+        // Consume the SSE stream. `content` deltas stream LIVE to onTextDelta (the
+        // answer after any <think> block — so it types onto the screen once thinking
+        // ends); `reasoning_content` and `tool_calls` deltas accumulate into the same
+        // AssistantTurn shape the non-streamed path returned.
+        var contentAccum = ""
+        var reasoningAccum = ""
+        // per tool-call index → (id, name, concatenated argument fragments)
+        var toolAccum: [Int: (id: String, name: String, args: String)] = [:]
+        var lastPushedAnswer = ""
+
+        // Visible answer = content after </think>; "" while still inside an unclosed
+        // <think>; the whole string when the model uses no think tags.
+        func answerPortion(_ s: String) -> String {
+            if let r = s.range(of: "</think>") {
+                return String(s[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if s.contains("<think>") { return "" }
+            return s
+        }
+
+        for try await line in bytesStream.lines {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let d = payload.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+            if let errorObj = obj["error"] as? [String: Any], let msg = errorObj["message"] as? String {
+                throw NSError(domain: msg, code: -1)
+            }
+            guard let choices = obj["choices"] as? [[String: Any]],
+                  let choice = choices.first,
+                  let delta = choice["delta"] as? [String: Any] else { continue }
+            if let c = delta["content"] as? String, !c.isEmpty {
+                contentAccum += c
+                let answer = answerPortion(contentAccum)
+                if answer != lastPushedAnswer {
+                    onTextDeltaSafe(onTextDelta, answer)
+                    lastPushedAnswer = answer
+                }
+            }
+            if let r = delta["reasoning_content"] as? String { reasoningAccum += r }
+            if let tcs = delta["tool_calls"] as? [[String: Any]] {
+                for tc in tcs {
+                    let idx = (tc["index"] as? Int) ?? 0
+                    var entry = toolAccum[idx] ?? (id: "", name: "", args: "")
+                    if let id = tc["id"] as? String, !id.isEmpty { entry.id = id }
+                    if let fn = tc["function"] as? [String: Any] {
+                        if let n = fn["name"] as? String, !n.isEmpty { entry.name = n }
+                        if let a = fn["arguments"] as? String { entry.args += a }
+                    }
+                    toolAccum[idx] = entry
+                }
             }
         }
 
-        // Parse content + <think> blocks (llama.cpp local thinking).
-        var content = (message["content"] as? String) ?? ""
-        var thinking: String? = nil
+        // Assemble tool calls (the concatenated fragments form a complete JSON
+        // arguments string; ToolArgs.parse tolerates a string OR an object).
+        var parsedCalls: [ParsedToolCall] = []
+        for idx in toolAccum.keys.sorted() {
+            guard let e = toolAccum[idx], !e.name.isEmpty else { continue }
+            let id = e.id.isEmpty ? "call_\(idx)" : e.id
+            parsedCalls.append(ParsedToolCall(id: id, name: e.name, rawArguments: e.args))
+        }
+
+        // Split content / <think> exactly as the non-streamed path did; prefer a
+        // reasoning_content channel for thinking when present.
+        var content = contentAccum
+        var thinking: String? = reasoningAccum.isEmpty ? nil : reasoningAccum
         if let range = content.range(of: "</think>") {
             if let startRange = content.range(of: "<think>") {
                 thinking = String(content[startRange.upperBound..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -870,7 +918,11 @@ class LLMClient {
             content = String(content[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        if parsedCalls.isEmpty, !content.isEmpty { onTextDeltaSafe(onTextDelta, content) }
+        // Belt-and-suspenders: make sure the final (trimmed) answer reached the UI at
+        // least once — covers a non-streamed cloud reply and the trailing trim.
+        if parsedCalls.isEmpty, !content.isEmpty, content != lastPushedAnswer {
+            onTextDeltaSafe(onTextDelta, content)
+        }
         return AssistantTurn(content: content.isEmpty ? nil : content, toolCalls: parsedCalls, thinking: thinking)
     }
 
