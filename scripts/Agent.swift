@@ -709,17 +709,33 @@ class LLMClient {
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
+        // Retry through the llama.cpp "not ready yet" window (just switched
+        // models / just booted): connection-refused or a 503 while weights load.
+        // Only applies to llamacpp — other providers surface their error as-is.
+        let attemptStart = Date()
+        var data: Data!
+        var response: URLResponse!
+        while true {
+            do {
+                (data, response) = try await URLSession.shared.data(for: request)
+            } catch {
+                if isLlamaCpp, (error as? URLError)?.code == .cannotConnectToHost {
+                    if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                        try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
+                        continue
+                    }
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+                }
+                throw error
+            }
+            if isLlamaCpp, let http = response as? HTTPURLResponse, http.statusCode == 503 {
+                if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                    try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
+                    continue
+                }
                 throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
             }
-            throw error
-        }
-        if isLlamaCpp, let http = response as? HTTPURLResponse, http.statusCode == 503 {
-            throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
+            break
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
