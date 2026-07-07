@@ -97,6 +97,11 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     @Published var webEnabled: Bool
     /// The draft text in the input bar.
     @Published var draft: String = ""
+    /// Selected text captured before this chat opened, held as CONTEXT for the
+    /// first turn: "Ask Agent" with a selection drops the text here and waits for
+    /// the user to type their prompt, then `send` combines the two. Shown as a
+    /// dismissible chip above the composer while set; cleared on the first send.
+    @Published var pendingContext: String = ""
     /// Tool cards keyed by the assistant message id they belong to (so a finished
     /// turn keeps its cards rendered above its answer).
     @Published private(set) var cardsByMessage: [String: [ToolCallState]] = [:]
@@ -437,17 +442,30 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// follow-up turn the moment the current run finishes (item 7).
     func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        let context = pendingContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Either a typed message or the pending selected-text context is enough to
+        // send. When both are present, combine them into one turn: the user's
+        // prompt followed by the selected text as labeled context.
+        guard !trimmed.isEmpty || !context.isEmpty else { return }
+        let content: String
+        if context.isEmpty {
+            content = trimmed
+        } else if trimmed.isEmpty {
+            content = context
+        } else {
+            content = "\(trimmed)\n\nSelected text:\n\(context)"
+        }
+        pendingContext = ""
         draft = ""
-        lastSentUserMessage = trimmed
+        lastSentUserMessage = trimmed.isEmpty ? content : trimmed
         let now = Date().timeIntervalSince1970
-        session.messages.append(ChatMessage(role: "user", content: trimmed, createdAt: now))
+        session.messages.append(ChatMessage(role: "user", content: content, createdAt: now))
         session.updatedAt = now
         rebuildVisible()
         if isGenerating {
             // Mid-generation: keep streaming, queue this for the next turn. The
             // message already shows as a sent bubble (rebuildVisible above).
-            pendingFollowups.append(trimmed)
+            pendingFollowups.append(content)
             queuedCount = pendingFollowups.count
         } else {
             run()
@@ -2587,6 +2605,12 @@ struct ChatView: View {
             Divider().opacity(0.4)
             inputBar
         }
+        // Focus the composer when the chat opens so the user can type right away —
+        // important when "Ask Agent" seeds selected text as context and waits for
+        // the prompt. Fires once per presentation.
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { inputFocused = true }
+        }
         // FILL the hosting view (which the controller autoresizes + frames to the
         // window) rather than pinning a fixed size. A hard `.frame(width:height:)`
         // (the old code) made NSHostingView report that exact size as BOTH its min
@@ -2833,6 +2857,9 @@ struct ChatView: View {
 
     private var inputBar: some View {
         VStack(spacing: 8) {
+            if !viewModel.pendingContext.isEmpty {
+                contextChip
+            }
             HStack(spacing: 10) {
                 TextField("Ask anything, or paste more text…", text: $viewModel.draft, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -2896,10 +2923,44 @@ struct ChatView: View {
         .clipShape(Capsule())
     }
 
+    /// The captured selection shown as a dismissible "context" card above the
+    /// composer. Tapping ✕ drops it; otherwise it's folded into the next message.
+    private var contextChip: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "text.quote")
+                .font(.system(size: 11))
+                .foregroundColor(ChatPalette.blue)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Selected text")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(ChatPalette.ink3)
+                Text(viewModel.pendingContext)
+                    .font(.system(size: 11))
+                    .foregroundColor(ChatPalette.ink2)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button(action: { viewModel.pendingContext = "" }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(ChatPalette.ink3)
+            }
+            .buttonStyle(.plain)
+            .help("Remove the selected text")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(ChatPalette.blueSoft)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(ChatPalette.blue.opacity(0.25), lineWidth: 0.5))
+    }
+
     private var canSend: Bool {
-        // Sending mid-generation is allowed (queued as a follow-up) — only an
-        // empty draft blocks the button.
+        // Sending mid-generation is allowed (queued as a follow-up). Sendable when
+        // there's a typed message OR captured context waiting to go.
         !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !viewModel.pendingContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func submit() {
