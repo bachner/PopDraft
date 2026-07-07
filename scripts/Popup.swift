@@ -664,6 +664,15 @@ class PopupWindowController: NSWindowController {
     private var ttsStatusTimer: Timer?
     private var previousApp: NSRunningApplication?
 
+    /// The last app that was frontmost BEFORE PopDraft activated itself. Showing
+    /// the action menu calls `NSApp.activate(ignoringOtherApps:)`, so by the time a
+    /// *re-press* runs `captureSelectedText`, `NSWorkspace.frontmostApplication` is
+    /// PopDraft — reading AX / Cmd+C / Edit▸Copy from ourselves yields nothing (the
+    /// `frontmost = PopDraft`, 0-char captures in the logs). An activation observer
+    /// keeps this pointed at the real target app so capture always targets the app
+    /// the user was actually working in.
+    private var lastRealFrontApp: NSRunningApplication?
+
     /// PR5: every invocation that produces a result is recorded into a persisted
     /// session (the captured selection + the user/assistant exchange). The session
     /// is built when a result arrives and flushed to disk on copy / meaningful
@@ -722,6 +731,29 @@ class PopupWindowController: NSWindowController {
             name: NSWindow.didResizeNotification,
             object: window
         )
+
+        // Track the last non-self frontmost app so text capture always targets the
+        // app the user was in — never PopDraft, which our own menu activates.
+        if let front = NSWorkspace.shared.frontmostApplication,
+           front.bundleIdentifier != Bundle.main.bundleIdentifier {
+            lastRealFrontApp = front
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(activeAppChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+    }
+
+    /// Record the last app that became frontmost, excluding PopDraft itself. Used
+    /// so `captureSelectedText` can recover the real target app even after our
+    /// action menu has stolen OS focus.
+    @objc private func activeAppChanged(_ note: Notification) {
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
+        if app.processIdentifier == getpid() { return }
+        lastRealFrontApp = app
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
@@ -835,10 +867,14 @@ class PopupWindowController: NSWindowController {
     /// Read the currently-focused UI element's selected text via the Accessibility
     /// API (system-wide → focused element → kAXSelectedTextAttribute). Returns nil
     /// if the focused app doesn't expose a text selection.
-    static func accessibilitySelectedText() -> String? {
-        let systemWide = AXUIElementCreateSystemWide()
+    static func accessibilitySelectedText(forPID pid: pid_t? = nil) -> String? {
+        // Prefer the target app's OWN AX root (by pid): showing our menu activates
+        // PopDraft, so the *system-wide* focused element would be our panel, not the
+        // app the user was in. Per-app AX reads the right selection even when we
+        // hold OS focus. Falls back to system-wide when no pid is known.
+        let root = pid.map { AXUIElementCreateApplication($0) } ?? AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+        guard AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
               let focused = focusedRef else { return nil }
         let element = focused as! AXUIElement
         var selRef: CFTypeRef?
@@ -848,18 +884,33 @@ class PopupWindowController: NSWindowController {
     }
 
     private func captureSelectedText() {
-        // METHOD 1 — Accessibility API: read the focused element's selected text
-        // directly (no clipboard, no synthetic keystrokes, no modifier pollution).
-        // Most reliable for native apps + many others.
-        let frontNameForLog = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-        Logger.shared.info("captureSelectedText: frontmost = \(frontNameForLog)")
-        if let axText = Self.accessibilitySelectedText(), !axText.isEmpty {
-            previousApp = NSWorkspace.shared.frontmostApplication
+        // Determine the REAL target app: the app the user was working in. Showing
+        // the action menu calls `NSApp.activate(ignoringOtherApps:)`, so on a
+        // re-press the OS-frontmost app is PopDraft ITSELF — capturing AX / Cmd+C /
+        // Edit▸Copy from ourselves yields nothing (the `frontmost = PopDraft`,
+        // 0-char captures in the logs). When we hold focus, recover the real app
+        // from the activation observer's `lastRealFrontApp`.
+        let osFront = NSWorkspace.shared.frontmostApplication
+        let weHoldFocus = osFront?.bundleIdentifier == Bundle.main.bundleIdentifier
+            || osFront?.processIdentifier == getpid()
+        let targetApp: NSRunningApplication? = weHoldFocus ? lastRealFrontApp : osFront
+        let targetName = targetApp?.localizedName ?? "unknown"
+        if targetApp != nil { previousApp = targetApp }  // where to return focus on dismiss
+        Logger.shared.info("captureSelectedText: osFront=\(osFront?.localizedName ?? "?") target=\(targetName) weHoldFocus=\(weHoldFocus)")
+
+        // METHOD 1 — Accessibility API on the TARGET app's focused element (by pid,
+        // so we read the user's app and not our own panel). Most reliable for native
+        // apps; terminals expose no selected-text attribute and fall through. When we
+        // DON'T hold focus the system-wide focused element is that same app, so fall
+        // back to it — preserving the exact pre-fix behavior for apps AX handled.
+        let axText = Self.accessibilitySelectedText(forPID: targetApp?.processIdentifier)
+            ?? (weHoldFocus ? nil : Self.accessibilitySelectedText())
+        if let axText = axText, !axText.isEmpty {
             clipboardText = axText
-            Logger.shared.info("captureSelectedText: \(axText.count) chars via Accessibility API")
+            Logger.shared.info("captureSelectedText: \(axText.count) chars via Accessibility API (\(targetName))")
             return
         }
-        Logger.shared.info("captureSelectedText: AX API empty; falling back to synthetic Cmd+C in \(frontNameForLog)")
+        Logger.shared.info("captureSelectedText: AX empty; using clipboard path in \(targetName)")
 
         let pasteboard = NSPasteboard.general
 
@@ -871,62 +922,56 @@ class PopupWindowController: NSWindowController {
         } ?? []
         let savedChangeCount = pasteboard.changeCount
 
-        // Get the frontmost app and store it for later refocus
-        let frontApp = NSWorkspace.shared.frontmostApplication
-        previousApp = frontApp
-        let frontName = frontApp?.localizedName ?? "unknown"
+        // METHOD 2 — synthetic Cmd+C. ONLY valid when the target app actually holds
+        // OS focus (a fresh press): a Cmd+C posted while PopDraft is frontmost would
+        // be delivered to US. When we hold focus we skip straight to the focus-immune
+        // Edit▸Copy menu-click below, which copies the real app's selection by name.
+        if !weHoldFocus {
+            let source = CGEventSource(stateID: .hidSystemState)
+            // The triggering hotkey (Option+Space, or Ctrl+Option+<key>) is almost
+            // always STILL PHYSICALLY HELD here. A synthetic keyUp can't override a
+            // physically-held key, so a Cmd+C posted now can land as Cmd+Option+C.
+            // Wait briefly for the user to lift the hotkey modifiers, then post a
+            // clean Cmd+C. Released within a few dozen ms — imperceptible.
+            var waitedMs = 0
+            while waitedMs < 600 {  // hard cap ~600ms so we never hang the menu
+                let held = CGEventSource.flagsState(.combinedSessionState)
+                if !held.contains(.maskAlternate), !held.contains(.maskControl),
+                   !held.contains(.maskShift), !held.contains(.maskCommand) { break }
+                usleep(15000)  // 15ms
+                waitedMs += 15
+            }
+            // Belt-and-suspenders: post synthetic modifier keyUps too, then settle.
+            for modKey: CGKeyCode in [0x3A, 0x3D, 0x3B, 0x3E, 0x38, 0x3C] {  // L/R Option, Control, Shift
+                let up = CGEvent(keyboardEventSource: source, virtualKey: modKey, keyDown: false)
+                up?.flags = []
+                up?.post(tap: .cghidEventTap)
+            }
+            usleep(20000)  // 20ms settle before Cmd+C
 
-        // Strategy: try CGEvent Cmd+C first (works for Chrome, native apps),
-        // then fall back to AppleScript Edit > Copy menu (works for Electron apps like Slack)
-        let source = CGEventSource(stateID: .hidSystemState)
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
+            keyDown?.flags = .maskCommand
+            keyDown?.post(tap: .cghidEventTap)
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
+            keyUp?.flags = .maskCommand
+            keyUp?.post(tap: .cghidEventTap)
 
-        // The triggering hotkey (Option+Space, or Ctrl+Option+<key>) is almost
-        // always STILL PHYSICALLY HELD when we get here. A synthetic keyUp can't
-        // override a physically-held key, so a Cmd+C posted now is delivered as
-        // Cmd+Option+C and copies NOTHING — this is exactly why terminals (iTerm2)
-        // showed an empty selection. Wait, briefly, for the user to actually lift
-        // the hotkey modifiers, then post a CLEAN Cmd+C. The user releases within a
-        // few dozen ms of the shortcut firing, so this is imperceptible.
-        var waitedMs = 0
-        while waitedMs < 600 {  // hard cap ~600ms so we never hang the menu
-            let held = CGEventSource.flagsState(.combinedSessionState)
-            if !held.contains(.maskAlternate), !held.contains(.maskControl),
-               !held.contains(.maskShift), !held.contains(.maskCommand) { break }
-            usleep(15000)  // 15ms
-            waitedMs += 15
-        }
-        // Belt-and-suspenders: post synthetic modifier keyUps too (helps if the
-        // physical release lands between our poll and the Cmd+C), then settle.
-        for modKey: CGKeyCode in [0x3A, 0x3D, 0x3B, 0x3E, 0x38, 0x3C] {  // L/R Option, Control, Shift
-            let up = CGEvent(keyboardEventSource: source, virtualKey: modKey, keyDown: false)
-            up?.flags = []
-            up?.post(tap: .cghidEventTap)
-        }
-        usleep(20000)  // 20ms settle before Cmd+C
-
-        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)  // 0x08 = 'c'
-        keyDown?.flags = .maskCommand
-        keyDown?.post(tap: .cghidEventTap)
-        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
-        keyUp?.flags = .maskCommand
-        keyUp?.post(tap: .cghidEventTap)
-
-        // Wait for clipboard to update (poll up to 500ms for slower apps like Chrome)
-        for _ in 0..<10 {
-            usleep(50000)  // 50ms per check
-            if pasteboard.changeCount != savedChangeCount { break }
+            // Wait for clipboard to update (poll up to 500ms for slower apps).
+            for _ in 0..<10 {
+                usleep(50000)  // 50ms per check
+                if pasteboard.changeCount != savedChangeCount { break }
+            }
         }
 
-        // If CGEvent Cmd+C didn't work, fall back to AppleScript Edit > Copy menu
-        // (helps Electron apps like Slack). CRITICAL: do NOT `activate` the target
-        // app here — it is ALREADY frontmost while we capture (our panel is
-        // non-activating), and activating it yanks focus back so our menu appears
-        // BEHIND it and feels like "nothing happened". System Events can click the
-        // menu of a running process without bringing it to the front.
-        if pasteboard.changeCount == savedChangeCount {
+        // METHOD 3 — AppleScript Edit▸Copy menu-click of the target process. Works
+        // for Electron apps AND terminals, is modifier-immune and selection-
+        // preserving, and copies even when the app is in the BACKGROUND (verified) —
+        // so it's the primary path when we hold focus. Do NOT `activate` the target:
+        // that yanks focus and makes our menu appear behind it.
+        if pasteboard.changeCount == savedChangeCount, targetApp != nil {
             let script = NSAppleScript(source: """
                 tell application "System Events"
-                    tell process "\(frontName)"
+                    tell process "\(targetName)"
                         click menu item "Copy" of menu "Edit" of menu bar 1
                     end tell
                 end tell
@@ -938,7 +983,7 @@ class PopupWindowController: NSWindowController {
         // Check if clipboard changed (meaning text was selected and copied)
         if pasteboard.changeCount != savedChangeCount {
             clipboardText = pasteboard.string(forType: .string) ?? ""
-            Logger.shared.info("captureSelectedText: \(clipboardText.count) chars via synthetic copy / AppleScript")
+            Logger.shared.info("captureSelectedText: \(clipboardText.count) chars via copy / AppleScript (\(targetName))")
 
             // Restore original clipboard
             pasteboard.clearContents()
@@ -948,7 +993,7 @@ class PopupWindowController: NSWindowController {
         } else {
             // No method produced a selection.
             clipboardText = ""
-            Logger.shared.info("captureSelectedText: 0 chars — AX + Cmd+C + AppleScript all empty in \(frontNameForLog)")
+            Logger.shared.info("captureSelectedText: 0 chars — all methods empty (\(targetName), weHoldFocus=\(weHoldFocus))")
         }
     }
 
@@ -1980,8 +2025,11 @@ class PopupWindowController: NSWindowController {
         onWillShow?()
         resetPresentation()
         // Remember the app to refocus on dismiss (reopen skips captureSelectedText,
-        // which is where `previousApp` is normally set).
-        previousApp = NSWorkspace.shared.frontmostApplication
+        // which is where `previousApp` is normally set). Prefer the real app, not
+        // PopDraft — reopening from the bubble may leave us frontmost.
+        let reopenFront = NSWorkspace.shared.frontmostApplication
+        previousApp = (reopenFront?.bundleIdentifier == Bundle.main.bundleIdentifier)
+            ? (lastRealFrontApp ?? reopenFront) : reopenFront
         clipboardText = session.selectedText ?? ""
         searchText = ""
         customPromptText = ""
