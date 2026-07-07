@@ -2489,6 +2489,30 @@ private struct BottomDistanceKey: PreferenceKey {
     }
 }
 
+private extension View {
+    /// Chat-composer key handling: plain Return SENDS; Shift+Return inserts a
+    /// newline (so multi-line messages are possible). On macOS 14+ we intercept the
+    /// Return key — for Shift+Return we return `.ignored` so the field editor inserts
+    /// the newline itself (correct at any cursor position); for plain Return we send
+    /// and return `.handled` to suppress the newline. On macOS 13 (no `onKeyPress`)
+    /// we fall back to the previous Return-to-send behavior.
+    @ViewBuilder
+    func returnSendsShiftReturnNewline(_ submit: @escaping () -> Void) -> some View {
+        if #available(macOS 14.0, *) {
+            // All-keys overload so we get the KeyPress (with modifiers). Only the
+            // Return key is special; everything else passes through untouched.
+            self.onKeyPress { press in
+                guard press.key == .return else { return .ignored }
+                if press.modifiers.contains(.shift) { return .ignored }  // newline
+                submit()
+                return .handled  // send; suppress the newline
+            }
+        } else {
+            self.onSubmit(submit)
+        }
+    }
+}
+
 struct ChatView: View {
     @ObservedObject var viewModel: AgentChatViewModel
     let onMinimize: () -> Void
@@ -2765,7 +2789,7 @@ struct ChatView: View {
                     .font(.system(size: 13))
                     .lineLimit(1...5)
                     .focused($inputFocused)
-                    .onSubmit(submit)
+                    .returnSendsShiftReturnNewline(submit)
                     // Item 7: input stays ENABLED during generation — a message
                     // sent mid-stream is queued and run as a follow-up turn.
 
@@ -2801,7 +2825,7 @@ struct ChatView: View {
                     .background(Capsule().fill(Color.orange.opacity(0.14)))
                 }
                 Spacer()
-                Text(viewModel.isGenerating ? "Streaming… you can keep typing" : "Enter to send · ↑ to recall")
+                Text(viewModel.isGenerating ? "Streaming… you can keep typing" : "Enter to send · ⇧↵ newline · ↑ recall")
                     .font(.system(size: 10))
                     .foregroundColor(ChatPalette.ink3)
             }
