@@ -887,6 +887,29 @@ class PopupWindowController: NSWindowController {
         return text
     }
 
+    /// DIAGNOSTIC: is the target app's Edit▸Copy menu item currently enabled? A
+    /// terminal exposes no AX selected-text but still enables Copy exactly when a
+    /// live selection exists, so this distinguishes "no live selection at capture
+    /// time" from "copy mechanism failed" for otherwise-unreproducible failures.
+    /// Returns "true"/"false", or a diagnostic string on script/permission error.
+    static func copyMenuEnabled(processName: String) -> String {
+        let s = NSAppleScript(source: """
+            tell application "System Events" to tell process "\(processName)"
+                try
+                    return (enabled of menu item "Copy" of menu "Edit" of menu bar 1) as string
+                on error errMsg number errNum
+                    return "err(" & errNum & "):" & errMsg
+                end try
+            end tell
+        """)
+        var err: NSDictionary?
+        let r = s?.executeAndReturnError(&err)
+        if let err = err {
+            return "asfail:\((err["NSAppleScriptErrorMessage"] as? String) ?? "\(err)")"
+        }
+        return r?.stringValue ?? "nil"
+    }
+
     private func captureSelectedText() {
         // Determine the REAL target app: the app the user was working in. Showing
         // the action menu calls `NSApp.activate(ignoringOtherApps:)`, so on a
@@ -915,6 +938,13 @@ class PopupWindowController: NSWindowController {
             return
         }
         Logger.shared.info("captureSelectedText: AX empty; using clipboard path in \(targetName)")
+
+        // DIAGNOSTIC: probe whether a live selection exists in the target at the
+        // very start of the clipboard path. If this is "false" the selection was
+        // already gone before we did anything (upstream problem); if "true" but we
+        // still capture 0 chars, the copy step itself failed.
+        let copyStateAtStart = Self.copyMenuEnabled(processName: targetName)
+        Logger.shared.info("captureSelectedText: [diag] Copy-menu enabled=\(copyStateAtStart) in \(targetName) at clipboard-path start")
 
         let pasteboard = NSPasteboard.general
 
@@ -965,6 +995,7 @@ class PopupWindowController: NSWindowController {
                 usleep(50000)  // 50ms per check
                 if pasteboard.changeCount != savedChangeCount { break }
             }
+            Logger.shared.info("captureSelectedText: [diag] after Cmd+C changeCount \(savedChangeCount)->\(pasteboard.changeCount)")
         }
 
         // METHOD 3 — AppleScript Edit▸Copy menu-click of the target process. Works
@@ -980,8 +1011,13 @@ class PopupWindowController: NSWindowController {
                     end tell
                 end tell
             """)
-            script?.executeAndReturnError(nil)
+            var copyErr: NSDictionary?
+            script?.executeAndReturnError(&copyErr)
+            if let copyErr = copyErr {
+                Logger.shared.info("captureSelectedText: [diag] Edit>Copy AppleScript error: \((copyErr["NSAppleScriptErrorMessage"] as? String) ?? "\(copyErr)")")
+            }
             usleep(180000)  // 180ms for Electron apps
+            Logger.shared.info("captureSelectedText: [diag] after Edit>Copy changeCount \(savedChangeCount)->\(pasteboard.changeCount)")
         }
 
         // Check if clipboard changed (meaning text was selected and copied)

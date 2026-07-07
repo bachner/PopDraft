@@ -40,6 +40,33 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Import signing certificate
+        # Sign every build with the SAME stable self-signed identity so its
+        # designated requirement (identifier + certificate leaf) is constant across
+        # releases. macOS TCC then honors the app's Accessibility/Automation grants
+        # after an update instead of resetting them (ad-hoc/linker signatures change
+        # their cdhash every build, which is why grants used to reset). No-ops
+        # gracefully when the secret isn't configured, so the build never breaks.
+        env:
+          SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_CERT_P12_BASE64" ]; then
+            echo "No SIGNING_CERT_P12_BASE64 secret set — using ad-hoc linker signature."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/popdraft-signing.keychain"
+          echo "$SIGNING_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN" >/dev/null
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "Imported signing identity:"
+          security find-identity -v "$KEYCHAIN" | grep -i "PopDraft Code Signing" || echo "(identity not found — check the cert)"
+
       - name: Build DMG
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -98,6 +125,20 @@ jobs:
           # Copy bespoke brand PNGs (loaded at runtime by AppAssets)
           mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
           cp design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
+
+          # Sign with the stable self-signed identity if it was imported (makes TCC
+          # grants persist across updates). MUST be the last modification to the
+          # bundle before the DMG — signing seals it. Falls back to the ad-hoc
+          # linker signature when no cert is configured.
+          if security find-identity -v 2>/dev/null | grep -q "PopDraft Code Signing"; then
+            codesign --force --deep --sign "PopDraft Code Signing" \
+              --identifier com.popdraft.app "${APP_BUNDLE}"
+            echo "Signed with stable identity:"
+            codesign -dvv "${APP_BUNDLE}" 2>&1 | grep -iE "Authority|Identifier=" || true
+            codesign -d -r- "${APP_BUNDLE}" 2>&1 | grep -i designated || true
+          else
+            echo "No stable signing identity available — shipping ad-hoc signature."
+          fi
 
           # Create Applications symlink
           ln -s /Applications "${BUILD_DIR}/Applications"
