@@ -1605,7 +1605,10 @@ class PopupWindowController: NSWindowController {
                 seedUser: seed,
                 selectedText: capturedText.isEmpty ? nil : capturedText,
                 autoRun: true,
-                suppressToolsFirstTurn: true)
+                suppressToolsFirstTurn: true,
+                // Quick actions answer FAST on the first turn — no thinking pass.
+                // Thinking comes back on once the user writes the next message.
+                suppressThinkingFirstTurn: true)
 
         case .agent:
             runAgent(action: action)
@@ -1642,7 +1645,8 @@ class PopupWindowController: NSWindowController {
     /// "Ask Agent" action, any non-Copy action routed to chat, and the
     /// empty-selection hotkey.
     private func enterChat(seedUser: String, selectedText: String?, autoRun: Bool,
-                           suppressToolsFirstTurn: Bool = false, seedContext: String = "") {
+                           suppressToolsFirstTurn: Bool = false, seedContext: String = "",
+                           suppressThinkingFirstTurn: Bool = false) {
         let now = Date().timeIntervalSince1970
         var messages: [ChatMessage] = [
             ChatMessage(role: "system", content: PopDraftAgent.systemPrompt, createdAt: now),
@@ -1656,14 +1660,17 @@ class PopupWindowController: NSWindowController {
             selectedText: selectedText,
             messages: messages)
         session.refreshTitle()
-        presentChat(for: session, autoRun: autoRun, suppressToolsFirstTurn: suppressToolsFirstTurn, seedContext: seedContext)
+        presentChat(for: session, autoRun: autoRun, suppressToolsFirstTurn: suppressToolsFirstTurn,
+                    seedContext: seedContext, suppressThinkingFirstTurn: suppressThinkingFirstTurn)
     }
 
     /// Present `ChatView` for an existing/seeded session and size the panel.
     private func presentChat(for session: ChatSession, autoRun: Bool,
-                             suppressToolsFirstTurn: Bool = false, seedContext: String = "") {
+                             suppressToolsFirstTurn: Bool = false, seedContext: String = "",
+                             suppressThinkingFirstTurn: Bool = false) {
         let vm = AgentChatViewModel(session: session, store: sessionStore)
         vm.suppressToolsOnNextRun = suppressToolsFirstTurn
+        vm.suppressThinkingOnNextRun = suppressThinkingFirstTurn
         vm.pendingContext = seedContext
         chatViewModel = vm
         // The chat's own save point: the controller persists on copy/minimize.

@@ -1590,7 +1590,8 @@ struct PopDraftAgent {
         confirmer: (any MacControlConfirmer)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil,
         onProgress: ToolProgressHook? = nil,
-        disableTools: Bool = false
+        disableTools: Bool = false,
+        forceThinkingOff: Bool = false
     ) async throws -> AgentLoop.Outcome {
         // Pure text-transformation actions (Improve / Fix grammar / Translate / …)
         // must NOT call tools — offering them just invites a small model to reach
@@ -1623,7 +1624,7 @@ struct PopDraftAgent {
             let tools = unboxTools(toolsBoxed)
             return try await LLMClient.shared.chatCompletion(
                 messages: messages, tools: tools.isEmpty ? nil : tools,
-                stream: false, onTextDelta: onTextDelta)
+                stream: false, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
         }
         // Final answer-synthesis call (BUG 3 fix): tools DISABLED and thinking
         // FORCED OFF, so when the tool loop ends without a plain answer we always

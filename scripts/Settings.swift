@@ -526,36 +526,7 @@ struct SettingsView: View {
                             actionRow(action: action, index: index, total: sorted.count)
                         }
 
-                        Divider().padding(.horizontal, 12)
-
-                        // Custom prompt row (inline)
-                        HStack(spacing: 8) {
-                            Toggle("", isOn: Binding(
-                                get: { customPromptEnabled },
-                                set: { newVal in
-                                    customPromptEnabled = newVal
-                                    ActionManager.shared.customPromptEnabled = newVal
-                                    ActionManager.shared.save()
-                                }
-                            ))
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .frame(width: 36)
-
-                            Image(systemName: "ellipsis.circle.fill")
-                                .foregroundColor(.accentColor)
-                                .frame(width: 18)
-
-                            Text("Custom prompt...")
-                                .font(.system(size: 12))
-                                .lineLimit(1)
-
-                            Spacer()
-
-                            shortcutButton(actionId: "custom_prompt", currentShortcut: customPromptShortcut)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
+                        // "Custom prompt…" action removed — superseded by "Ask Agent".
                     }
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(8)
@@ -773,7 +744,9 @@ struct SettingsView: View {
                 Text("Active Provider")
                     .font(.system(size: 12, weight: .medium))
                 Picker("", selection: $selectedProvider) {
-                    ForEach(LLMConfig.Provider.allCases, id: \.self) { provider in
+                    // Ollama removed from the provider list (llama.cpp / OpenAI /
+                    // Claude only). The enum case stays for config back-compat.
+                    ForEach(LLMConfig.Provider.allCases.filter { $0 != .ollama }, id: \.self) { provider in
                         Text(provider.displayName).tag(provider)
                     }
                 }

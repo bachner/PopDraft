@@ -149,6 +149,11 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
     /// rewrite. Auto-clears after that one run, so follow-up chat turns the user
     /// types get the full toolset back.
     var suppressToolsOnNextRun: Bool = false
+    /// One-shot "no thinking" for a quick-action's auto-run (Improve / Articulate /
+    /// Reply / …): the first turn answers FAST without a thinking pass. Cleared on
+    /// consume, so when the user writes the next message thinking is back on for the
+    /// rest of the chat. Mirrors `suppressToolsOnNextRun`.
+    var suppressThinkingOnNextRun: Bool = false
 
     init(session: ChatSession, store: SessionStore) {
         self.session = session
@@ -491,6 +496,9 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         // action's auto-run). Cleared here so any follow-up turn gets tools back.
         let disableTools = suppressToolsOnNextRun
         suppressToolsOnNextRun = false
+        // One-shot thinking-off for a quick action's first turn; back on afterward.
+        let thinkingOff = suppressThinkingOnNextRun
+        suppressThinkingOnNextRun = false
 
         // Surface a tiny note if this turn's transcript is large enough that the
         // agent will compact older messages to stay under the context window. The
@@ -526,7 +534,7 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                     session: snapshot, config: appConfig,
                     confirmer: self.confirmBroker,
                     onTextDelta: onDelta, onProgress: onProgress,
-                    disableTools: disableTools)
+                    disableTools: disableTools, forceThinkingOff: thinkingOff)
                 guard self.generation == gen else { return }  // superseded → drop
                 var saved = outcome.session
                 // Item 7: re-append any user messages the person typed WHILE this
@@ -1298,21 +1306,33 @@ struct ToolCallCard: View {
             // A wrapping grid of thumbnails (click → opens the full-res image in
             // Preview; right-click for the source page), so image_search visibly
             // SHOWS pictures regardless of the model's text.
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96, maximum: 130), spacing: 6)],
-                      alignment: .leading, spacing: 6) {
+            // Each result is its OWN captioned card (thumbnail + its title) so it's
+            // obvious which picture goes with which label — a bare row of images and
+            // a separate list of titles is impossible to match up.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 118, maximum: 148), spacing: 8)],
+                      alignment: .leading, spacing: 8) {
                 ForEach(Array(imgs.enumerated()), id: \.offset) { _, im in
-                    AsyncImage(url: URL(string: im.thumbnailURL.isEmpty ? im.imageURL : im.thumbnailURL)) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image.resizable().interpolation(.medium).scaledToFill()
-                        case .failure:
-                            ZStack { Color.secondary.opacity(0.1); Image(systemName: "photo").foregroundColor(.secondary) }
-                        default:
-                            ZStack { Color.secondary.opacity(0.08); ProgressView().controlSize(.small) }
+                    VStack(alignment: .leading, spacing: 3) {
+                        AsyncImage(url: URL(string: im.thumbnailURL.isEmpty ? im.imageURL : im.thumbnailURL)) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image.resizable().interpolation(.medium).scaledToFill()
+                            case .failure:
+                                ZStack { Color.secondary.opacity(0.1); Image(systemName: "photo").foregroundColor(.secondary) }
+                            default:
+                                ZStack { Color.secondary.opacity(0.08); ProgressView().controlSize(.small) }
+                            }
+                        }
+                        .frame(width: 132, height: 92)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        if !im.title.isEmpty {
+                            Text(im.title)
+                                .font(.system(size: 10))
+                                .foregroundColor(ChatPalette.ink2)
+                                .lineLimit(2)
+                                .frame(width: 132, alignment: .leading)
                         }
                     }
-                    .frame(width: 118, height: 84)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .help(im.title.isEmpty ? "Click to open in Preview" : "\(im.title) — click to open in Preview")
                     .onTapGesture {
                         Self.openImageInPreview(im.imageURL.isEmpty ? im.thumbnailURL : im.imageURL)
@@ -2560,18 +2580,23 @@ private struct BottomDistanceKey: PreferenceKey {
 private extension View {
     /// Chat-composer key handling: plain Return SENDS; Shift+Return inserts a
     /// newline (so multi-line messages are possible). On macOS 14+ we intercept the
-    /// Return key — for Shift+Return we return `.ignored` so the field editor inserts
-    /// the newline itself (correct at any cursor position); for plain Return we send
-    /// and return `.handled` to suppress the newline. On macOS 13 (no `onKeyPress`)
-    /// we fall back to the previous Return-to-send behavior.
+    /// Return key: for Shift+Return we insert the newline OURSELVES via `newline`
+    /// and mark it handled — returning `.ignored` does NOT reliably insert a newline
+    /// in a vertical TextField (it falls through to a default action that extends the
+    /// selection). For plain Return we send. On macOS 13 (no `onKeyPress`) we fall
+    /// back to Return-to-send.
     @ViewBuilder
-    func returnSendsShiftReturnNewline(_ submit: @escaping () -> Void) -> some View {
+    func returnSendsShiftReturnNewline(_ submit: @escaping () -> Void,
+                                       newline: @escaping () -> Void) -> some View {
         if #available(macOS 14.0, *) {
             // All-keys overload so we get the KeyPress (with modifiers). Only the
             // Return key is special; everything else passes through untouched.
             self.onKeyPress { press in
                 guard press.key == .return else { return .ignored }
-                if press.modifiers.contains(.shift) { return .ignored }  // newline
+                if press.modifiers.contains(.shift) {
+                    newline()
+                    return .handled
+                }
                 submit()
                 return .handled  // send; suppress the newline
             }
@@ -2866,7 +2891,7 @@ struct ChatView: View {
                     .font(.system(size: 13))
                     .lineLimit(1...5)
                     .focused($inputFocused)
-                    .returnSendsShiftReturnNewline(submit)
+                    .returnSendsShiftReturnNewline(submit, newline: { viewModel.draft += "\n" })
                     // Item 7: input stays ENABLED during generation — a message
                     // sent mid-stream is queued and run as a follow-up turn.
 
