@@ -1277,8 +1277,9 @@ struct ToolCallCard: View {
                 Text(host(url)).font(.system(size: 9.5)).foregroundColor(ChatPalette.blue)
             }
         case .images(let imgs):
-            // A wrapping grid of thumbnails (clickable → opens the source page), so
-            // image_search visibly SHOWS pictures regardless of the model's text.
+            // A wrapping grid of thumbnails (click → opens the full-res image in
+            // Preview; right-click for the source page), so image_search visibly
+            // SHOWS pictures regardless of the model's text.
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 96, maximum: 130), spacing: 6)],
                       alignment: .leading, spacing: 6) {
                 ForEach(Array(imgs.enumerated()), id: \.offset) { _, im in
@@ -1294,16 +1295,24 @@ struct ToolCallCard: View {
                     }
                     .frame(width: 118, height: 84)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .help(im.title)
+                    .help(im.title.isEmpty ? "Click to open in Preview" : "\(im.title) — click to open in Preview")
                     .onTapGesture {
-                        if let u = URL(string: im.sourcePage.isEmpty ? im.imageURL : im.sourcePage) {
-                            NSWorkspace.shared.open(u)
+                        Self.openImageInPreview(im.imageURL.isEmpty ? im.thumbnailURL : im.imageURL)
+                    }
+                    .contextMenu {
+                        Button("Open Image in Preview") {
+                            Self.openImageInPreview(im.imageURL.isEmpty ? im.thumbnailURL : im.imageURL)
+                        }
+                        if !im.sourcePage.isEmpty, let u = URL(string: im.sourcePage) {
+                            Button("Open Source Page") { NSWorkspace.shared.open(u) }
                         }
                     }
                 }
             }
         case .screenshot(let path):
             screenshotThumb(path)
+                .help("Click to open in Preview")
+                .onTapGesture { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
         case .text(let s):
             Text(s).font(.system(size: 10.5)).foregroundColor(ChatPalette.ink2).lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1333,6 +1342,47 @@ struct ToolCallCard: View {
 
     private func host(_ s: String) -> String {
         URL(string: s)?.host ?? s
+    }
+
+    /// Open the full-resolution image at `urlString` in the native macOS app
+    /// (Preview): download it to a temp file so Preview shows the picture itself
+    /// rather than the web page, then hand it to NSWorkspace. Local file URLs open
+    /// directly; any failure falls back to opening the URL in the browser.
+    static func openImageInPreview(_ urlString: String) {
+        guard !urlString.isEmpty, let url = URL(string: urlString) else { return }
+        if url.isFileURL { NSWorkspace.shared.open(url); return }
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            func openInBrowser() { DispatchQueue.main.async { NSWorkspace.shared.open(url) } }
+            // Only open as an image when the response really is one — some result
+            // URLs resolve to an HTML page; those should open in the browser.
+            let isImage = (response?.mimeType?.hasPrefix("image/") ?? false)
+            guard let data = data, !data.isEmpty, isImage else { openInBrowser(); return }
+            let ext = imageExtension(forMIME: response?.mimeType)
+                ?? (url.pathExtension.isEmpty ? "jpg" : url.pathExtension)
+            let base = "popdraft-image-\(UInt(bitPattern: urlString.hashValue))"
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent(base).appendingPathExtension(ext)
+            do {
+                try data.write(to: tmp, options: .atomic)
+                DispatchQueue.main.async { NSWorkspace.shared.open(tmp) }
+            } catch {
+                openInBrowser()
+            }
+        }.resume()
+    }
+
+    private static func imageExtension(forMIME mime: String?) -> String? {
+        switch mime {
+        case "image/png": return "png"
+        case "image/jpeg": return "jpg"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/heic", "image/heif": return "heic"
+        case "image/tiff": return "tiff"
+        case "image/bmp": return "bmp"
+        case "image/svg+xml": return "svg"
+        default: return nil
+        }
     }
 }
 
