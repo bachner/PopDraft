@@ -75,7 +75,7 @@ struct AgentSettings: Codable, Equatable {
     /// `ContextBudget.effectiveBudget(provider:configured:detected:)`. (Compaction)
     var contextTokens: Int
 
-    init(maxIterations: Int = 6,
+    init(maxIterations: Int = 12,
          enableMacControl: Bool = false,
          enableWebSearch: Bool = true,
          autoApproveSafeReadOnly: Bool = false,
@@ -93,7 +93,7 @@ struct AgentSettings: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        maxIterations = try c.decodeIfPresent(Int.self, forKey: .maxIterations) ?? 6
+        maxIterations = try c.decodeIfPresent(Int.self, forKey: .maxIterations) ?? 12
         enableMacControl = try c.decodeIfPresent(Bool.self, forKey: .enableMacControl) ?? false
         enableWebSearch = try c.decodeIfPresent(Bool.self, forKey: .enableWebSearch) ?? true
         autoApproveSafeReadOnly = try c.decodeIfPresent(Bool.self, forKey: .autoApproveSafeReadOnly) ?? false
@@ -3837,7 +3837,7 @@ struct AgentLoop {
     /// it nil and see no behavior change.
     var trace: (@Sendable (String) -> Void)?
 
-    init(maxIterations: Int = 6, runner: ToolRunner = ToolRunner()) {
+    init(maxIterations: Int = 12, runner: ToolRunner = ToolRunner()) {
         self.maxIterations = max(1, maxIterations)
         self.runner = runner
     }

@@ -50,11 +50,45 @@ enum AgentTrace {
     }
 }
 
+// MARK: - Vision request gate
+
+/// A FIFO async mutex (actor) that SERIALIZES access to the single-slot vision
+/// llama-server (:10820). That server has one inference slot and SIGSEGVs if
+/// several multimodal requests hit it at once — and the agent can fire many
+/// `see_image` calls in a single parallel iteration. `acquire()` suspends (no
+/// thread blocked) until the slot is free; `release()` hands it to the next
+/// waiter. The calls all still complete — just one at a time.
+actor VisionRequestGate {
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !busy {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            waiters.append(c)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            busy = false
+        } else {
+            waiters.removeFirst().resume()  // hand the slot straight to the next waiter
+        }
+    }
+}
+
 // MARK: - LLM Client
 
 class LLMClient {
     static let llamaServerDownError = "LLAMA_SERVER_DOWN"
     static let shared = LLMClient()
+    /// Serializes calls to the single-slot vision server (:10820) so parallel
+    /// `see_image` tool calls queue instead of crashing it.
+    static let visionGate = VisionRequestGate()
     private var config: LLMConfig
     private var activeProvider: LLMConfig.Provider?
     private var activeStreamDelegate: OllamaStreamDelegate?
@@ -668,6 +702,23 @@ class LLMClient {
     /// `enable_thinking:false`). Retries through the connection-refused / 503 window
     /// (via `LlamaLoadRetry`) while the vision server loads its weights.
     func visionCompletion(text: String, images: [ImageRef]) async throws -> String {
+        // SERIALIZE: the vision server has ONE inference slot and crashes under
+        // concurrent multimodal requests. Hold the gate for the whole call so
+        // parallel see_image tool calls run one-at-a-time (they all still complete).
+        // `defer` can't `await`, so release explicitly on both the success and the
+        // throw path.
+        await Self.visionGate.acquire()
+        do {
+            let result = try await visionCompletionInner(text: text, images: images)
+            await Self.visionGate.release()
+            return result
+        } catch {
+            await Self.visionGate.release()
+            throw error
+        }
+    }
+
+    private func visionCompletionInner(text: String, images: [ImageRef]) async throws -> String {
         let urlString = "\(VisionServerManager.endpoint)/v1/chat/completions"
         guard let url = URL(string: urlString) else {
             throw NSError(domain: "Invalid URL", code: -1)
@@ -702,7 +753,11 @@ class LLMClient {
             do {
                 (data, response) = try await URLSession.shared.data(for: request)
             } catch {
-                if (error as? URLError)?.code == .cannotConnectToHost {
+                // cannotConnectToHost = server down; networkConnectionLost/timedOut =
+                // the tiny VL server crashed mid-request and KeepAlive is restarting
+                // it. All are recoverable — retry through the load window.
+                let code = (error as? URLError)?.code
+                if code == .cannotConnectToHost || code == .networkConnectionLost || code == .timedOut {
                     if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
                         try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
                         continue

@@ -831,11 +831,19 @@ enum MarkdownBlock: Identifiable {
     /// inline web view — NOT as highlighted code. Produced for ```svg/```html/```xml
     /// fences and for raw inline `<svg>…</svg>` lifted out of a prose block.
     case markup(index: Int, String)
+    /// A GFM pipe table: `header` cells + body `rows`, each cell rendered with
+    /// inline markdown; `aligns` is the per-column text alignment from the `:--:`
+    /// separator row. Rendered as a real `Grid` instead of dumping raw `| … |`.
+    case table(index: Int, header: [String], aligns: [TextAlignment], rows: [[String]])
+    /// A thematic break (`---` / `***` / `___` on its own line) → a horizontal rule.
+    case rule(index: Int)
     var id: Int {
         switch self {
         case .prose(let index, _): return index
         case .code(let index, _, _): return index
         case .markup(let index, _): return index
+        case .table(let index, _, _, _): return index
+        case .rule(let index): return index
         }
     }
 }
@@ -880,7 +888,10 @@ enum MarkdownParser {
             lang = nil
         }
 
-        for line in text.components(separatedBy: "\n") {
+        let lines = text.components(separatedBy: "\n")
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") {
                 if inCode {
@@ -892,12 +903,98 @@ enum MarkdownParser {
                     let l = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
                     lang = l.isEmpty ? nil : l
                 }
+                i += 1
                 continue
             }
-            if inCode { code.append(line) } else { prose.append(line) }
+            if inCode { code.append(line); i += 1; continue }
+
+            // A thematic break (`---` / `***` / `___`) on its own line → a rule.
+            if isThematicBreak(trimmed) {
+                flushProse()
+                out.append(.rule(index: out.count))
+                i += 1
+                continue
+            }
+            // A GFM pipe table: THIS line is a row AND the NEXT is a `|---|:--:|`
+            // separator. Consume the header, the separator, and all body rows.
+            if isTableRow(trimmed), i + 1 < lines.count,
+               isTableSeparator(lines[i + 1].trimmingCharacters(in: .whitespaces)) {
+                flushProse()
+                let header = tableCells(trimmed)
+                let aligns = tableAligns(lines[i + 1].trimmingCharacters(in: .whitespaces))
+                var rows: [[String]] = []
+                var j = i + 2
+                while j < lines.count {
+                    let t = lines[j].trimmingCharacters(in: .whitespaces)
+                    if !isTableRow(t) { break }
+                    rows.append(tableCells(t))
+                    j += 1
+                }
+                out.append(.table(index: out.count, header: header, aligns: aligns, rows: rows))
+                i = j
+                continue
+            }
+            prose.append(line)
+            i += 1
         }
         if inCode { flushCode() } else { flushProse() }
         return out
+    }
+
+    // MARK: GFM tables + thematic breaks
+
+    /// A line is a thematic break if — ignoring spaces — it is 3+ of a single
+    /// marker char (`-`, `*`, or `_`). Rendered as a horizontal rule.
+    static func isThematicBreak(_ s: String) -> Bool {
+        let stripped = s.replacingOccurrences(of: " ", with: "")
+        guard stripped.count >= 3 else { return false }
+        for marker in ["-", "*", "_"] where stripped.allSatisfy({ String($0) == marker }) {
+            return true
+        }
+        return false
+    }
+
+    /// A candidate table row: contains a `|` plus some non-pipe content. Kept
+    /// permissive — the full table is only accepted when the NEXT line is a
+    /// separator, so a lone "a | b" never becomes a table.
+    static func isTableRow(_ s: String) -> Bool {
+        guard s.contains("|") else { return false }
+        return s.contains(where: { $0 != "|" && $0 != " " })
+    }
+
+    /// The `|---|:--:|` divider under a table header: every cell is dashes with
+    /// optional leading/trailing colons (alignment), with at least one cell.
+    static func isTableSeparator(_ s: String) -> Bool {
+        guard s.contains("-"), s.contains("|") else { return false }
+        let cells = tableCells(s)
+        guard !cells.isEmpty else { return false }
+        for cell in cells {
+            let c = cell.trimmingCharacters(in: .whitespaces)
+            if c.isEmpty || !c.contains("-") { return false }
+            if !c.allSatisfy({ $0 == "-" || $0 == ":" }) { return false }
+        }
+        return true
+    }
+
+    /// Split a `| a | b |` row into trimmed cells, dropping the empty cells created
+    /// by the optional outer pipes.
+    static func tableCells(_ s: String) -> [String] {
+        var t = s.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("|") { t.removeFirst() }
+        if t.hasSuffix("|") { t.removeLast() }
+        return t.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Per-column alignment from the separator row (`:--`=leading, `--:`=trailing,
+    /// `:-:`=center, else leading).
+    static func tableAligns(_ separator: String) -> [TextAlignment] {
+        tableCells(separator).map { raw in
+            let c = raw.trimmingCharacters(in: .whitespaces)
+            let left = c.hasPrefix(":"), right = c.hasSuffix(":")
+            if left && right { return .center }
+            if right { return .trailing }
+            return .leading
+        }
     }
 
     /// A fragment of a prose block: ordinary `.text`, or `.markup` — a graphic
@@ -969,11 +1066,12 @@ enum MarkdownParser {
         return nil
     }
 
-    /// If a Markdown image `![alt](data:image/…)` starts at `at`, return an `<img>`
-    /// tag (with the data URI's literal spaces/quotes/angle-brackets encoded so it
-    /// loads) and the index just past the closing `)`; else nil. The URL is taken
-    /// up to the LAST `)` on the logical line, so an SVG `transform='rotate(45 …)'`
-    /// inside the data URI doesn't terminate the image early.
+    /// If a Markdown image `![alt](data:image/…)` or `![alt](pdimg:<hash>.<ext>)`
+    /// starts at `at`, return an `<img>` tag (with the URL's literal
+    /// spaces/quotes/angle-brackets encoded so it loads) and the index just past the
+    /// closing `)`; else nil. The URL is taken up to the LAST `)` on the logical
+    /// line, so an SVG `transform='rotate(45 …)'` inside a data URI doesn't
+    /// terminate the image early.
     private static func matchDataImage(_ s: [Character], at: Int) -> (imgTag: String, end: Int)? {
         guard at + 1 < s.count, s[at] == "!", s[at + 1] == "[" else { return nil }
         // alt runs to "](".
@@ -985,11 +1083,17 @@ enum MarkdownParser {
         }
         guard altEnd >= 0 else { return nil }
         let urlStart = altEnd + 2
-        let dataPrefix = Array("data:image/")
-        guard urlStart + dataPrefix.count <= s.count else { return nil }
-        for k2 in 0..<dataPrefix.count where Character(s[urlStart + k2].lowercased()) != dataPrefix[k2] {
-            return nil
+        // The source must be an inline data: image OR a `pdimg:` cache ref (the
+        // agent emits `![alt](pdimg:<hash>.<ext>)` for image_search results it
+        // wants shown). Both render as an `<img>` in RawMarkupWebView — `pdimg:`
+        // is served from disk by PDImageSchemeHandler and allow-listed there.
+        func hasPrefix(_ prefix: String) -> Bool {
+            let p = Array(prefix)
+            guard urlStart + p.count <= s.count else { return false }
+            for k2 in 0..<p.count where Character(s[urlStart + k2].lowercased()) != p[k2] { return false }
+            return true
         }
+        guard hasPrefix("data:image/") || hasPrefix("pdimg:") else { return nil }
         // Find end of logical line, then the last ')' before it.
         var lineEnd = urlStart
         while lineEnd < s.count, s[lineEnd] != "\n" { lineEnd += 1 }
@@ -2349,6 +2453,15 @@ struct MessageBubble: View {
                 case .markup(_, let markup):
                     // svg/html drawing → render as a graphic, never as code.
                     RawMarkupBody(markup: markup)
+                case .table(_, let header, let aligns, let rows):
+                    MarkdownTableView(header: header, aligns: aligns, rows: rows)
+                        .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
+                case .rule:
+                    Rectangle()
+                        .fill(ChatPalette.ink2.opacity(0.25))
+                        .frame(height: 1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
                 }
             }
         }
@@ -2356,6 +2469,58 @@ struct MessageBubble: View {
 
     private func copyButton(text: String) -> some View {
         MessageCopyButton(text: text)
+    }
+}
+
+/// Renders a GFM pipe table as a real `Grid` — emphasized header, thin row
+/// separators, per-column alignment — instead of dumping raw `| … |` text. Cells
+/// use the same inline-markdown renderer as prose, so bold / emoji / links inside
+/// a cell render correctly.
+struct MarkdownTableView: View {
+    let header: [String]
+    let aligns: [TextAlignment]
+    let rows: [[String]]
+
+    private var columnCount: Int { max(header.count, rows.map { $0.count }.max() ?? 0) }
+
+    private func align(_ col: Int) -> TextAlignment { col < aligns.count ? aligns[col] : .leading }
+    private func frameAlignment(_ col: Int) -> Alignment {
+        switch align(col) {
+        case .center: return .center
+        case .trailing: return .trailing
+        default: return .leading
+        }
+    }
+    private func cell(_ cells: [String], _ col: Int) -> String { col < cells.count ? cells[col] : "" }
+
+    @ViewBuilder private func cellText(_ text: String, header isHeader: Bool, col: Int) -> some View {
+        Text(MarkdownParser.attributed(text))
+            .font(.system(size: 13, weight: isHeader ? .semibold : .regular))
+            .foregroundColor(ChatPalette.ink)
+            .multilineTextAlignment(align(col))
+            .frame(maxWidth: .infinity, alignment: frameAlignment(col))
+    }
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+            GridRow {
+                ForEach(0..<columnCount, id: \.self) { col in
+                    cellText(cell(header, col), header: true, col: col)
+                }
+            }
+            Divider().gridCellUnsizedAxes(.horizontal)
+            ForEach(0..<rows.count, id: \.self) { r in
+                GridRow {
+                    ForEach(0..<columnCount, id: \.self) { col in
+                        cellText(cell(rows[r], col), header: false, col: col)
+                    }
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(ChatPalette.ink2.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(ChatPalette.ink2.opacity(0.15), lineWidth: 1))
     }
 }
 

@@ -147,7 +147,7 @@ test("New fields default when absent from JSON") {
     // New forward-looking fields get sane defaults.
     assert(c.userModels.isEmpty, "userModels defaults to empty")
     assert(c.providerKeys.isEmpty, "providerKeys defaults to empty")
-    assert(c.agentSettings.maxIterations == 6, "agentSettings.maxIterations defaults to 6")
+    assert(c.agentSettings.maxIterations == 12, "agentSettings.maxIterations defaults to 12")
     assert(c.agentSettings.enableMacControl == false, "enableMacControl defaults false")
     assert(c.agentSettings.autoApproveAll == false, "autoApproveAll defaults false")
     assert(c.webSearch.provider == "ddg", "webSearch.provider defaults to ddg")
