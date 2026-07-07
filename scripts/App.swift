@@ -345,6 +345,60 @@ class DependencyManager {
         try? boot.run(); boot.waitUntilExit()
     }
 
+    /// Download a built-in llama model's gguf into `~/.popdraft/models`. This ONLY
+    /// fetches the file — it does NOT touch the running server; the caller
+    /// activates it (e.g. `switchLocalModelFileAndRestart`) once it's on disk, so
+    /// the current model keeps serving until the switch. `progress` (0…1) + a
+    /// status string and `completion(ok)` are always delivered on the main queue.
+    /// Shared by the Settings "Download & Use" button and the in-chat model
+    /// switcher so both use ONE download implementation.
+    func downloadBuiltinModel(_ model: LLMConfig.LlamaModel,
+                              progress: @escaping (Double, String) -> Void,
+                              completion: @escaping (Bool) -> Void) {
+        // Approximate expected bytes from the human size string ("~18.6GB") so the
+        // progress bar can advance; falls back to indeterminate-ish if unparseable.
+        let expected: Int64 = {
+            let digits = model.size.filter { "0123456789.".contains($0) }
+            let v = Double(digits) ?? 0
+            let up = model.size.uppercased()
+            if up.contains("GB") { return Int64(v * 1_000_000_000) }
+            if up.contains("MB") { return Int64(v * 1_000_000) }
+            return Int64(max(v, 1))
+        }()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let modelsDir = NSString(string: "~/.popdraft/models").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true)
+            let modelPath = "\(modelsDir)/\(model.filename)"
+            DispatchQueue.main.async { progress(0, "Downloading \(model.name)…") }
+
+            let curl = Process()
+            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curl.arguments = ["-L", "-o", modelPath, model.url]
+            curl.standardOutput = FileHandle.nullDevice
+            curl.standardError = FileHandle.nullDevice
+            do { try curl.run() } catch {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            while curl.isRunning {
+                Thread.sleep(forTimeInterval: 1.0)
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath),
+                   let size = attrs[.size] as? Int64 {
+                    let pct = expected > 0 ? min(0.99, Double(size) / Double(expected)) : 0
+                    let mb = size / 1_000_000
+                    DispatchQueue.main.async { progress(pct, "Downloading… \(Int(pct * 100))% (\(mb)MB)") }
+                }
+            }
+            let got = (try? FileManager.default.attributesOfItem(atPath: modelPath))?[.size] as? Int64 ?? 0
+            let ok = curl.terminationStatus == 0 && got > 100_000_000
+            if !ok { try? FileManager.default.removeItem(atPath: modelPath) }
+            DispatchQueue.main.async {
+                if ok { progress(1.0, "Downloaded") }
+                completion(ok)
+            }
+        }
+    }
+
     /// The gguf FILE the local server is currently configured to run, read from
     /// the launch-agent plist (the source of truth for the active local model).
     func activeLocalModelFilename() -> String? {
