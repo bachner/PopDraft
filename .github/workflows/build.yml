@@ -64,8 +64,8 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN" >/dev/null
           rm -f "$RUNNER_TEMP/cert.p12"
-          echo "Imported signing identity:"
-          security find-identity -v "$KEYCHAIN" | grep -i "PopDraft Code Signing" || echo "(identity not found — check the cert)"
+          echo "Imported signing identity (self-signed → shown as not-trusted, which is fine for signing):"
+          security find-identity "$KEYCHAIN" | grep -i "PopDraft Code Signing" || echo "(identity not found — check the cert)"
 
       - name: Build DMG
         env:
@@ -126,18 +126,20 @@ jobs:
           mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
           cp design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
 
-          # Sign with the stable self-signed identity if it was imported (makes TCC
-          # grants persist across updates). MUST be the last modification to the
-          # bundle before the DMG — signing seals it. Falls back to the ad-hoc
-          # linker signature when no cert is configured.
-          if security find-identity -v 2>/dev/null | grep -q "PopDraft Code Signing"; then
-            codesign --force --deep --sign "PopDraft Code Signing" \
-              --identifier com.popdraft.app "${APP_BUNDLE}"
+          # Sign with the stable self-signed identity (makes TCC grants persist
+          # across updates). MUST be the last modification to the bundle before the
+          # DMG — signing seals it. A self-signed cert is NOT trusted, so it never
+          # appears in `find-identity -v`; codesign signs with it anyway when it's in
+          # the keychain search list. So we ATTEMPT the signing and verify the
+          # result, falling back to the ad-hoc linker signature only if it fails.
+          if codesign --force --deep --sign "PopDraft Code Signing" \
+               --identifier com.popdraft.app "${APP_BUNDLE}" 2>/dev/null \
+             && codesign -dvv "${APP_BUNDLE}" 2>&1 | grep -qi "Authority=PopDraft Code Signing"; then
             echo "Signed with stable identity:"
-            codesign -dvv "${APP_BUNDLE}" 2>&1 | grep -iE "Authority|Identifier=" || true
+            codesign -dvv "${APP_BUNDLE}" 2>&1 | grep -iE "Authority=|Identifier=" || true
             codesign -d -r- "${APP_BUNDLE}" 2>&1 | grep -i designated || true
           else
-            echo "No stable signing identity available — shipping ad-hoc signature."
+            echo "Stable signing unavailable — shipping ad-hoc linker signature."
           fi
 
           # Create Applications symlink
