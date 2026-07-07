@@ -3774,8 +3774,9 @@ func isContextOverflowError(_ error: Error) -> Bool {
 /// still surfaces. Pure decision logic (no networking) — unit-tested standalone.
 enum LlamaLoadRetry {
     /// Total time budget to keep retrying before giving up. Deliberately generous
-    /// — a 30B+ local model can spend a while loading from disk.
-    static let maxWaitSeconds: Double = 45
+    /// — this window must cover a full server RESTART (bootout+bootstrap, kicked by
+    /// the caller when the socket is refused) PLUS a 30B+ model loading from disk.
+    static let maxWaitSeconds: Double = 90
     /// Fixed delay between retries.
     static let pollIntervalSeconds: Double = 1.5
 

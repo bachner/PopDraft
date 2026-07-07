@@ -305,9 +305,9 @@ func runTests() async {
     do {
         check(LlamaLoadRetry.shouldRetry(elapsed: 0), "retries immediately after the first failure")
         check(LlamaLoadRetry.shouldRetry(elapsed: 1), "retries at 1s elapsed")
-        check(LlamaLoadRetry.shouldRetry(elapsed: 44.9), "retries just under the budget")
-        check(!LlamaLoadRetry.shouldRetry(elapsed: 45), "stops retrying once the budget is reached")
-        check(!LlamaLoadRetry.shouldRetry(elapsed: 60), "stops retrying well past the budget")
+        check(LlamaLoadRetry.shouldRetry(elapsed: LlamaLoadRetry.maxWaitSeconds - 0.1), "retries just under the budget")
+        check(!LlamaLoadRetry.shouldRetry(elapsed: LlamaLoadRetry.maxWaitSeconds), "stops retrying once the budget is reached")
+        check(!LlamaLoadRetry.shouldRetry(elapsed: LlamaLoadRetry.maxWaitSeconds + 15), "stops retrying well past the budget")
         check(LlamaLoadRetry.pollIntervalSeconds > 0, "poll interval is positive (no busy-loop)")
         check(LlamaLoadRetry.pollIntervalSeconds < LlamaLoadRetry.maxWaitSeconds,
               "poll interval is smaller than the total budget (retries actually happen more than once)")
