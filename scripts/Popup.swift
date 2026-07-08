@@ -1004,9 +1004,10 @@ class PopupWindowController: NSWindowController {
         // so it's the primary path when we hold focus. Do NOT `activate` the target:
         // that yanks focus and makes our menu appear behind it.
         if pasteboard.changeCount == savedChangeCount, targetApp != nil {
+            let safeName = targetName.replacingOccurrences(of: "\"", with: "")
             let script = NSAppleScript(source: """
                 tell application "System Events"
-                    tell process "\(targetName)"
+                    tell process "\(safeName)"
                         click menu item "Copy" of menu "Edit" of menu bar 1
                     end tell
                 end tell
@@ -1030,11 +1031,43 @@ class PopupWindowController: NSWindowController {
             for (type, data) in savedContents {
                 pasteboard.setData(data, forType: type)
             }
+        } else if Self.isCopyOnSelectTerminal(targetApp),
+                  case let current = pasteboard.string(forType: .string) ?? "",
+                  !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // REGRESSION FIX (iTerm2 et al.): these terminals AUTO-COPY the selection
+            // to the clipboard the instant it's made, so our synthetic Cmd+C / Edit▸
+            // Copy is a no-op (the identical text is already there) and changeCount
+            // never moves — yet the user's selection IS sitting on the clipboard right
+            // now. AX also exposes nothing for terminals (we're past that check). So
+            // trust the current clipboard as the selection instead of reporting
+            // "nothing selected". Scoped to known copy-on-select terminals so a stale
+            // clipboard can't masquerade as a selection in an ordinary app.
+            clipboardText = current
+            Logger.shared.info("captureSelectedText: \(current.count) chars from clipboard (copy-on-select terminal \(targetName))")
         } else {
             // No method produced a selection.
             clipboardText = ""
             Logger.shared.info("captureSelectedText: 0 chars — all methods empty (\(targetName), weHoldFocus=\(weHoldFocus))")
         }
+    }
+
+    /// Bundle IDs of terminals that AUTO-COPY the current selection to the clipboard
+    /// the instant it's made (iTerm2's default; common in modern terminals). For
+    /// these, a synthetic Cmd+C is a no-op — the selection is already on the
+    /// clipboard — so when every copy method leaves the clipboard unchanged we trust
+    /// the current clipboard as the selection. (iTerm2 verified on this machine.)
+    private static let copyOnSelectTerminals: Set<String> = [
+        "com.googlecode.iterm2",   // iTerm2 (verified)
+        "net.kovidgoyal.kitty",    // kitty
+        "com.github.wez.wezterm",  // WezTerm
+        "org.alacritty",           // Alacritty
+        "co.zeit.hyper",           // Hyper
+        "org.tabby",               // Tabby
+    ]
+
+    private static func isCopyOnSelectTerminal(_ app: NSRunningApplication?) -> Bool {
+        guard let id = app?.bundleIdentifier else { return false }
+        return copyOnSelectTerminals.contains(id)
     }
 
     func showAtMouseLocation() {
