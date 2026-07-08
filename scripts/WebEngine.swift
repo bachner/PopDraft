@@ -808,12 +808,43 @@ final class NavigationBridge: NSObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         if Self.isBenignCancellation(error) { resolve(.success(())); return }
-        resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
+        resolve(.failure(WebEngineError.navigationFailed(Self.describe(error))))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         if Self.isBenignCancellation(error) { resolve(.success(())); return }
-        resolve(.failure(WebEngineError.navigationFailed(error.localizedDescription)))
+        resolve(.failure(WebEngineError.navigationFailed(Self.describe(error))))
+    }
+
+    /// Turn a WebKit navigation error into a message the AGENT can act on. A TLS /
+    /// certificate failure is very often not a broken site but a blocked host: a
+    /// network or ISP DNS-hijacks it to a block page whose cert doesn't match the
+    /// requested host (e.g. Al Jazeera → an Israeli-ISP block server presenting a
+    /// non-matching cert → "A TLS error caused the secure connection to fail"). The
+    /// raw string tells the model nothing actionable, so we name the host and say
+    /// "treat as unreachable, use another source" — which is exactly right whether
+    /// the cause is a block, an interception, or a genuinely misconfigured site.
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        let host = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL)?.host
+        let hostPart = host.map { " (\($0))" } ?? ""
+        guard ns.domain == NSURLErrorDomain else { return error.localizedDescription }
+        switch ns.code {
+        case NSURLErrorSecureConnectionFailed,
+             NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasBadDate,
+             NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid:
+            return "the server's TLS certificate\(hostPart) is invalid or doesn't match the host — the site is likely BLOCKED or intercepted by the network/DNS (a block page presenting a non-matching cert). Treat this source as unreachable and use another one."
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+            return "the host\(hostPart) could not be resolved (DNS) — it may be blocked or unavailable. Use another source."
+        case NSURLErrorCannotConnectToHost:
+            return "could not connect to the host\(hostPart) — it may be down or blocked. Use another source."
+        case NSURLErrorTimedOut:
+            return "the connection\(hostPart) timed out — use another source."
+        default:
+            return error.localizedDescription
+        }
     }
 
     /// `NSURLErrorCancelled` (-999) is not a real failure: WebKit reports it for
