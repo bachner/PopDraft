@@ -126,6 +126,14 @@ jobs:
           mkdir -p "${APP_BUNDLE}/Contents/Resources/Assets"
           cp design-mocks/assets/*.png "${APP_BUNDLE}/Contents/Resources/Assets/"
 
+          # Copy the rich-renderer web assets (marked.js / highlight.js / mermaid +
+          # CSS). Without these, MarkdownWebAssets.available is false and the chat
+          # falls back to the NATIVE renderer — which is why shipped builds lacked
+          # GFM tables, syntax highlighting, and full RTL (the dev tree finds these
+          # via AppAssets.webResource's source fallback, so it only broke in the DMG).
+          mkdir -p "${APP_BUNDLE}/Contents/Resources/web"
+          cp resources/web/* "${APP_BUNDLE}/Contents/Resources/web/"
+
           # Sign with the stable self-signed identity (makes TCC grants persist
           # across updates). MUST be the last modification to the bundle before the
           # DMG — signing seals it. A self-signed cert is NOT trusted, so it never

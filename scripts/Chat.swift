@@ -3093,13 +3093,19 @@ struct ChatView: View {
                             .foregroundColor(ChatPalette.ink3)
                     }
                 } else {
+                    // RTL-aware: a Hebrew/Arabic partial streams right-aligned (with
+                    // the caret on its left) instead of left-aligning and then jumping
+                    // right when the message settles.
+                    let streamRTL = TextDirection.isRTL(viewModel.streamingText)
                     HStack(alignment: .bottom, spacing: 2) {
                         Text(viewModel.streamingText)
                             .font(.system(size: 13))
                             .foregroundColor(ChatPalette.ink)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .multilineTextAlignment(streamRTL ? .trailing : .leading)
+                            .frame(maxWidth: .infinity, alignment: streamRTL ? .trailing : .leading)
                         StreamingCaret()
                     }
+                    .environment(\.layoutDirection, streamRTL ? .rightToLeft : .leftToRight)
                 }
             }
             Spacer(minLength: 0)
