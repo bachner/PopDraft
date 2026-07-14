@@ -157,8 +157,21 @@ class TTSServerManager {
     private let serverURL = "http://127.0.0.1:7865"
 
     func ensureRunning() {
-        // First ensure script exists
-        ensureScriptExists()
+        // Install/update the server script; learn whether it CHANGED this launch.
+        let scriptChanged = ensureScriptExists()
+
+        if scriptChanged {
+            // The bundled server was updated (e.g. the Kokoro → Higgs switch). A
+            // server started from the OLD script may still be running from a previous
+            // app session — and because it answers /health it would keep serving
+            // stale code forever (the "old Kokoro server survives the update" bug).
+            // Kill it, then start fresh after it releases the port.
+            stopAnyRunningServer()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.startServer()
+            }
+            return
+        }
 
         // Check if server is already running
         TTSClient.shared.checkHealth { [weak self] isHealthy in
@@ -170,7 +183,26 @@ class TTSServerManager {
         }
     }
 
-    private func ensureScriptExists() {
+    /// Kill any running TTS server — the one we started this session AND any server
+    /// recorded in the PID file (which may be from a PREVIOUS app session, before an
+    /// update). Used when the server script changes so the new code actually loads.
+    private func stopAnyRunningServer() {
+        if let p = serverProcess, p.isRunning { p.terminate() }
+        serverProcess = nil
+        // Kill any TTS server by command-line match — covers a server left running
+        // by a PREVIOUS app session. Matching on "llm-tts-server.py" is safe (it
+        // can't hit an unrelated process the way a stale/reused PID could).
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-f", "llm-tts-server.py"]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
+    /// Returns true if the installed server script was created OR replaced this call
+    /// (i.e. it differed from the bundle), so callers know to restart the server.
+    @discardableResult
+    private func ensureScriptExists() -> Bool {
         let destPath = NSString(string: serverScript).expandingTildeInPath
         let configDir = NSString(string: "~/.popdraft").expandingTildeInPath
 
@@ -179,7 +211,7 @@ class TTSServerManager {
 
         guard let bundlePath = Bundle.main.path(forResource: "llm-tts-server", ofType: "py") else {
             print("TTS server script not found in bundle")
-            return
+            return false
         }
         // Copy from the bundle when missing OR when the bundled script DIFFERS from
         // the installed copy. An app update ships a new server (e.g. the Kokoro →
@@ -187,17 +219,18 @@ class TTSServerManager {
         // "only copy if missing" behavior would keep running the outdated server.
         let bundleData = try? Data(contentsOf: URL(fileURLWithPath: bundlePath))
         let destData = try? Data(contentsOf: URL(fileURLWithPath: destPath))
-        if destData != bundleData {
-            do {
-                if FileManager.default.fileExists(atPath: destPath) {
-                    try FileManager.default.removeItem(atPath: destPath)
-                }
-                try FileManager.default.copyItem(atPath: bundlePath, toPath: destPath)
-                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath)
-                print("TTS server script installed/updated at \(destPath)")
-            } catch {
-                print("Failed to copy TTS server script: \(error)")
+        guard destData != bundleData else { return false }
+        do {
+            if FileManager.default.fileExists(atPath: destPath) {
+                try FileManager.default.removeItem(atPath: destPath)
             }
+            try FileManager.default.copyItem(atPath: bundlePath, toPath: destPath)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath)
+            print("TTS server script installed/updated at \(destPath)")
+            return true
+        } catch {
+            print("Failed to copy TTS server script: \(error)")
+            return false
         }
     }
 
