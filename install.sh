@@ -82,24 +82,13 @@ fi
 
 # Install TTS dependencies
 echo ""
-echo "Installing TTS dependencies..."
+echo "Installing TTS dependencies (Higgs Audio v3 via MLX-Audio)..."
 
-# Check for espeak-ng
-if ! command -v espeak-ng &> /dev/null && ! command -v espeak &> /dev/null; then
-    echo "  Installing espeak-ng..."
-    if command -v brew &> /dev/null; then
-        brew install espeak-ng 2>/dev/null || echo "  [WARN] Could not install espeak-ng"
-    else
-        echo "  [WARN] Homebrew not found. Install espeak-ng manually: brew install espeak-ng"
-    fi
-else
-    echo "  [OK] espeak-ng is available"
-fi
-
-# Install Python packages into venv
-# kokoro >= 0.9.4 requires Python 3.10-3.12, so we can't use the macOS system python3 (3.9)
-# or recent Homebrew pythons (3.13+). Find a compatible interpreter, installing one if needed.
-echo "  Looking for Python 3.10-3.12 (required by kokoro)..."
+# Install Python packages into venv. mlx-audio + torch need a modern Python
+# (3.11/3.12); the macOS system python3 (3.9) won't do. Find a compatible
+# interpreter, installing one via Homebrew if needed. (No espeak-ng needed —
+# Higgs tokenizes text itself, unlike Kokoro.)
+echo "  Looking for Python 3.10-3.12..."
 
 PYTHON_BIN=""
 for py in python3.12 python3.11 python3.10 \
@@ -138,16 +127,17 @@ if [ -n "$PYTHON_BIN" ]; then
         echo "  [OK] Virtual environment created"
         echo "  Upgrading pip..."
         "$CONFIG_DIR/tts-venv/bin/pip" install --upgrade pip > /dev/null
-        echo "  Installing Python packages (this may take a few minutes)..."
-        if "$CONFIG_DIR/tts-venv/bin/pip" install "kokoro>=0.9.4" "misaki[ja]" "misaki[zh]" soundfile numpy; then
-            if "$CONFIG_DIR/tts-venv/bin/python3" -c "import kokoro" 2>/dev/null; then
+        echo "  Installing Python packages (mlx-audio + torch — a few hundred MB)..."
+        if "$CONFIG_DIR/tts-venv/bin/pip" install mlx-audio torch scipy numpy librosa; then
+            if "$CONFIG_DIR/tts-venv/bin/python3" -c "import mlx_audio, torch" 2>/dev/null; then
                 echo "  [OK] TTS packages installed and verified"
+                echo "  Note: the ~8 GB Higgs voice model downloads on first use."
             else
-                echo "  [WARN] kokoro installed but import failed"
+                echo "  [WARN] mlx-audio installed but import failed"
             fi
         else
             echo "  [ERROR] Failed to install TTS packages. Install manually:"
-            echo "         $CONFIG_DIR/tts-venv/bin/pip install \"kokoro>=0.9.4\" \"misaki[ja]\" \"misaki[zh]\" soundfile numpy"
+            echo "         $CONFIG_DIR/tts-venv/bin/pip install mlx-audio torch scipy numpy librosa"
         fi
     else
         echo "  [ERROR] Could not create Python venv with $PYTHON_BIN"

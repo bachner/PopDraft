@@ -177,19 +177,26 @@ class TTSServerManager {
         // Create config dir if needed
         try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true, attributes: nil)
 
-        // If script doesn't exist, copy from bundle
-        if !FileManager.default.fileExists(atPath: destPath) {
-            if let bundlePath = Bundle.main.path(forResource: "llm-tts-server", ofType: "py") {
-                do {
-                    try FileManager.default.copyItem(atPath: bundlePath, toPath: destPath)
-                    // Make executable
-                    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath)
-                    print("TTS server script copied from bundle to \(destPath)")
-                } catch {
-                    print("Failed to copy TTS server script: \(error)")
+        guard let bundlePath = Bundle.main.path(forResource: "llm-tts-server", ofType: "py") else {
+            print("TTS server script not found in bundle")
+            return
+        }
+        // Copy from the bundle when missing OR when the bundled script DIFFERS from
+        // the installed copy. An app update ships a new server (e.g. the Kokoro →
+        // Higgs switch), and it must REPLACE the stale copy in ~/.popdraft — the old
+        // "only copy if missing" behavior would keep running the outdated server.
+        let bundleData = try? Data(contentsOf: URL(fileURLWithPath: bundlePath))
+        let destData = try? Data(contentsOf: URL(fileURLWithPath: destPath))
+        if destData != bundleData {
+            do {
+                if FileManager.default.fileExists(atPath: destPath) {
+                    try FileManager.default.removeItem(atPath: destPath)
                 }
-            } else {
-                print("TTS server script not found in bundle")
+                try FileManager.default.copyItem(atPath: bundlePath, toPath: destPath)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath)
+                print("TTS server script installed/updated at \(destPath)")
+            } catch {
+                print("Failed to copy TTS server script: \(error)")
             }
         }
     }

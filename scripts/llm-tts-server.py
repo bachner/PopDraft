@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Kokoro-82M TTS Server for macOS
-Keeps the model loaded in memory for fast speech synthesis.
+Higgs Audio v3 (4B) TTS Server for macOS — runs on Apple Silicon via MLX-Audio.
+
+Keeps the model loaded in memory for fast, near-real-time speech synthesis.
+Model: bosonai/higgs-audio-v3-tts-4b (100+ languages incl. Hebrew, voice cloning).
+Runtime: MLX-Audio (native M-series acceleration). Same HTTP API as the previous
+Kokoro server so the app's Swift client is unchanged.
+
+Note: Higgs TTS 3 is under a Research & Non-Commercial license; weights are
+downloaded from Hugging Face to the user's machine (not bundled with the app).
 """
 
 import sys
@@ -21,24 +28,27 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in separate threads."""
     daemon_threads = True
 
-# Pipeline cache keyed by lang_code (loaded on demand)
-pipelines = {}
-pipelines_lock = threading.Lock()
+
+# The Higgs model repo (MLX-Audio resolves + loads it; ~8 GB, cached under
+# ~/.cache/huggingface). Overridable via env for testing.
+MODEL_ID = os.environ.get("POPDRAFT_TTS_MODEL", "bosonai/higgs-audio-v3-tts-4b")
 SAMPLE_RATE = 24000
 
-# Language code mapping for Kokoro v1.0 multilingual voices
-# Voice names follow the pattern: {lang_code}{gender}_{name}
-LANG_CODES = {
-    'a': 'American English',
-    'b': 'British English',
-    'j': 'Japanese',
-    'z': 'Mandarin Chinese',
-    'e': 'Spanish',
-    'f': 'French',
-    'h': 'Hindi',
-    'i': 'Italian',
-    'p': 'Brazilian Portuguese',
-}
+# The model is large + generation is single-slot; serialize synthesis so
+# concurrent /speak calls don't fight over MLX/Metal.
+model = None
+model_lock = threading.Lock()
+synth_lock = threading.Lock()
+
+# Curated subset of Higgs' languages we expose by NAME (the value passed to
+# model.generate(language=...)). "auto" (the default) detects the script instead.
+LANGUAGES = [
+    "English", "Hebrew", "Spanish", "French", "German", "Italian",
+    "Portuguese", "Russian", "Arabic", "Chinese", "Japanese", "Korean",
+    "Hindi", "Dutch", "Turkish", "Polish",
+]
+_LANG_SET = {l.lower() for l in LANGUAGES}
+
 PID_FILE = os.path.expanduser("~/.llm-tts-server.pid")
 DEFAULT_PORT = 7865
 
@@ -47,60 +57,98 @@ playback_lock = threading.Lock()
 current_playback = None
 current_audio_file = None
 
-def get_pipeline(voice='af_heart'):
-    """Get or create a KPipeline for the given voice's language.
 
-    Extracts the first character of the voice name as the lang_code,
-    looks it up in the cache, and creates a new KPipeline if needed.
-    """
-    lang_code = voice[0] if voice else 'a'
-    if lang_code not in LANG_CODES:
-        lang_code = 'a'  # Fall back to American English
+def detect_language(text):
+    """Pick a Higgs language name from the text's dominant script. Falls back to
+    English. Covers the scripts most relevant here (Hebrew first — the user works
+    in Hebrew)."""
+    for ch in text:
+        o = ord(ch)
+        if 0x0590 <= o <= 0x05FF:
+            return "Hebrew"
+        if 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F:
+            return "Arabic"
+        if 0x0400 <= o <= 0x04FF:
+            return "Russian"
+        if 0x3040 <= o <= 0x30FF:
+            return "Japanese"
+        if 0xAC00 <= o <= 0xD7A3:
+            return "Korean"
+        if 0x4E00 <= o <= 0x9FFF:
+            return "Chinese"
+        if 0x0900 <= o <= 0x097F:
+            return "Hindi"
+    return "English"
 
-    with pipelines_lock:
-        if lang_code in pipelines:
-            return pipelines[lang_code]
 
-    # Create outside the lock to avoid blocking other languages
-    print(f"Loading Kokoro pipeline for '{lang_code}' ({LANG_CODES[lang_code]})...", file=sys.stderr)
-    from kokoro import KPipeline
-    new_pipeline = KPipeline(lang_code=lang_code)
-    print(f"Pipeline '{lang_code}' loaded!", file=sys.stderr)
-
-    with pipelines_lock:
-        # Another thread may have created it while we were loading
-        if lang_code not in pipelines:
-            pipelines[lang_code] = new_pipeline
-        return pipelines[lang_code]
+def resolve_language(voice, text):
+    """The app sends the chosen language in the `voice` field (legacy name). If it
+    names a known language, honor it; otherwise ("auto", empty, or a stale Kokoro
+    voice id like 'af_heart') auto-detect from the text."""
+    v = (voice or "").strip()
+    if v.lower() in _LANG_SET:
+        # Normalize to the canonical capitalization Higgs expects.
+        for l in LANGUAGES:
+            if l.lower() == v.lower():
+                return l
+    return detect_language(text)
 
 
 def load_model():
-    """Pre-load the default American English pipeline at startup."""
-    print("Loading default Kokoro pipeline...", file=sys.stderr)
-    get_pipeline('af_heart')
-    print("Default pipeline ready!", file=sys.stderr)
+    """Load the Higgs model once, into memory (kept resident for fast repeats)."""
+    global model
+    with model_lock:
+        if model is not None:
+            return model
+        print(f"Loading Higgs TTS model ({MODEL_ID})...", file=sys.stderr)
+        from mlx_audio.tts.utils import load_model as _load
+        model = _load(MODEL_ID)
+        print("Higgs TTS model loaded!", file=sys.stderr)
+        return model
 
-def text_to_speech(text, voice='af_heart', speed=1.0):
-    """Generate speech from text."""
-    import soundfile as sf
+
+def _apply_speed(audio, speed):
+    """Pitch-preserving time-stretch for the speed slider. No-op if speed≈1 or
+    librosa isn't available (Higgs' natural pace is used)."""
+    if abs(speed - 1.0) < 0.02:
+        return audio
+    try:
+        import librosa
+        return librosa.effects.time_stretch(audio, rate=speed)
+    except Exception as e:
+        print(f"speed control unavailable ({e}); using natural pace", file=sys.stderr)
+        return audio
+
+
+def text_to_speech(text, voice='auto', speed=1.0):
+    """Generate speech WAV from text and return its path (or None)."""
     import numpy as np
+    from scipy.io import wavfile
 
-    pipe = get_pipeline(voice)
-    audio_chunks = []
-    for _, _, audio in pipe(text, voice=voice, speed=speed):
-        audio_chunks.append(audio)
+    m = load_model()
+    lang = resolve_language(voice, text)
 
-    if not audio_chunks:
+    with synth_lock:  # one generation at a time
+        chunks = []
+        try:
+            gen = m.generate(text=text, voice="default_voice", language=lang)
+        except TypeError:
+            gen = m.generate(text=text, voice="default_voice")
+        for r in gen:
+            chunks.append(np.array(r.audio, copy=False).reshape(-1))
+
+    if not chunks:
         return None
+    audio = np.concatenate(chunks).astype(np.float32)
+    audio = _apply_speed(audio, speed)
 
-    full_audio = np.concatenate(audio_chunks)
-
-    # Save to temp file
     fd, audio_path = tempfile.mkstemp(suffix='.wav')
     os.close(fd)
-    sf.write(audio_path, full_audio, SAMPLE_RATE)
-
+    # 16-bit PCM keeps afplay happy and the file small.
+    pcm = np.clip(audio, -1.0, 1.0)
+    wavfile.write(audio_path, SAMPLE_RATE, (pcm * 32767).astype(np.int16))
     return audio_path
+
 
 def stop_playback():
     """Stop current playback if any."""
@@ -110,15 +158,16 @@ def stop_playback():
             current_playback.terminate()
             try:
                 current_playback.wait(timeout=1)
-            except:
+            except Exception:
                 current_playback.kill()
         current_playback = None
         if current_audio_file and os.path.exists(current_audio_file):
             try:
                 os.unlink(current_audio_file)
-            except:
+            except Exception:
                 pass
         current_audio_file = None
+
 
 def pause_playback():
     """Pause current playback using SIGSTOP."""
@@ -129,6 +178,7 @@ def pause_playback():
             return True
     return False
 
+
 def resume_playback():
     """Resume paused playback using SIGCONT."""
     global current_playback
@@ -138,6 +188,7 @@ def resume_playback():
             return True
     return False
 
+
 def playback_monitor(audio_path):
     """Monitor playback and cleanup when done."""
     global current_playback, current_audio_file
@@ -146,104 +197,41 @@ def playback_monitor(audio_path):
             if current_playback is None:
                 break
             if current_playback.poll() is not None:
-                # Playback finished
                 if current_audio_file and os.path.exists(current_audio_file):
                     try:
                         os.unlink(current_audio_file)
-                    except:
+                    except Exception:
                         pass
                 current_audio_file = None
                 current_playback = None
                 break
-        threading.Event().wait(0.1)  # Check every 100ms
+        threading.Event().wait(0.1)
+
 
 class TTSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress logging
+
+    def _text(self, code, body):
+        self.send_response(code)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(body if isinstance(body, bytes) else body.encode())
 
     def do_GET(self):
         global current_playback, current_audio_file
         parsed = urlparse(self.path)
 
         if parsed.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'ok')
+            self._text(200, b'ok')
             return
 
         if parsed.path == '/voices':
-            voices = {
-                'a': {
-                    'language': 'American English',
-                    'voices': [
-                        'af_heart', 'af_alloy', 'af_aoede', 'af_bella',
-                        'af_jessica', 'af_kore', 'af_nicole', 'af_nova',
-                        'af_river', 'af_sarah', 'af_sky',
-                        'am_adam', 'am_echo', 'am_eric', 'am_fenrir',
-                        'am_liam', 'am_michael', 'am_onyx', 'am_puck',
-                        'am_santa',
-                    ],
-                },
-                'b': {
-                    'language': 'British English',
-                    'voices': [
-                        'bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily',
-                        'bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis',
-                    ],
-                },
-                'j': {
-                    'language': 'Japanese',
-                    'voices': [
-                        'jf_alpha', 'jf_gongitsune', 'jf_nezumi',
-                        'jf_tebukuro',
-                        'jm_kumo',
-                    ],
-                },
-                'z': {
-                    'language': 'Mandarin Chinese',
-                    'voices': [
-                        'zf_xiaobei', 'zf_xiaoni', 'zf_xiaoxiao',
-                        'zf_xiaoyi',
-                        'zm_yunjian', 'zm_yunxi', 'zm_yunxia', 'zm_yunyang',
-                    ],
-                },
-                'e': {
-                    'language': 'Spanish',
-                    'voices': [
-                        'ef_dora',
-                        'em_alex', 'em_santa',
-                    ],
-                },
-                'f': {
-                    'language': 'French',
-                    'voices': [
-                        'ff_siwis',
-                        'fm_gilles',
-                    ],
-                },
-                'h': {
-                    'language': 'Hindi',
-                    'voices': [
-                        'hf_alpha', 'hf_beta',
-                        'hm_omega', 'hm_psi',
-                    ],
-                },
-                'i': {
-                    'language': 'Italian',
-                    'voices': [
-                        'if_sara',
-                        'im_nicola',
-                    ],
-                },
-                'p': {
-                    'language': 'Brazilian Portuguese',
-                    'voices': [
-                        'pf_dora',
-                        'pm_alex', 'pm_santa',
-                    ],
-                },
-            }
+            # Chatterbox/Kokoro-style shape kept for compatibility: one "voice"
+            # per language (Higgs has a single base voice; the language is the knob).
+            voices = {"auto": {"language": "Auto-detect", "voices": ["auto"]}}
+            for lang in LANGUAGES:
+                voices[lang] = {"language": lang, "voices": [lang]}
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -252,99 +240,53 @@ class TTSHandler(BaseHTTPRequestHandler):
 
         if parsed.path == '/status':
             with playback_lock:
-                if current_playback is None:
-                    status = 'idle'
-                elif current_playback.poll() is not None:
+                if current_playback is None or current_playback.poll() is not None:
                     status = 'idle'
                 else:
-                    # Check if paused (we need to track this)
                     status = 'playing'
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(status.encode())
+            self._text(200, status)
             return
 
         if parsed.path == '/stop':
             stop_playback()
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'stopped')
+            self._text(200, b'stopped')
             return
 
         if parsed.path == '/pause':
-            if pause_playback():
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'paused')
-            else:
-                self.send_response(404)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'nothing playing')
+            self._text(200, b'paused') if pause_playback() else self._text(404, b'nothing playing')
             return
 
         if parsed.path == '/resume':
-            if resume_playback():
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'resumed')
-            else:
-                self.send_response(404)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'nothing to resume')
+            self._text(200, b'resumed') if resume_playback() else self._text(404, b'nothing to resume')
             return
 
         if parsed.path == '/speak':
             params = parse_qs(parsed.query)
             text = params.get('text', [''])[0]
-            voice = params.get('voice', ['af_heart'])[0]
+            voice = params.get('voice', ['auto'])[0]
             speed = float(params.get('speed', ['1.0'])[0])
             play = params.get('play', ['1'])[0] == '1'
 
             if not text:
-                self.send_response(400)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'Missing text parameter')
+                self._text(400, b'Missing text parameter')
                 return
 
             try:
-                # Stop any existing playback
                 stop_playback()
-
                 audio_path = text_to_speech(text, voice=voice, speed=speed)
                 if audio_path:
                     if play:
                         with playback_lock:
                             current_audio_file = audio_path
                             current_playback = subprocess.Popen(["afplay", audio_path])
-                        # Start monitor thread to cleanup when done
                         threading.Thread(target=playback_monitor, args=(audio_path,), daemon=True).start()
-                        # Return immediately - don't wait for playback
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/plain')
-                        self.end_headers()
-                        self.wfile.write(b'playing')
+                        self._text(200, b'playing')
                     else:
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/plain')
-                        self.end_headers()
-                        self.wfile.write(audio_path.encode())
+                        self._text(200, audio_path.encode())
                 else:
-                    self.send_response(500)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.end_headers()
-                    self.wfile.write(b'Failed to generate audio')
+                    self._text(500, b'Failed to generate audio')
             except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(str(e).encode())
+                self._text(500, str(e))
             return
 
         self.send_response(404)
@@ -354,22 +296,18 @@ class TTSHandler(BaseHTTPRequestHandler):
         if self.path == '/speak':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
-
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
                 data = {'text': body}
 
             text = data.get('text', '')
-            voice = data.get('voice', 'af_heart')
+            voice = data.get('voice', 'auto')
             speed = float(data.get('speed', 1.0))
             play = data.get('play', True)
 
             if not text:
-                self.send_response(400)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'Missing text')
+                self._text(400, b'Missing text')
                 return
 
             try:
@@ -378,63 +316,57 @@ class TTSHandler(BaseHTTPRequestHandler):
                     if play:
                         subprocess.run(["afplay", audio_path], check=True)
                         os.unlink(audio_path)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.end_headers()
-                    self.wfile.write(b'ok' if play else audio_path.encode())
+                    self._text(200, b'ok' if play else audio_path.encode())
                 else:
                     self.send_response(500)
                     self.end_headers()
             except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(str(e).encode())
+                self._text(500, str(e))
             return
 
         self.send_response(404)
         self.end_headers()
 
+
 def cleanup():
-    """Remove PID file on exit."""
     if os.path.exists(PID_FILE):
         os.unlink(PID_FILE)
 
+
 def write_pid():
-    """Write current PID to file."""
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Kokoro TTS Server')
+    parser = argparse.ArgumentParser(description='Higgs TTS Server')
     parser.add_argument('-p', '--port', type=int, default=DEFAULT_PORT, help='Port to listen on')
     parser.add_argument('--daemon', action='store_true', help='Run in background')
     args = parser.parse_args()
 
     if args.daemon:
-        # Fork to background
         pid = os.fork()
         if pid > 0:
             print(f"TTS server started on port {args.port} (PID: {pid})")
             sys.exit(0)
         os.setsid()
 
-    # Setup cleanup
     atexit.register(cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
-    # Load model before starting server
-    load_model()
-
-    # Write PID file
+    # Load the model in the BACKGROUND so /health is up immediately and the ~8 GB
+    # first-run download/load doesn't block the server from starting (the app's
+    # health check would otherwise time out). The first /speak waits on model_lock
+    # until the load finishes; later ones are instant.
+    threading.Thread(target=load_model, daemon=True).start()
     write_pid()
 
-    # Start server (threaded to handle concurrent requests)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), TTSHandler)
     print(f"TTS server listening on http://127.0.0.1:{args.port}", file=sys.stderr)
     server.serve_forever()
+
 
 if __name__ == '__main__':
     main()

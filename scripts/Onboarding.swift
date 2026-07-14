@@ -373,8 +373,8 @@ struct OnboardingView: View {
 
     private func installTTSDependencies() {
         let depStatus = DependencyManager.shared.checkDependencies()
-        if depStatus.hasPythonPackages && depStatus.hasEspeak {
-            // TTS dependencies already installed
+        if depStatus.hasPythonPackages {
+            // TTS dependencies already installed (Higgs needs no espeak)
             self.finishOnboarding()
         } else {
             // Install TTS dependencies

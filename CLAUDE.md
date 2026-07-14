@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PopDraft is a macOS menu bar app that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp, Ollama, OpenAI, Claude) for text generation and Kokoro-82M for neural TTS.
+PopDraft is a macOS menu bar app that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp, Ollama, OpenAI, Claude) for text generation and Higgs Audio v3 (4B) for neural TTS, run locally on Apple Silicon via MLX-Audio (100+ languages incl. Hebrew, language auto-detected from the text).
 
 ## Key Commands
 
@@ -25,9 +25,10 @@ PopDraft is a macOS menu bar app that provides system-wide LLM text processing v
 # Clean removal
 ./uninstall.sh
 
-# TTS dependencies (installed by install.sh)
-brew install espeak-ng
-pip install kokoro soundfile numpy
+# TTS dependencies (installed by install.sh, into ~/.popdraft/tts-venv)
+# Higgs Audio v3 runs on Apple Silicon via MLX-Audio; its loader needs torch.
+# The ~8 GB voice model downloads from Hugging Face on first use.
+pip install mlx-audio torch scipy numpy librosa
 
 # Test TTS server
 curl http://127.0.0.1:7865/health
@@ -72,7 +73,7 @@ registers it into `AgentToolCatalog` (in `Core.swift`) via its `register()`;
 change to one feature file, not an edit to a shared list.
 
 **TTS Server:**
-- `scripts/llm-tts-server.py` - Kokoro TTS HTTP server
+- `scripts/llm-tts-server.py` - Higgs Audio v3 TTS HTTP server (MLX-Audio backend; same HTTP API as before — `/speak`, `/stop`, `/pause`, `/resume`, `/status`, `/voices`, `/health` on :7865). Model loads lazily in a background thread so `/health` is instant. The `voice` field carries a Higgs language name or `auto` (auto-detect from script).
 
 **Config:**
 - `scripts/llm-config.sh` - Backend configuration helper (for debugging)
@@ -103,7 +104,7 @@ change to one feature file, not an edit to a shared list.
   "openaiModel": "gpt-4o",
   "claudeAPIKey": "",
   "claudeModel": "claude-sonnet-4-20250514",
-  "ttsVoice": "af_heart",
+  "ttsVoice": "auto",
   "ttsSpeed": 1.0
 }
 ```
