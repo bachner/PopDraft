@@ -226,7 +226,7 @@ struct LLMConfig {
     var claudeThinkingBudget: Int = 10000
     var ollamaEnableThinking: Bool = false
     var llamacppEnableThinking: Bool = false
-    var ttsVoice: String = "af_heart"
+    var ttsVoice: String = "auto"
     var ttsSpeed: Double = 1.0
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
 
@@ -245,91 +245,31 @@ struct LLMConfig {
     var agentSettings: AgentSettings = AgentSettings()
     var mcpServers: [MCPServerConfig] = []
 
-    // TTS voice list — all 54 Kokoro v1.0 voices grouped by language
-    static let ttsVoiceLanguages: [String] = [
-        "American English",
-        "British English",
-        "Japanese",
-        "Mandarin Chinese",
-        "Spanish",
-        "French",
-        "Hindi",
-        "Italian",
-        "Brazilian Portuguese",
-    ]
+    // TTS "voices" for Higgs Audio v3 — one high-quality base voice; the LANGUAGE
+    // is the knob. "Auto-detect" (the default) reads the text's script, so Hebrew
+    // and English selections just work with no picking. Higgs supports 100+
+    // languages; this is a curated subset. The selected id is sent to the server as
+    // the `voice` field and maps to Higgs' `language`.
+    static let ttsVoiceLanguages: [String] = ["Automatic", "Languages"]
 
     static let ttsVoices: [(id: String, name: String, language: String)] = [
-        // American English - Female
-        ("af_heart", "Heart (Female)", "American English"),
-        ("af_alloy", "Alloy (Female)", "American English"),
-        ("af_aoede", "Aoede (Female)", "American English"),
-        ("af_bella", "Bella (Female)", "American English"),
-        ("af_jessica", "Jessica (Female)", "American English"),
-        ("af_kore", "Kore (Female)", "American English"),
-        ("af_nicole", "Nicole (Female)", "American English"),
-        ("af_nova", "Nova (Female)", "American English"),
-        ("af_river", "River (Female)", "American English"),
-        ("af_sarah", "Sarah (Female)", "American English"),
-        ("af_sky", "Sky (Female)", "American English"),
-        // American English - Male
-        ("am_adam", "Adam (Male)", "American English"),
-        ("am_echo", "Echo (Male)", "American English"),
-        ("am_eric", "Eric (Male)", "American English"),
-        ("am_fenrir", "Fenrir (Male)", "American English"),
-        ("am_liam", "Liam (Male)", "American English"),
-        ("am_michael", "Michael (Male)", "American English"),
-        ("am_onyx", "Onyx (Male)", "American English"),
-        ("am_puck", "Puck (Male)", "American English"),
-        ("am_santa", "Santa (Male)", "American English"),
-        // British English - Female
-        ("bf_alice", "Alice (Female)", "British English"),
-        ("bf_emma", "Emma (Female)", "British English"),
-        ("bf_isabella", "Isabella (Female)", "British English"),
-        ("bf_lily", "Lily (Female)", "British English"),
-        // British English - Male
-        ("bm_daniel", "Daniel (Male)", "British English"),
-        ("bm_fable", "Fable (Male)", "British English"),
-        ("bm_george", "George (Male)", "British English"),
-        ("bm_lewis", "Lewis (Male)", "British English"),
-        // Japanese - Female
-        ("jf_alpha", "Alpha (Female)", "Japanese"),
-        ("jf_gongitsune", "Gongitsune (Female)", "Japanese"),
-        ("jf_nezumi", "Nezumi (Female)", "Japanese"),
-        ("jf_tebukuro", "Tebukuro (Female)", "Japanese"),
-        // Japanese - Male
-        ("jm_kumo", "Kumo (Male)", "Japanese"),
-        // Mandarin Chinese - Female
-        ("zf_xiaobei", "Xiaobei (Female)", "Mandarin Chinese"),
-        ("zf_xiaoni", "Xiaoni (Female)", "Mandarin Chinese"),
-        ("zf_xiaoxiao", "Xiaoxiao (Female)", "Mandarin Chinese"),
-        ("zf_xiaoyi", "Xiaoyi (Female)", "Mandarin Chinese"),
-        // Mandarin Chinese - Male
-        ("zm_yunjian", "Yunjian (Male)", "Mandarin Chinese"),
-        ("zm_yunxi", "Yunxi (Male)", "Mandarin Chinese"),
-        ("zm_yunxia", "Yunxia (Male)", "Mandarin Chinese"),
-        ("zm_yunyang", "Yunyang (Male)", "Mandarin Chinese"),
-        // Spanish - Female
-        ("ef_dora", "Dora (Female)", "Spanish"),
-        // Spanish - Male
-        ("em_alex", "Alex (Male)", "Spanish"),
-        ("em_santa", "Santa (Male)", "Spanish"),
-        // French - Female
-        ("ff_siwis", "Siwis (Female)", "French"),
-        // Hindi - Female
-        ("hf_alpha", "Alpha (Female)", "Hindi"),
-        ("hf_beta", "Beta (Female)", "Hindi"),
-        // Hindi - Male
-        ("hm_omega", "Omega (Male)", "Hindi"),
-        ("hm_psi", "Psi (Male)", "Hindi"),
-        // Italian - Female
-        ("if_sara", "Sara (Female)", "Italian"),
-        // Italian - Male
-        ("im_nicola", "Nicola (Male)", "Italian"),
-        // Brazilian Portuguese - Female
-        ("pf_dora", "Dora (Female)", "Brazilian Portuguese"),
-        // Brazilian Portuguese - Male
-        ("pm_alex", "Alex (Male)", "Brazilian Portuguese"),
-        ("pm_santa", "Santa (Male)", "Brazilian Portuguese"),
+        ("auto", "Auto-detect (from text)", "Automatic"),
+        ("English", "English", "Languages"),
+        ("Hebrew", "Hebrew — עברית", "Languages"),
+        ("Spanish", "Spanish — Español", "Languages"),
+        ("French", "French — Français", "Languages"),
+        ("German", "German — Deutsch", "Languages"),
+        ("Italian", "Italian — Italiano", "Languages"),
+        ("Portuguese", "Portuguese — Português", "Languages"),
+        ("Russian", "Russian — Русский", "Languages"),
+        ("Arabic", "Arabic — العربية", "Languages"),
+        ("Chinese", "Chinese — 中文", "Languages"),
+        ("Japanese", "Japanese — 日本語", "Languages"),
+        ("Korean", "Korean — 한국어", "Languages"),
+        ("Hindi", "Hindi — हिन्दी", "Languages"),
+        ("Dutch", "Dutch — Nederlands", "Languages"),
+        ("Turkish", "Turkish — Türkçe", "Languages"),
+        ("Polish", "Polish — Polski", "Languages"),
     ]
 
     // Model lists

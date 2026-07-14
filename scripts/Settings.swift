@@ -91,7 +91,7 @@ struct SettingsView: View {
     @State private var isLoading = false
     @State private var customOpenAIModel: String = ""
     @State private var customClaudeModel: String = ""
-    @State private var ttsVoice: String = "af_heart"
+    @State private var ttsVoice: String = "auto"
     @State private var ttsSpeed: Double = 1.0
     @State private var voiceSearchText: String = ""
     @State private var settingsActions: [Action] = []

@@ -68,8 +68,9 @@ class DependencyManager {
                           FileManager.default.fileExists(atPath: "/usr/local/bin/espeak-ng") ||
                           FileManager.default.fileExists(atPath: "/usr/bin/espeak")
 
-        // Check Python packages (in venv)
-        let checkScript = "\(ttsVenvPython) -c 'import kokoro; import soundfile; import numpy' 2>/dev/null && echo OK"
+        // Check Python packages (in venv) — Higgs runs via mlx-audio, whose Higgs
+        // loader also needs torch.
+        let checkScript = "\(ttsVenvPython) -c 'import mlx_audio, torch' 2>/dev/null && echo OK"
         let result = runShellCommand(checkScript)
         status.hasPythonPackages = result.contains("OK")
 
@@ -98,31 +99,33 @@ class DependencyManager {
             // Check current status
             let status = self.checkDependencies()
 
-            // Install espeak-ng if missing (and homebrew available)
-            if !status.hasEspeak && status.hasHomebrew {
-                DispatchQueue.main.async { statusCallback("Installing espeak-ng...") }
-                let result = self.runShellCommand("/opt/homebrew/bin/brew install espeak-ng 2>&1 || /usr/local/bin/brew install espeak-ng 2>&1", timeout: 300, trackProcess: true)
-                if self.installCancelled { return }
-                if result.contains("Error") {
-                    print("espeak-ng install warning: \(result)")
-                }
-            }
-
-            // Install Python packages into venv if missing
+            // Install Python packages into venv if missing. Higgs (via mlx-audio +
+            // torch) needs a modern Python (3.11/3.12) — the system python3 is 3.9,
+            // so find a compatible interpreter first.
             if !status.hasPythonPackages {
                 DispatchQueue.main.async { statusCallback("Creating Python environment...") }
                 let venvDir = NSString(string: "~/.popdraft/tts-venv").expandingTildeInPath
-                // Remove old venv to avoid issues with corrupted/partial venvs on Python 3.9
+                // Prefer a 3.11/3.12 interpreter (mlx-audio + torch require it).
+                let pyCandidates = [
+                    "python3.12", "python3.11", "python3.10",
+                    "/opt/homebrew/bin/python3.12", "/opt/homebrew/bin/python3.11", "/opt/homebrew/bin/python3.10",
+                    "/usr/local/bin/python3.12", "/usr/local/bin/python3.11", "/usr/local/bin/python3.10",
+                ]
+                let pythonBin = self.runShellCommand(
+                    "for py in \(pyCandidates.joined(separator: " ")); do if command -v \"$py\" >/dev/null 2>&1; then echo \"$py\"; break; fi; done"
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                let venvPython = pythonBin.isEmpty ? "python3" : pythonBin
+                // Remove old venv to avoid issues with corrupted/partial venvs.
                 try? FileManager.default.removeItem(atPath: venvDir)
-                let venvResult = self.runShellCommand("python3 -m venv \"\(venvDir)\" 2>&1", timeout: 120, trackProcess: true)
+                let venvResult = self.runShellCommand("\"\(venvPython)\" -m venv \"\(venvDir)\" 2>&1", timeout: 120, trackProcess: true)
                 if self.installCancelled { return }
                 if venvResult.contains("Error") {
                     print("venv creation warning: \(venvResult)")
                     success = false
                 } else {
-                    DispatchQueue.main.async { statusCallback("Installing TTS packages (this may take a few minutes)...") }
+                    DispatchQueue.main.async { statusCallback("Installing TTS packages (mlx-audio + torch, a few minutes)...") }
                     let pipPath = venvDir + "/bin/pip"
-                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet kokoro soundfile numpy 2>&1", timeout: 600, trackProcess: true)
+                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet mlx-audio torch scipy numpy librosa 2>&1", timeout: 900, trackProcess: true)
                     if self.installCancelled { return }
                     if result.contains("ERROR") {
                         print("pip install warning: \(result)")
