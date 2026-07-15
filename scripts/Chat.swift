@@ -3514,10 +3514,43 @@ final class BubblePanel: NSPanel {
 /// here directly (this fires for clicks on a non-activating panel without ever
 /// activating the app).
 final class BubbleClickHostingView: NSHostingView<BubbleView> {
+    /// Fired on a click that did NOT turn into a drag (expand the chat).
     var onClick: (() -> Void)?
+    /// Fired on mouse-up after a real drag, so the controller can persist the
+    /// bubble's new position.
+    var onDragEnded: (() -> Void)?
+
+    private var mouseDownScreen: NSPoint = .zero
+    private var originAtMouseDown: NSPoint = .zero
+    private var didDrag = false
+    /// Movement (in points) before a press becomes a drag rather than a click.
+    private let dragThreshold: CGFloat = 4
 
     override func mouseDown(with event: NSEvent) {
-        onClick?()
+        didDrag = false
+        mouseDownScreen = NSEvent.mouseLocation
+        originAtMouseDown = window?.frame.origin ?? .zero
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let window = window else { return }
+        let now = NSEvent.mouseLocation
+        let dx = now.x - mouseDownScreen.x
+        let dy = now.y - mouseDownScreen.y
+        if !didDrag && hypot(dx, dy) > dragThreshold { didDrag = true }
+        if didDrag {
+            // Move the panel to follow the cursor (screen coords, so multi-display
+            // dragging works). setFrameOrigin doesn't activate the app.
+            window.setFrameOrigin(NSPoint(x: originAtMouseDown.x + dx, y: originAtMouseDown.y + dy))
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if didDrag {
+            onDragEnded?()   // persist the new free position
+        } else {
+            onClick?()       // a plain click → expand into the chat
+        }
     }
 }
 
@@ -3555,6 +3588,7 @@ final class BubbleWindowController: NSWindowController {
         // Layer-backed so the pop/bounce transitions can animate its transform.
         host.wantsLayer = true
         host.onClick = { [weak self] in self?.onExpand?() }
+        host.onDragEnded = { [weak self] in self?.saveDraggedPosition() }
         panel.contentView = host
         hostingView = host
 
@@ -3596,6 +3630,20 @@ final class BubbleWindowController: NSWindowController {
         }
     }
 
+    /// Position the orb: at its free-dragged position (clamped on-screen) if the
+    /// user has moved it, otherwise pinned to the configured corner.
+    private func positionBubble(animated: Bool) {
+        guard let window = window else { return }
+        let bubble = LLMConfig.load().bubble
+        if let px = bubble.posX, let py = bubble.posY {
+            let clamped = BubbleWindowController.clampOnScreen(
+                NSPoint(x: px, y: py), size: window.frame.size)
+            window.setFrameOrigin(clamped)
+        } else {
+            pinToCorner(animated: animated)
+        }
+    }
+
     private func pinToCorner(animated: Bool) {
         guard let window = window else { return }
         let corner = BubbleCorner.parse(LLMConfig.load().bubble.corner)
@@ -3607,8 +3655,29 @@ final class BubbleWindowController: NSWindowController {
         window.setFrameOrigin(origin)
     }
 
+    /// Keep a free-dragged origin within some screen's visible frame, so a bubble
+    /// saved on a now-disconnected/rearranged display can't end up off-screen.
+    static func clampOnScreen(_ origin: NSPoint, size: NSSize) -> NSPoint {
+        let rect = NSRect(origin: origin, size: size)
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(rect) })
+            ?? NSScreen.main ?? NSScreen.screens.first
+        guard let visible = screen?.visibleFrame else { return origin }
+        let x = min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - size.width))
+        let y = min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - size.height))
+        return NSPoint(x: x, y: y)
+    }
+
+    /// Persist the orb's current origin as its free position (called after a drag).
+    private func saveDraggedPosition() {
+        guard let f = window?.frame else { return }
+        var config = LLMConfig.load()
+        config.bubble.posX = Double(f.origin.x)
+        config.bubble.posY = Double(f.origin.y)
+        config.save()
+    }
+
     @objc private func screenParametersChanged() {
-        if isShown { pinToCorner(animated: false) }
+        if isShown { positionBubble(animated: false) }
     }
 
     // MARK: Show / hide
@@ -3631,7 +3700,7 @@ final class BubbleWindowController: NSWindowController {
     /// chat feels like the orb settling back — a plain fade under Reduce Motion.
     func show(animated: Bool = true) {
         guard let window = window else { return }
-        pinToCorner(animated: false)
+        positionBubble(animated: false)
         isShown = true
         clearOrbAnimations()
         if animated {
