@@ -3563,6 +3563,14 @@ final class BubbleWindowController: NSWindowController {
 
     private var hostingView: BubbleClickHostingView?
     private var isShown = false
+    /// Where the user last DRAGGED the orb this session (panel origin, screen
+    /// coords). In-memory ONLY — so the orb reappears here when the chat closes or
+    /// re-shows, but an app RESTART falls back to the configured corner. Nil → use
+    /// the corner.
+    private var sessionOrigin: NSPoint?
+    /// The configured corner we last applied — lets us notice a Settings corner
+    /// change and drop the session drag position so picking a corner snaps there.
+    private var lastKnownCorner: String?
 
     init() {
         let size = NSSize(width: BubbleView.diameter + 24, height: BubbleView.diameter + 24)
@@ -3630,15 +3638,19 @@ final class BubbleWindowController: NSWindowController {
         }
     }
 
-    /// Position the orb: at its free-dragged position (clamped on-screen) if the
-    /// user has moved it, otherwise pinned to the configured corner.
+    /// Position the orb: at the position the user DRAGGED it to this session
+    /// (clamped on-screen), otherwise pinned to the configured corner. The dragged
+    /// position is in-memory only, so a restart returns to the corner.
     private func positionBubble(animated: Bool) {
         guard let window = window else { return }
-        let bubble = LLMConfig.load().bubble
-        if let px = bubble.posX, let py = bubble.posY {
-            let clamped = BubbleWindowController.clampOnScreen(
-                NSPoint(x: px, y: py), size: window.frame.size)
-            window.setFrameOrigin(clamped)
+        let corner = LLMConfig.load().bubble.corner
+        // If the user picked a different corner in Settings, honor it: drop the
+        // session drag position and snap to the new corner.
+        if let last = lastKnownCorner, last != corner { sessionOrigin = nil }
+        lastKnownCorner = corner
+
+        if let origin = sessionOrigin {
+            window.setFrameOrigin(BubbleWindowController.clampOnScreen(origin, size: window.frame.size))
         } else {
             pinToCorner(animated: animated)
         }
@@ -3667,13 +3679,12 @@ final class BubbleWindowController: NSWindowController {
         return NSPoint(x: x, y: y)
     }
 
-    /// Persist the orb's current origin as its free position (called after a drag).
+    /// Remember the orb's current origin as its session drag position (called after
+    /// a drag). In-memory only — NOT persisted, so it resets to the corner on
+    /// restart while sticking for the rest of this session.
     private func saveDraggedPosition() {
         guard let f = window?.frame else { return }
-        var config = LLMConfig.load()
-        config.bubble.posX = Double(f.origin.x)
-        config.bubble.posY = Double(f.origin.y)
-        config.save()
+        sessionOrigin = f.origin
     }
 
     @objc private func screenParametersChanged() {
