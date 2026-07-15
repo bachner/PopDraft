@@ -307,7 +307,13 @@ jobs:
           fi
 
   release:
-    needs: [build, e2e-install-test]
+    # NOTE: intentionally does NOT depend on e2e-install-test. That job runs the
+    # full install.sh incl. a ~2.5 GB `pip install torch` for the Higgs TTS runtime,
+    # whose download can stall on the runner and previously HUNG the release (a
+    # tagged build sat 30 min then blocked publishing). The DMG is already produced
+    # by `build`; unit-tests gate correctness. e2e still runs as a non-blocking
+    # signal.
+    needs: [build, unit-tests]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-14
 

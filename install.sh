@@ -128,7 +128,9 @@ if [ -n "$PYTHON_BIN" ]; then
         echo "  Upgrading pip..."
         "$CONFIG_DIR/tts-venv/bin/pip" install --upgrade pip > /dev/null
         echo "  Installing Python packages (mlx-audio + torch — a few hundred MB)..."
-        if "$CONFIG_DIR/tts-venv/bin/pip" install mlx-audio torch scipy numpy librosa; then
+        # --timeout/--retries so a stalled wheel download (torch is ~2.5 GB) fails
+        # and retries instead of hanging indefinitely.
+        if "$CONFIG_DIR/tts-venv/bin/pip" install --timeout 60 --retries 5 mlx-audio torch scipy numpy librosa; then
             if "$CONFIG_DIR/tts-venv/bin/python3" -c "import mlx_audio, torch" 2>/dev/null; then
                 echo "  [OK] TTS packages installed and verified"
                 echo "  Note: the ~8 GB Higgs voice model downloads on first use."
