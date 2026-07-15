@@ -125,7 +125,7 @@ class DependencyManager {
                 } else {
                     DispatchQueue.main.async { statusCallback("Installing TTS packages (mlx-audio + torch, a few minutes)...") }
                     let pipPath = venvDir + "/bin/pip"
-                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet mlx-audio torch scipy numpy librosa 2>&1", timeout: 900, trackProcess: true)
+                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet --timeout 60 --retries 5 mlx-audio torch scipy numpy librosa 2>&1", timeout: 900, trackProcess: true)
                     if self.installCancelled { return }
                     if result.contains("ERROR") {
                         print("pip install warning: \(result)")
