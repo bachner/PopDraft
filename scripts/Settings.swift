@@ -1818,18 +1818,10 @@ struct SettingsView: View {
         // PR3: persist user-managed models + provider keys.
         config.userModels = userModels
         config.providerKeys = providerKeys
-        // PR4: persist corner-bubble settings. Preserve the free-dragged position
-        // (posX/posY — it lives only on disk, set by dragging the orb) across
-        // Settings saves; clear it ONLY when the user changes the corner here, so
-        // picking a corner snaps the bubble to it.
-        let diskBubble = AppConfig.load(dir: LLMConfig.configDir).bubble
-        let cornerChanged = BubbleCorner.parse(diskBubble.corner) != bubbleCorner
-        config.bubble = BubbleSettings(
-            enabled: bubbleEnabled,
-            corner: bubbleCorner.rawValue,
-            posX: cornerChanged ? nil : diskBubble.posX,
-            posY: cornerChanged ? nil : diskBubble.posY
-        )
+        // PR4: persist corner-bubble settings. (The free-dragged position is
+        // session-only — held in memory by BubbleWindowController — so it resets to
+        // this corner on restart; nothing about it is persisted here.)
+        config.bubble = BubbleSettings(enabled: bubbleEnabled, corner: bubbleCorner.rawValue)
         // PR9: persist Mac-control settings, PRESERVING the other agentSettings
         // fields (maxIterations / enableWebSearch / macControlDryRun) already on
         // disk — we only own the two General-tab toggles here.
