@@ -138,16 +138,25 @@ struct MCPServerConfig: Codable, Equatable {
 struct BubbleSettings: Codable, Equatable {
     var enabled: Bool
     var corner: String
+    /// Free-dragged position — the panel's origin (bottom-left) in screen
+    /// coordinates. When BOTH are set the bubble floats here (clamped on-screen)
+    /// instead of pinning to `corner`; nil → pinned to `corner` (the default).
+    var posX: Double?
+    var posY: Double?
 
-    init(enabled: Bool = true, corner: String = "bottomRight") {
+    init(enabled: Bool = true, corner: String = "bottomRight", posX: Double? = nil, posY: Double? = nil) {
         self.enabled = enabled
         self.corner = corner
+        self.posX = posX
+        self.posY = posY
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         corner = try c.decodeIfPresent(String.self, forKey: .corner) ?? "bottomRight"
+        posX = try c.decodeIfPresent(Double.self, forKey: .posX)
+        posY = try c.decodeIfPresent(Double.self, forKey: .posY)
     }
 }
 
