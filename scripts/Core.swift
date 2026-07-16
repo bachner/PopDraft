@@ -3773,17 +3773,32 @@ func isContextOverflowError(_ error: Error) -> Bool {
 /// budget is exhausted the server really is unreachable, and the original error
 /// still surfaces. Pure decision logic (no networking) — unit-tested standalone.
 enum LlamaLoadRetry {
-    /// Total time budget to keep retrying before giving up. Deliberately generous
-    /// — this window must cover a full server RESTART (bootout+bootstrap, kicked by
-    /// the caller when the socket is refused) PLUS a 30B+ model loading from disk.
+    /// Budget for the socket-REFUSED window (server process actually down, e.g. the
+    /// brief bootout→bootstrap gap on a model switch). Bounded, because a refused
+    /// socket can mean the server is genuinely dead — the caller kicks a one-time
+    /// restart and polls through this window before giving up.
     static let maxWaitSeconds: Double = 90
+    /// Budget for the HTTP-503 "loading model" window. MUCH more generous than the
+    /// refused budget because the server is PROVABLY alive (it bound the socket and
+    /// answered 503) and is loading weights: a cold 20GB+ model plus a large KV
+    /// cache (e.g. a 30B-A3B at 128K context) can take minutes to load, especially
+    /// under memory pressure. Capped so a genuinely stuck load still surfaces an
+    /// error eventually rather than hanging forever.
+    static let loadingWaitSeconds: Double = 300
     /// Fixed delay between retries.
     static let pollIntervalSeconds: Double = 1.5
 
-    /// Whether another attempt is worth making, given the time elapsed since the
-    /// FIRST attempt (not counting the one about to run).
+    /// Whether another attempt is worth making for the REFUSED-socket window, given
+    /// the time elapsed since the FIRST attempt (not counting the one about to run).
     static func shouldRetry(elapsed: Double) -> Bool {
         return elapsed < maxWaitSeconds
+    }
+
+    /// Whether to keep waiting through the 503 "still loading" window. Uses the far
+    /// larger `loadingWaitSeconds` budget so switching to a large local model no
+    /// longer surfaces a spurious `LLAMA_SERVER_DOWN` mid-load.
+    static func shouldKeepWaitingForLoad(elapsed: Double) -> Bool {
+        return elapsed < loadingWaitSeconds
     }
 }
 

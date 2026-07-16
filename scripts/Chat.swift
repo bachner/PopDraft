@@ -2841,7 +2841,15 @@ private extension View {
             // Return key is special; everything else passes through untouched.
             self.onKeyPress { press in
                 guard press.key == .return else { return .ignored }
-                if press.modifiers.contains(.shift) {
+                // `press.modifiers` does NOT reliably report Shift on recent macOS:
+                // the SwiftUI KeyPress can arrive with an empty modifier set even
+                // while Shift is physically held, so Shift+Return was falling through
+                // to submit() and SENDING instead of inserting a newline. Read the
+                // hardware modifier state directly from AppKit (reliable) and OR it
+                // with the KeyPress set as a belt-and-suspenders.
+                let shiftHeld = press.modifiers.contains(.shift)
+                    || NSEvent.modifierFlags.contains(.shift)
+                if shiftHeld {
                     newline()
                     return .handled
                 }
