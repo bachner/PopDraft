@@ -311,6 +311,18 @@ func runTests() async {
         check(LlamaLoadRetry.pollIntervalSeconds > 0, "poll interval is positive (no busy-loop)")
         check(LlamaLoadRetry.pollIntervalSeconds < LlamaLoadRetry.maxWaitSeconds,
               "poll interval is smaller than the total budget (retries actually happen more than once)")
+
+        // The 503 "still loading" window uses a SEPARATE, far larger budget so a
+        // cold large-model load isn't cut off as a spurious LLAMA_SERVER_DOWN.
+        check(LlamaLoadRetry.loadingWaitSeconds > LlamaLoadRetry.maxWaitSeconds,
+              "loading budget is larger than the refused-socket budget")
+        check(LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: 0), "keeps waiting immediately after the first 503")
+        check(LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: LlamaLoadRetry.maxWaitSeconds + 1),
+              "still waits past the refused budget while the model is provably loading")
+        check(LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: LlamaLoadRetry.loadingWaitSeconds - 0.1),
+              "keeps waiting just under the loading budget")
+        check(!LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: LlamaLoadRetry.loadingWaitSeconds),
+              "stops waiting once the loading budget is reached")
     }
 
     // ------------------------------------------------------------------------

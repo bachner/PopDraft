@@ -767,7 +767,9 @@ class LLMClient {
                 throw error
             }
             if let http = response as? HTTPURLResponse, http.statusCode == 503 {
-                if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                // 503 = vision server alive, still loading its weights — wait through
+                // the long loading budget rather than the short refused budget.
+                if LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: Date().timeIntervalSince(attemptStart)) {
                     try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
                     continue
                 }
@@ -881,7 +883,10 @@ class LLMClient {
                 throw error
             }
             if isLlamaCpp, let http = response as? HTTPURLResponse, http.statusCode == 503 {
-                if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
+                // 503 = server alive, model still loading. Wait through the LONG
+                // loading budget (a cold 20GB+ model can take minutes) rather than
+                // the short refused-socket budget.
+                if LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: Date().timeIntervalSince(attemptStart)) {
                     try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
                     continue
                 }
