@@ -1022,7 +1022,12 @@ struct DuckDuckGoProvider: SearchProvider {
         var lastError: Error?
         for endpoint in endpoints {
             guard var comps = URLComponents(string: endpoint) else { continue }
-            comps.queryItems = [URLQueryItem(name: "q", value: trimmed)]
+            // `kp=-1` forces DuckDuckGo safe search OFF (unfiltered results).
+            // Without it an anonymous request gets DDG's default (moderate) filter.
+            comps.queryItems = [
+                URLQueryItem(name: "q", value: trimmed),
+                URLQueryItem(name: "kp", value: "-1"),
+            ]
             guard let url = comps.url else { continue }
             var req = URLRequest(url: url)
             req.timeoutInterval = 12
@@ -2312,9 +2317,11 @@ final class WebEngine {
         let encoded = q.query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q.query
         // Engines to try in order. Each renders client-side, so a plain scrape
         // can't read them — but a real WKWebView can.
+        // Safe search OFF on both engines: DuckDuckGo `kp=-1`, Bing `adlt=off`
+        // (matches the image-search paths — unfiltered, all results).
         let serps = [
-            "https://duckduckgo.com/?q=\(encoded)&ia=web",
-            "https://www.bing.com/search?q=\(encoded)",
+            "https://duckduckgo.com/?q=\(encoded)&ia=web&kp=-1",
+            "https://www.bing.com/search?q=\(encoded)&adlt=off",
         ]
         for serp in serps {
             guard let url = URL(string: serp) else { continue }
