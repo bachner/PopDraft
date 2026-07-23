@@ -204,6 +204,22 @@ class VisionServerManager {
         return ok
     }
 
+    /// One-time teardown of the dedicated vision service: `see_image` now runs
+    /// on the ACTIVE model, so a resident :10820 VL server is pure RAM/boot cost
+    /// with zero consumers. Boots the launchd job out and removes its plist —
+    /// the model FILES under ~/.popdraft/models are the user's and stay put.
+    /// Idempotent (the plist is the marker: gone ⇒ already torn down). BLOCKS
+    /// (runs launchctl) — call off the main thread.
+    func teardown() {
+        guard FileManager.default.fileExists(atPath: Self.plistPath) else { return }
+        let out = Process(); out.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        out.arguments = ["bootout", "gui/\(getuid())/\(Self.launchLabel)"]
+        out.standardOutput = FileHandle.nullDevice
+        out.standardError = FileHandle.nullDevice
+        try? out.run(); out.waitUntilExit()
+        try? FileManager.default.removeItem(atPath: Self.plistPath)
+    }
+
     /// Start the dedicated vision llama-server if its model files exist and it
     /// isn't already serving. Idempotent + safe to call repeatedly. BLOCKS (writes
     /// the plist, runs launchctl) — call off the main thread.

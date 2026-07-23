@@ -11,9 +11,14 @@
 //     http URL → url source).
 //   - VisionSupport.modelSupportsVision per provider/model (true for gpt-4o /
 //     Claude Sonnet/Opus; FALSE for the default local 4B and gpt-3.5).
+//   - VisionSupport.parseOllamaCapabilities (`POST /api/show` capabilities array).
+//   - VisionSupport.parseLlamaProps (llama-server `GET /props` modalities.vision
+//     + model_path — the authoritative local gate).
+//   - VisionSupport.activeModelName + unsupportedModelMessage (names the model /
+//     provider and points at switching to a vision-capable model).
+//   - VisionContent.sniffBitmapType (magic bytes → passthrough media type vs
+//     rasterize; extensions/Content-Type can lie and are never trusted).
 //   - VisionSource.parse for local path / https URL / `screenshot:<url>` prefix.
-//   - The no-vision-model capability message is actionable (mentions gpt-4o,
-//     Claude Sonnet, Settings → Models, gemma-3n).
 //
 // Run via tests/run-tests.sh (staged as main.swift alongside Core.swift).
 
@@ -198,19 +203,95 @@ check(VisionSupport.modelSupportsVision(config: cfg("llamacpp", llama: "llava-1.
 // ollama
 check(!VisionSupport.modelSupportsVision(config: cfg("ollama", ollama: "qwen3.5:4b")), "ollama qwen3.5 → NO vision")
 check(VisionSupport.modelSupportsVision(config: cfg("ollama", ollama: "llava:13b")), "ollama llava → vision")
+check(VisionSupport.modelSupportsVision(config: cfg("ollama", ollama: "gemma4:31b")), "ollama gemma4 → vision (heuristic)")
+check(VisionSupport.modelSupportsVision(config: cfg("llamacpp", llama: "gemma-4-27b")), "llamacpp gemma-4 → vision (heuristic)")
+check(!VisionSupport.modelSupportsVision(config: cfg("ollama", ollama: "gpt-oss:120b")), "ollama gpt-oss → NO vision (heuristic)")
 // unknown provider
 check(!VisionSupport.modelSupportsVision(config: cfg("mystery")), "unknown provider → NO vision")
 
-// ---- No-vision-model message is actionable ----
-section("VisionSupport.noVisionModelMessage actionable")
+// ---- Ollama /api/show capabilities parsing ----
+section("VisionSupport.parseOllamaCapabilities")
 do {
-    let msg = VisionSupport.noVisionModelMessage()
-    check(msg.contains("gpt-4o"), "message names gpt-4o")
-    check(msg.contains("Sonnet"), "message names Claude Sonnet")
+    let vision = #"{"capabilities":["completion","thinking","tools","vision"],"details":{}}"#
+    check(VisionSupport.parseOllamaCapabilities(Data(vision.utf8)) == ["completion", "thinking", "tools", "vision"],
+          "capabilities array parsed (vision present)")
+    check(VisionSupport.parseOllamaCapabilities(Data(vision.utf8))?.contains("vision") == true,
+          "vision capability detected")
+    let noVision = #"{"capabilities":["completion","tools"]}"#
+    check(VisionSupport.parseOllamaCapabilities(Data(noVision.utf8))?.contains("vision") == false,
+          "no-vision capabilities parsed (vision absent)")
+    let missing = #"{"details":{"family":"x"}}"#
+    check(VisionSupport.parseOllamaCapabilities(Data(missing.utf8)) == nil,
+          "missing capabilities key → nil (caller falls back to heuristic)")
+    check(VisionSupport.parseOllamaCapabilities(Data("not json".utf8)) == nil,
+          "malformed body → nil")
+    let wrongType = #"{"capabilities":"vision"}"#
+    check(VisionSupport.parseOllamaCapabilities(Data(wrongType.utf8)) == nil,
+          "non-array capabilities → nil")
+}
+
+// ---- llama-server /props parsing (authoritative local vision gate) ----
+section("VisionSupport.parseLlamaProps")
+do {
+    let seeing = #"{"modalities":{"vision":true,"video":true,"audio":false},"model_path":"/x/models/Qwen3.5-0.8B-Q4_K_M.gguf"}"#
+    let p1 = VisionSupport.parseLlamaProps(Data(seeing.utf8))
+    check(p1?.vision == true, "vision:true parsed")
+    check(p1?.modelPath == "/x/models/Qwen3.5-0.8B-Q4_K_M.gguf", "model_path parsed")
+    let blind = #"{"modalities":{"vision":false,"video":false,"audio":false}}"#
+    let p2 = VisionSupport.parseLlamaProps(Data(blind.utf8))
+    check(p2?.vision == false, "vision:false parsed (no --mmproj loaded)")
+    check(p2?.modelPath == nil, "missing model_path → nil path, probe still answers")
+    let noModalities = #"{"default_generation_settings":{}}"#
+    check(VisionSupport.parseLlamaProps(Data(noModalities.utf8)) == nil,
+          "missing modalities → nil (caller falls back to heuristic)")
+    check(VisionSupport.parseLlamaProps(Data("not json".utf8)) == nil, "malformed body → nil")
+    let wrongShape = #"{"modalities":{"vision":"yes"}}"#
+    check(VisionSupport.parseLlamaProps(Data(wrongShape.utf8)) == nil, "non-bool vision → nil")
+}
+
+// ---- Active model name (mirrors the provider switch) ----
+section("VisionSupport.activeModelName")
+check(VisionSupport.activeModelName(config: cfg("openai", openai: "gpt-4o")) == "gpt-4o", "openai → openaiModel")
+check(VisionSupport.activeModelName(config: cfg("claude")) == "claude-sonnet-4-5-20250514", "claude → claudeModel")
+check(VisionSupport.activeModelName(config: cfg("llamacpp")) == "qwen3.5-4b", "llamacpp → llamaModel")
+check(VisionSupport.activeModelName(config: cfg("ollama", ollama: "gpt-oss:120b")) == "gpt-oss:120b", "ollama → ollamaModel")
+
+// ---- Unsupported-model message explains the failure + the fix ----
+section("VisionSupport.unsupportedModelMessage actionable")
+do {
+    let msg = VisionSupport.unsupportedModelMessage(model: "gpt-oss:120b", provider: "ollama")
+    check(msg.contains("gpt-oss:120b"), "message names the active model")
+    check(msg.contains("Ollama"), "message names the provider")
+    check(msg.lowercased().contains("vision"), "message says it's about vision support")
+    check(msg.contains("NOT analyzed"), "message states the image was NOT analyzed")
     check(msg.contains("Settings → Models"), "message points at Settings → Models")
-    check(msg.lowercased().contains("gemma-3n"), "message names a local multimodal option (gemma-3n)")
-    check(!msg.lowercased().contains("can't") || msg.lowercased().contains("can capture"),
-          "message is not a flat refusal (offers a path)")
+    check(msg.contains("gpt-4o"), "message offers a concrete vision-capable model")
+    let local = VisionSupport.unsupportedModelMessage(model: "qwen3.5-4b", provider: "llamacpp")
+    check(local.contains("qwen3.5-4b") && local.contains("llama.cpp"), "local variant names model + provider")
+}
+
+// ---- Bitmap passthrough vs rasterize decision (magic-byte sniffing) ----
+section("VisionContent.sniffBitmapType")
+do {
+    let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0])
+    check(VisionContent.sniffBitmapType(png) == "image/png", "PNG magic → image/png")
+    let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46])
+    check(VisionContent.sniffBitmapType(jpeg) == "image/jpeg", "JPEG magic → image/jpeg")
+    check(VisionContent.sniffBitmapType(Data("GIF87a....".utf8)) == "image/gif", "GIF87a → image/gif")
+    check(VisionContent.sniffBitmapType(Data("GIF89a....".utf8)) == "image/gif", "GIF89a → image/gif")
+    check(VisionContent.sniffBitmapType(Data("RIFF\u{04}\u{00}\u{00}\u{00}WEBPVP8 ".utf8)) == "image/webp",
+          "RIFF....WEBP → image/webp")
+    check(VisionContent.sniffBitmapType(Data("RIFF\u{04}\u{00}\u{00}\u{00}WAVEfmt ".utf8)) == nil,
+          "RIFF non-WEBP (wav) → nil")
+    check(VisionContent.sniffBitmapType(Data("<svg xmlns=\"…\"></svg>".utf8)) == nil,
+          "SVG bytes → nil (rasterize) — even if the filename claims .png")
+    check(VisionContent.sniffBitmapType(Data("%PDF-1.7".utf8)) == nil, "PDF bytes → nil (rasterize)")
+    check(VisionContent.sniffBitmapType(Data([0x89, 0x50])) == nil, "truncated header → nil")
+    check(VisionContent.sniffBitmapType(Data()) == nil, "empty data → nil")
+    // Slice with a non-zero start index must sniff identically (Data slices
+    // keep their parent's indices; the sniffer must not assume base 0).
+    let padded = Data([0x00]) + png
+    check(VisionContent.sniffBitmapType(padded[1...]) == "image/png", "non-zero-based slice sniffs correctly")
 }
 
 // ---- see_image source parsing ----
