@@ -88,9 +88,7 @@ struct SettingsView: View {
     @State private var ollamaEnableThinking: Bool = false
     @State private var llamacppEnableThinking: Bool = false
     @State private var availableOllamaModels: [String] = []
-    @State private var isLoading = false
-    @State private var customOpenAIModel: String = ""
-    @State private var customClaudeModel: String = ""
+    @State private var ollamaAPIKey: String = ""
     @State private var ttsVoice: String = "auto"
     @State private var ttsSpeed: Double = 1.0
     @State private var voiceSearchText: String = ""
@@ -132,14 +130,16 @@ struct SettingsView: View {
     @State private var hfDebounceTask: Task<Void, Never>? = nil
     @State private var userModels: [ModelRef] = []
 
-    // PR3: Models tab — cloud key validation
-    @State private var cloudProvider: CloudProvider = .openai
-    @State private var cloudKey: String = ""
-    @State private var cloudValidating: Bool = false
-    @State private var cloudValidation: KeyValidation? = nil
-    @State private var cloudSelectedModel: String = ""
+    // Inline per-provider key validation. Each visible key field validates its
+    // OWN provider so switching panes never shows another key's chip/models.
+    @State private var keyValidating: Set<CloudProvider> = []
+    @State private var keyValidation: [CloudProvider: KeyValidation] = [:]
+    @State private var keyDebounceTasks: [CloudProvider: Task<Void, Never>] = [:]
     @State private var providerKeys: [String: String] = [:]
-    @State private var cloudDebounceTask: Task<Void, Never>? = nil
+    // Agent-mode-only providers (Gemini/OpenRouter): model text lives here, keyed
+    // by CloudProvider rawValue — there is no config field for them, only userModels.
+    @State private var otherModelText: [String: String] = [:]
+    @State private var otherKeysExpanded: Bool = false
     let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
@@ -744,9 +744,7 @@ struct SettingsView: View {
                 Text("Active Provider")
                     .font(.system(size: 12, weight: .medium))
                 Picker("", selection: $selectedProvider) {
-                    // Ollama removed from the provider list (llama.cpp / OpenAI /
-                    // Claude only). The enum case stays for config back-compat.
-                    ForEach(LLMConfig.Provider.allCases.filter { $0 != .ollama }, id: \.self) { provider in
+                    ForEach(LLMConfig.Provider.allCases, id: \.self) { provider in
                         Text(provider.displayName).tag(provider)
                     }
                 }
@@ -769,13 +767,12 @@ struct SettingsView: View {
                     ollamaSettings
                 case .openai:
                     openaiSettings
-                    Divider()
-                    cloudModelSection
                 case .claude:
                     claudeSettings
-                    Divider()
-                    cloudModelSection
                 }
+
+                Divider()
+                otherKeysSection
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
@@ -982,94 +979,146 @@ struct SettingsView: View {
         return q + size
     }
 
-    // MARK: - Cloud model section (provider key validation)
+    // MARK: - Inline key validation (per-provider chip + model suggestions)
 
-    private var cloudModelSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Validate your API key")
-                .font(.system(size: 12, weight: .semibold))
+    /// Spinner / valid / invalid chip shown directly under a provider's key field.
+    @ViewBuilder
+    private func keyValidationChip(_ provider: CloudProvider) -> some View {
+        if keyValidating.contains(provider) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small).scaleEffect(0.7)
+                Text("Validating key…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+        } else if let v = keyValidation[provider] {
+            HStack(spacing: 6) {
+                Image(systemName: v.isValid ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .foregroundColor(v.isValid ? .green : .red)
+                    .font(.system(size: 12))
+                Text(v.isValid ? "Key valid · \(v.models.count) models available" : "Key invalid\(v.error.map { " (\($0))" } ?? "")")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+        }
+    }
 
-            Picker("", selection: $cloudProvider) {
-                ForEach(CloudProvider.allCases, id: \.self) { p in
-                    Text(p.displayName).tag(p)
+    /// Clickable model suggestions under a free-text model field: live-validated
+    /// ids from the provider's `/v1/models` (never a hardcoded catalog), plus
+    /// user-validated entries and `extra` (e.g. local Ollama tags). Clicking a row
+    /// sets the field AND records the model in userModels; free-typed text just
+    /// saves to config.
+    ///
+    /// `localOnly` (Ollama pane with no key): suggestions are the local daemon's
+    /// tags ONLY and clicks are NOT recorded — userModels source "cloud" must
+    /// hold names that exist on ollama.com, or the in-chat chooser would offer
+    /// local-only tags against the cloud endpoint (and vice versa).
+    @ViewBuilder
+    private func modelSuggestions(_ provider: CloudProvider, text: Binding<String>, extra: [String] = [], localOnly: Bool = false) -> some View {
+        let hits = modelSuggestionHits(provider, current: text.wrappedValue, extra: extra, localOnly: localOnly)
+        if !hits.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Available models — click to select")
+                    .font(.system(size: 10, weight: .medium)).foregroundColor(.secondary)
+                ForEach(hits, id: \.self) { id in
+                    Button {
+                        text.wrappedValue = id
+                        if !localOnly { recordCloudModel(provider, modelId: id) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "cube.box")
+                                .font(.system(size: 10)).foregroundColor(.accentColor)
+                            Text(id)
+                                .font(.system(size: 11, design: .monospaced)).lineLimit(1)
+                            Spacer(minLength: 8)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 2)
                 }
             }
-            .pickerStyle(.segmented)
-            .onChange(of: cloudProvider) { _, _ in
-                cloudValidation = nil
-                cloudKey = providerKeys[cloudProvider.rawValue] ?? currentKeyForActiveProvider()
-            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.06)))
+        }
+    }
 
-            SecureField("API key", text: $cloudKey)
+    /// Suggestion ids for a model field, filtered by the current text
+    /// (case-insensitive substring; empty text lists all), deduped, capped at 8.
+    /// Hidden once the text exactly matches the only remaining hit.
+    private func modelSuggestionHits(_ provider: CloudProvider, current: String, extra: [String], localOnly: Bool = false) -> [String] {
+        var ids: [String] = []
+        if !localOnly {
+            ids = keyValidation[provider]?.models ?? []
+            let slot = modelStorageSlot(provider)
+            for m in userModels where m.provider == slot && m.source == "cloud" && !ids.contains(m.name) {
+                ids.append(m.name)
+            }
+        }
+        for e in extra where !ids.contains(e) { ids.append(e) }
+        let needle = current.trimmingCharacters(in: .whitespaces)
+        let filtered = needle.isEmpty ? ids : ids.filter { $0.localizedCaseInsensitiveContains(needle) }
+        if filtered == [needle] { return [] }
+        return Array(filtered.prefix(8))
+    }
+
+    // MARK: - Other API keys (agent-mode providers)
+
+    /// Gemini / OpenRouter keys: validated + stored (providerKeys/userModels) for
+    /// Agent mode, but they can't be the active single-shot provider. OpenAI /
+    /// Anthropic / Ollama validate inline in their own panes above.
+    private var otherKeysSection: some View {
+        DisclosureGroup(isExpanded: $otherKeysExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                otherKeyRow(.gemini)
+                otherKeyRow(.openrouter)
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Other API keys")
+                .font(.system(size: 12, weight: .semibold))
+        }
+    }
+
+    @ViewBuilder
+    private func otherKeyRow(_ provider: CloudProvider) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(provider.displayName)
+                .font(.system(size: 12, weight: .medium))
+            SecureField("API key", text: otherKeyBinding(provider))
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12))
-                .onChange(of: cloudKey) { _, newValue in
-                    scheduleCloudValidation(newValue)
+            keyValidationChip(provider)
+            TextField("Model (free text)", text: otherModelBinding(provider))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+                .onSubmit {
+                    recordCloudModel(provider, modelId: otherModelText[provider.rawValue] ?? "")
                 }
-
-            // Live chip
-            if cloudValidating {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small).scaleEffect(0.7)
-                    Text("Validating key…")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-            } else if let v = cloudValidation {
-                HStack(spacing: 6) {
-                    Image(systemName: v.isValid ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundColor(v.isValid ? .green : .red)
-                        .font(.system(size: 12))
-                    Text(v.isValid ? "Key valid · \(v.models.count) models available" : "Key invalid\(v.error.map { " (\($0))" } ?? "")")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .lineLimit(2)
-                }
-            }
-
-            // Model picker from returned ids
-            if let v = cloudValidation, v.isValid, !v.models.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model")
-                        .font(.system(size: 11, weight: .medium))
-                    Picker("", selection: $cloudSelectedModel) {
-                        ForEach(v.models, id: \.self) { id in
-                            Text(id).tag(id)
-                        }
-                    }
-                    .labelsHidden()
-                    if cloudProviderCanBeActive {
-                        Text("Selecting a model here sets it as the active model for \(cloudProvider.displayName).")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    } else {
-                        Text("\(cloudProvider.displayName) is saved for use in Agent mode (coming soon) — it can't be the active single-shot model yet.")
-                            .font(.system(size: 10))
-                            .foregroundColor(.orange)
-                    }
-                }
-                .onChange(of: cloudSelectedModel) { _, newValue in
-                    applyCloudModelSelection(newValue)
-                }
-            }
+            modelSuggestions(provider, text: otherModelBinding(provider))
+            Text("\(provider.displayName) is saved for use in Agent mode (coming soon) — it can't be the active single-shot model yet.")
+                .font(.system(size: 10))
+                .foregroundColor(.orange)
         }
     }
 
-    /// PR3 only routes single-shot generation to OpenAI (api.openai.com) and Anthropic.
-    /// Gemini/OpenRouter keys are validated + stored, but can't be the ACTIVE model yet
-    /// (full routing arrives in PR7). This guards against clobbering the OpenAI config.
-    private var cloudProviderCanBeActive: Bool {
-        cloudProvider == .openai || cloudProvider == .anthropic
+    /// Binds a Gemini/OpenRouter key field straight to its providerKeys slot,
+    /// scheduling validation on every edit.
+    private func otherKeyBinding(_ provider: CloudProvider) -> Binding<String> {
+        Binding(
+            get: { providerKeys[provider.rawValue] ?? "" },
+            set: { newValue in
+                providerKeys[provider.rawValue] = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                scheduleKeyValidation(provider, key: newValue)
+            })
     }
 
-    /// The key currently in the active-provider config field, used as a sensible default.
-    /// Only OpenAI/Anthropic mirror to real config; others read from providerKeys only.
-    private func currentKeyForActiveProvider() -> String {
-        switch cloudProvider {
-        case .openai: return openaiAPIKey
-        case .anthropic: return claudeAPIKey
-        case .gemini, .openrouter: return providerKeys[cloudProvider.rawValue] ?? ""
-        }
+    private func otherModelBinding(_ provider: CloudProvider) -> Binding<String> {
+        Binding(
+            get: { otherModelText[provider.rawValue] ?? "" },
+            set: { otherModelText[provider.rawValue] = $0 })
     }
 
     // MARK: - TTS Settings Tab
@@ -1527,99 +1576,101 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - PR3: Cloud key validation
+    // MARK: - Cloud key validation (inline, per-provider)
 
-    /// Debounced (~500ms) validation of the cloud API key.
-    private func scheduleCloudValidation(_ raw: String) {
-        cloudDebounceTask?.cancel()
+    /// Debounced (~500ms) validation of a provider API key against its live
+    /// model-list endpoint. State is keyed by provider so every visible key
+    /// field validates independently.
+    private func scheduleKeyValidation(_ provider: CloudProvider, key raw: String) {
+        keyDebounceTasks[provider]?.cancel()
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Always store the key under its own provider slot.
-        providerKeys[cloudProvider.rawValue] = key
-        // Only OpenAI/Anthropic mirror into the real config fields used by the
-        // single-shot path. Gemini/OpenRouter must NEVER overwrite the OpenAI key
-        // (PR3 routes single-shot only to api.openai.com / api.anthropic.com).
-        switch cloudProvider {
-        case .openai: openaiAPIKey = key
-        case .anthropic: claudeAPIKey = key
-        case .gemini, .openrouter: break
-        }
         guard key.count >= 8 else {
-            cloudValidating = false
-            cloudValidation = nil
+            keyValidating.remove(provider)
+            keyValidation[provider] = nil
             return
         }
-        cloudValidating = true
-        let provider = cloudProvider
-        cloudDebounceTask = Task { [key, provider] in
+        keyValidating.insert(provider)
+        keyDebounceTasks[provider] = Task { [key] in
             try? await Task.sleep(nanoseconds: 500_000_000)
             if Task.isCancelled { return }
             let result = await ModelValidator.validateCloudKey(provider: provider, key: key)
             if Task.isCancelled { return }
             await MainActor.run {
-                cloudValidating = false
-                cloudValidation = result
-                if result.isValid, cloudSelectedModel.isEmpty, let first = result.models.first {
-                    cloudSelectedModel = first
-                }
+                keyValidating.remove(provider)
+                keyValidation[provider] = result
             }
         }
     }
 
-    /// Apply the user's cloud model selection. Only OpenAI/Anthropic become the ACTIVE
-    /// single-shot model; Gemini/OpenRouter are only recorded in userModels (for PR7).
-    private func applyCloudModelSelection(_ modelId: String) {
-        guard !modelId.isEmpty else { return }
-        switch cloudProvider {
-        case .openai:
-            openaiModel = modelId
-            customOpenAIModel = modelId
-        case .anthropic:
-            claudeModel = modelId
-            customClaudeModel = modelId
-        case .gemini, .openrouter:
-            // Do NOT touch openaiModel/claudeModel — those drive the live request path.
-            break
+    /// userModels storage slot for a provider: active-capable providers store
+    /// under their LLMConfig rawValue; agent-mode-only keys (Gemini/OpenRouter)
+    /// under their own name so they can't collide with the OpenAI slot.
+    private func modelStorageSlot(_ provider: CloudProvider) -> String {
+        switch provider {
+        case .openai, .anthropic, .ollama: return provider.llmProviderRawValue
+        case .gemini, .openrouter: return provider.rawValue
         }
-        // Record under the provider's own slot (gemini/openrouter use their own rawValue).
-        let provider = cloudProviderCanBeActive ? cloudProvider.llmProviderRawValue : cloudProvider.rawValue
-        let ref = ModelRef(provider: provider, name: modelId, quant: nil, source: "cloud")
-        if !userModels.contains(where: { $0.name == ref.name && $0.provider == ref.provider && $0.source == "cloud" }) {
-            userModels.append(ref)
-        }
+    }
+
+    /// Record a picked model in userModels (source "cloud") so it survives as a
+    /// suggestion and shows in the in-chat model chooser. Most-recent-LAST:
+    /// `loadCurrentConfig` prefills Gemini/OpenRouter from `.last(where:)`, so a
+    /// re-picked model must move to the end, not stay where it first landed.
+    private func recordCloudModel(_ provider: CloudProvider, modelId: String) {
+        let id = modelId.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return }
+        let ref = ModelRef(provider: modelStorageSlot(provider), name: id, quant: nil, source: "cloud")
+        userModels.removeAll { $0.name == ref.name && $0.provider == ref.provider && $0.source == "cloud" }
+        userModels.append(ref)
+    }
+
+    /// True when a key is set — requests go to Ollama Cloud (https://ollama.com)
+    /// instead of the local daemon.
+    private var usingOllamaCloud: Bool {
+        !ollamaAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var ollamaSettings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if isLoading {
-                ProgressView("Loading models...")
-            } else {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model")
-                        .font(.system(size: 12, weight: .medium))
-                    if availableOllamaModels.isEmpty {
-                        TextField("e.g., qwen3.5:4b", text: $ollamaModel)
-                            .textFieldStyle(.roundedBorder)
-                    } else {
-                        Picker("", selection: $ollamaModel) {
-                            ForEach(availableOllamaModels, id: \.self) { model in
-                                Text(model).tag(model)
-                            }
-                        }
-                        .labelsHidden()
+            VStack(alignment: .leading, spacing: 4) {
+                Text("API Key")
+                    .font(.system(size: 12, weight: .medium))
+                SecureField("Optional — for Ollama Cloud", text: $ollamaAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: ollamaAPIKey) { _, newValue in
+                        // The key's store is config.ollamaAPIKey — no providerKeys
+                        // mirror (nothing reads that slot; it would just duplicate
+                        // the secret in config.json).
+                        scheduleKeyValidation(.ollama, key: newValue)
+                        if !usingOllamaCloud { fetchOllamaModels() }
                     }
-                }
-
-                Text("If Ollama fails, PopDraft will fall back to llama.cpp")
+                keyValidationChip(.ollama)
+                Text("With a key (ollama.com → Settings → API keys) PopDraft uses Ollama Cloud. Leave empty for local Ollama at http://localhost:11434.")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Enable Thinking", isOn: $ollamaEnableThinking)
-                        .font(.system(size: 12, weight: .medium))
-                    Text("Enable reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Model")
+                    .font(.system(size: 12, weight: .medium))
+                TextField(usingOllamaCloud ? "e.g. gpt-oss:120b" : "e.g. qwen3.5:4b", text: $ollamaModel)
+                    .textFieldStyle(.roundedBorder)
+                modelSuggestions(.ollama, text: $ollamaModel,
+                                 extra: usingOllamaCloud ? [] : availableOllamaModels,
+                                 localOnly: !usingOllamaCloud)
+            }
+
+            Text("If Ollama is unreachable, PopDraft falls back to the local llama.cpp model")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Enable Thinking", isOn: $ollamaEnableThinking)
+                    .font(.system(size: 12, weight: .medium))
+                Text("Enable reasoning from thinking models (e.g., DeepSeek-R1, QwQ)")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
             }
         }
     }
@@ -1631,6 +1682,11 @@ struct SettingsView: View {
                     .font(.system(size: 12, weight: .medium))
                 SecureField("sk-...", text: $openaiAPIKey)
                     .textFieldStyle(.roundedBorder)
+                    .onChange(of: openaiAPIKey) { _, newValue in
+                        providerKeys["openai"] = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        scheduleKeyValidation(.openai, key: newValue)
+                    }
+                keyValidationChip(.openai)
                 Text("Get your API key from platform.openai.com")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
@@ -1639,36 +1695,11 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Model")
                     .font(.system(size: 12, weight: .medium))
-                Picker("", selection: $openaiModel) {
-                    ForEach(openaiModelOptions, id: \.self) { model in
-                        Text(model).tag(model)
-                    }
-                }
-                .labelsHidden()
-
-                if openaiModel == "Custom..." {
-                    TextField("Enter model name", text: $customOpenAIModel)
-                        .textFieldStyle(.roundedBorder)
-                }
+                TextField("e.g. gpt-4o", text: $openaiModel)
+                    .textFieldStyle(.roundedBorder)
+                modelSuggestions(.openai, text: $openaiModel)
             }
         }
-    }
-
-    /// Picker options for OpenAI: user-validated models first (source of truth),
-    /// then the small suggestion list as a fallback, plus "Custom...".
-    private var openaiModelOptions: [String] {
-        var ids = userModels.filter { $0.provider == "openai" && $0.source == "cloud" }.map { $0.name }
-        for s in LLMConfig.openaiModels where !ids.contains(s) { ids.append(s) }
-        if !ids.contains("Custom...") { ids.append("Custom...") }
-        return ids
-    }
-
-    /// Picker options for Claude/Anthropic: user-validated models first, then suggestions.
-    private var claudeModelOptions: [String] {
-        var ids = userModels.filter { $0.provider == "claude" && $0.source == "cloud" }.map { $0.name }
-        for s in LLMConfig.claudeModels where !ids.contains(s) { ids.append(s) }
-        if !ids.contains("Custom...") { ids.append("Custom...") }
-        return ids
     }
 
     private var claudeSettings: some View {
@@ -1678,6 +1709,11 @@ struct SettingsView: View {
                     .font(.system(size: 12, weight: .medium))
                 SecureField("sk-ant-...", text: $claudeAPIKey)
                     .textFieldStyle(.roundedBorder)
+                    .onChange(of: claudeAPIKey) { _, newValue in
+                        providerKeys["anthropic"] = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        scheduleKeyValidation(.anthropic, key: newValue)
+                    }
+                keyValidationChip(.anthropic)
                 Text("Get your API key from console.anthropic.com")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
@@ -1686,17 +1722,9 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Model")
                     .font(.system(size: 12, weight: .medium))
-                Picker("", selection: $claudeModel) {
-                    ForEach(claudeModelOptions, id: \.self) { model in
-                        Text(model).tag(model)
-                    }
-                }
-                .labelsHidden()
-
-                if claudeModel == "Custom..." {
-                    TextField("Enter model name", text: $customClaudeModel)
-                        .textFieldStyle(.roundedBorder)
-                }
+                TextField("e.g. claude-sonnet-4-5", text: $claudeModel)
+                    .textFieldStyle(.roundedBorder)
+                modelSuggestions(.anthropic, text: $claudeModel)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -1730,21 +1758,11 @@ struct SettingsView: View {
         selectedProvider = config.provider
         selectedLlamaModel = LLMConfig.llamaModels.contains(where: { $0.id == config.llamaModel }) ? config.llamaModel : LLMConfig.llamaModels.first?.id ?? "qwen3.5-2b"
         ollamaModel = config.ollamaModel
+        ollamaAPIKey = config.ollamaAPIKey
         openaiAPIKey = config.openaiAPIKey
-        // A saved model resolves to itself if it's a known suggestion OR a user-validated model.
-        let knownOpenAI = LLMConfig.openaiModels.contains(config.openaiModel) ||
-            userModels.contains { $0.provider == "openai" && $0.source == "cloud" && $0.name == config.openaiModel }
-        openaiModel = knownOpenAI ? config.openaiModel : "Custom..."
-        if openaiModel == "Custom..." {
-            customOpenAIModel = config.openaiModel
-        }
+        openaiModel = config.openaiModel
         claudeAPIKey = config.claudeAPIKey
-        let knownClaude = LLMConfig.claudeModels.contains(config.claudeModel) ||
-            userModels.contains { $0.provider == "claude" && $0.source == "cloud" && $0.name == config.claudeModel }
-        claudeModel = knownClaude ? config.claudeModel : "Custom..."
-        if claudeModel == "Custom..." {
-            customClaudeModel = config.claudeModel
-        }
+        claudeModel = config.claudeModel
         claudeExtendedThinking = config.claudeExtendedThinking
         claudeThinkingBudget = Double(config.claudeThinkingBudget)
         ollamaEnableThinking = config.ollamaEnableThinking
@@ -1763,27 +1781,28 @@ struct SettingsView: View {
         customPromptShortcut = ActionManager.shared.customPromptShortcut
         customPromptEnabled = ActionManager.shared.customPromptEnabled
 
-        // PR3: default the cloud panel to match the active provider, prefilling its key.
-        switch config.provider {
-        case .claude:
-            cloudProvider = .anthropic
-            cloudKey = providerKeys["anthropic"] ?? config.claudeAPIKey
-        default:
-            cloudProvider = .openai
-            cloudKey = providerKeys["openai"] ?? config.openaiAPIKey
+        // Prefill the agent-mode model fields from their recorded userModels entry.
+        for p in [CloudProvider.gemini, .openrouter] {
+            otherModelText[p.rawValue] = userModels.last(where: { $0.provider == p.rawValue && $0.source == "cloud" })?.name ?? ""
         }
+
+        // Validate any keys already present so panes show live model suggestions
+        // immediately (cheap /v1/models probes; short/empty keys no-op).
+        scheduleKeyValidation(.openai, key: openaiAPIKey)
+        scheduleKeyValidation(.anthropic, key: claudeAPIKey)
+        scheduleKeyValidation(.ollama, key: ollamaAPIKey)
+        scheduleKeyValidation(.gemini, key: providerKeys["gemini"] ?? "")
+        scheduleKeyValidation(.openrouter, key: providerKeys["openrouter"] ?? "")
     }
 
     private func fetchOllamaModels() {
-        isLoading = true
-        guard let url = URL(string: "http://localhost:11434/api/tags") else {
-            isLoading = false
-            return
-        }
+        // Cloud mode: suggestions come from the key validation (/v1/models);
+        // the local /api/tags probe would just error against no daemon.
+        guard !usingOllamaCloud else { return }
+        guard let url = URL(string: "http://localhost:11434/api/tags") else { return }
 
         URLSession.shared.dataTask(with: url) { data, _, _ in
             DispatchQueue.main.async {
-                isLoading = false
                 guard let data = data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let models = json["models"] as? [[String: Any]] else {
@@ -1800,14 +1819,21 @@ struct SettingsView: View {
     }
 
     private func saveSettings() {
+        // Free-typed Gemini/OpenRouter model text has no config field — userModels
+        // is its only store, so Save must record it (onSubmit alone would lose the
+        // text when the user clicks Save without pressing Return).
+        for p in [CloudProvider.gemini, .openrouter] {
+            recordCloudModel(p, modelId: otherModelText[p.rawValue] ?? "")
+        }
         var config = LLMConfig()
         config.provider = selectedProvider
         config.llamaModel = selectedLlamaModel
-        config.ollamaModel = ollamaModel
+        config.ollamaModel = ollamaModel.trimmingCharacters(in: .whitespaces)
+        config.ollamaAPIKey = ollamaAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         config.openaiAPIKey = openaiAPIKey
-        config.openaiModel = openaiModel == "Custom..." ? customOpenAIModel : openaiModel
+        config.openaiModel = openaiModel.trimmingCharacters(in: .whitespaces)
         config.claudeAPIKey = claudeAPIKey
-        config.claudeModel = claudeModel == "Custom..." ? customClaudeModel : claudeModel
+        config.claudeModel = claudeModel.trimmingCharacters(in: .whitespaces)
         config.claudeExtendedThinking = claudeExtendedThinking
         config.claudeThinkingBudget = Int(claudeThinkingBudget)
         config.ollamaEnableThinking = ollamaEnableThinking

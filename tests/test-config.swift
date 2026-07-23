@@ -53,6 +53,7 @@ LLAMACPP_URL=http://localhost:9999/v1?token=abc=def
 LLAMA_MODEL=qwen3.5-7b
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:8b
+OLLAMA_API_KEY=ok-cloud-789
 OPENAI_API_KEY=sk-openai-123
 OPENAI_MODEL=gpt-4.1
 CLAUDE_API_KEY=sk-ant-456
@@ -80,6 +81,7 @@ test("Legacy plaintext migration - every field maps correctly") {
     assert(c.llamaModel == "qwen3.5-7b", "llamaModel")
     assert(c.ollamaURL == "http://localhost:11434", "ollamaURL")
     assert(c.ollamaModel == "llama3.2:8b", "ollamaModel")
+    assert(c.ollamaAPIKey == "ok-cloud-789", "ollamaAPIKey")
     assert(c.openaiAPIKey == "sk-openai-123", "openaiAPIKey")
     assert(c.openaiModel == "gpt-4.1", "openaiModel")
     assert(c.claudeAPIKey == "sk-ant-456", "claudeAPIKey")
@@ -126,6 +128,7 @@ test("JSON round-trip save -> load is stable") {
 
     let loaded = AppConfig.load(dir: dir)
     assert(loaded == original, "round-tripped config should equal the original")
+    assert(loaded.ollamaAPIKey == "ok-cloud-789", "ollamaAPIKey survives round-trip")
     assert(loaded.userModels.first?.quant == "Q4_K_M", "userModels survive round-trip")
     assert(loaded.agentSettings.maxIterations == 9, "agentSettings survive round-trip")
     assert(loaded.agentSettings.autoApproveAll == true, "agentSettings.autoApproveAll survives round-trip")
@@ -145,6 +148,7 @@ test("New fields default when absent from JSON") {
     assert(c.provider == "openai", "present field loaded")
     assert(c.openaiModel == "gpt-4o-mini", "present field loaded")
     // New forward-looking fields get sane defaults.
+    assert(c.ollamaAPIKey.isEmpty, "ollamaAPIKey defaults to empty")
     assert(c.userModels.isEmpty, "userModels defaults to empty")
     assert(c.providerKeys.isEmpty, "providerKeys defaults to empty")
     assert(c.agentSettings.maxIterations == 12, "agentSettings.maxIterations defaults to 12")
@@ -225,6 +229,18 @@ test("Stub-only (no plaintext): provider comes from the JSON stub") {
     let c = AppConfig.load(dir: dir)
     assert(c.provider == "claude", "stub provider used when no plaintext, got \(c.provider)")
     assert(c.openaiModel == "gpt-4o", "absent keys keep defaults")
+}
+
+test("Legacy JSON stub overlays ollamaAPIKey") {
+    let dir = createTempDir()
+    defer { cleanup(dir) }
+
+    // A pre-v2 stub carrying the Ollama Cloud key must apply it.
+    write(#"{"provider":"ollama","ollamaAPIKey":"ok-stub-1"}"#, to: dir, named: "config.json")
+
+    let c = AppConfig.load(dir: dir)
+    assert(c.provider == "ollama", "stub provider used")
+    assert(c.ollamaAPIKey == "ok-stub-1", "stub ollamaAPIKey applied, got \(c.ollamaAPIKey)")
 }
 
 test("Load with empty dir returns defaults") {

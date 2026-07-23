@@ -160,6 +160,10 @@ class LLMClient {
     // Check if a local backend is available
     private func isLocalBackendAvailable(_ provider: LLMConfig.Provider) -> Bool {
         guard provider == .llamacpp || provider == .ollama else { return true }
+        // Ollama with an API key set is the CLOUD service (ollama.com) — nothing
+        // local to probe; reachability surfaces as a normal request error (with
+        // the usual llama.cpp fallback).
+        if provider == .ollama && !config.ollamaAPIKey.isEmpty { return true }
 
         let urlString = provider == .llamacpp
             ? "\(config.llamacppURL)/health"
@@ -188,6 +192,13 @@ class LLMClient {
         Logger.shared.log(message)
     }
 
+    /// Provider id for `ContextBudget`: Ollama with an API key set is the CLOUD
+    /// service (ollama.com), whose window must not fall back to the local-Ollama
+    /// default budget.
+    static func budgetProviderId(provider: String, ollamaAPIKey: String) -> String {
+        (provider == "ollama" && !ollamaAPIKey.isEmpty) ? "ollama-cloud" : provider
+    }
+
     func generate(prompt: String, systemPrompt: String? = nil, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
         generate(prompt: prompt, systemPrompt: systemPrompt, onProgress: onProgress,
                  allowContextRetry: true, completion: completion)
@@ -214,7 +225,8 @@ class LLMClient {
                 // to fit the budget and retry ONCE (never the raw "-1").
                 if allowContextRetry, let self = self, isContextOverflowError(error) {
                     let budget = ContextBudget.effectiveBudget(
-                        provider: provider.rawValue,
+                        provider: Self.budgetProviderId(provider: provider.rawValue,
+                                                        ollamaAPIKey: self.config.ollamaAPIKey),
                         configured: self.config.agentSettings.contextTokens,
                         detected: self.detectedContextTokens())
                     // Reserve room for the system prompt + the model's reply.
@@ -364,7 +376,7 @@ class LLMClient {
     // MARK: - Ollama Backend
 
     private func generateOllama(prompt: String, systemPrompt: String?, onProgress: ((LLMStreamProgress) -> Void)? = nil, completion: @escaping (Result<LLMResponse, Error>) -> Void) {
-        guard let url = URL(string: "\(config.ollamaURL)/api/generate") else {
+        guard let url = URL(string: "\(config.effectiveOllamaURL)/api/generate") else {
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
             return
         }
@@ -374,6 +386,11 @@ class LLMClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Ollama Cloud serves the same native API, Bearer-authenticated. The same
+        // request feeds both the streaming and non-streaming branches below.
+        if !config.ollamaAPIKey.isEmpty {
+            request.setValue("Bearer \(config.ollamaAPIKey)", forHTTPHeaderField: "Authorization")
+        }
         request.timeoutInterval = 120
 
         var body: [String: Any] = [
@@ -631,10 +648,13 @@ class LLMClient {
                 isLlamaCpp: true, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
         case .ollama:
             // Ollama's native /api/generate isn't tool-capable; use its
-            // OpenAI-compatible endpoint for the agent path.
+            // OpenAI-compatible endpoint for the agent path. With an API key set
+            // this targets Ollama Cloud (ollama.com) instead of the local server.
             return try await chatCompletionOpenAICompatible(
-                urlString: "\(config.ollamaURL)/v1/chat/completions",
-                model: config.ollamaModel, apiKey: nil, messages: messages, tools: tools,
+                urlString: "\(config.effectiveOllamaURL)/v1/chat/completions",
+                model: config.ollamaModel,
+                apiKey: config.ollamaAPIKey.isEmpty ? nil : config.ollamaAPIKey,
+                messages: messages, tools: tools,
                 isLlamaCpp: false, onTextDelta: onTextDelta, forceThinkingOff: forceThinkingOff)
         case .openai:
             guard !config.openaiAPIKey.isEmpty else {
@@ -1758,7 +1778,8 @@ struct PopDraftAgent {
         // tools-OFF, thinking-OFF model call that recaps the dropped older messages.
         let detected = LLMClient.shared.detectedContextTokens()
         let budget = ContextBudget.effectiveBudget(
-            provider: config.provider,
+            provider: LLMClient.budgetProviderId(provider: config.provider,
+                                                 ollamaAPIKey: config.ollamaAPIKey),
             configured: config.agentSettings.contextTokens,
             detected: detected)
         let summarize: ContextBudget.Summarizer = { dropped in

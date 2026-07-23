@@ -125,6 +125,19 @@ let openAIModels = """
 }
 """
 
+// Ollama Cloud /v1/models body (ollama.com is OpenAI-compatible; ids keep the
+// ollama name:tag form).
+let ollamaCloudModels = """
+{
+  "object": "list",
+  "data": [
+    {"id": "gpt-oss:120b", "object": "model", "owned_by": "ollama"},
+    {"id": "qwen3.5:397b", "object": "model", "owned_by": "ollama"},
+    {"id": "kimi-k2.5", "object": "model", "owned_by": "ollama"}
+  ]
+}
+"""
+
 // Anthropic /v1/models body (has display_name; we still extract id).
 let anthropicModels = """
 {
@@ -241,6 +254,11 @@ test("parseOpenAIModels → ids") {
     assert(ids == ["gpt-4o", "gpt-4o-mini", "o1"], "ids: \(ids)")
 }
 
+test("parseOpenAIModels handles Ollama Cloud body (name:tag ids)") {
+    let ids = ModelValidator.parseOpenAIModels(data(ollamaCloudModels))
+    assert(ids == ["gpt-oss:120b", "qwen3.5:397b", "kimi-k2.5"], "ollama cloud ids: \(ids)")
+}
+
 test("parseAnthropicModels → ids (display_name ignored)") {
     let ids = ModelValidator.parseAnthropicModels(data(anthropicModels))
     assert(ids == ["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250514", "claude-3-5-haiku-20241022"],
@@ -285,6 +303,9 @@ test("CloudProvider base URLs + mapping") {
     assert(CloudProvider.gemini.defaultBaseURL.contains("generativelanguage"), "gemini base")
     assert(CloudProvider.anthropic.llmProviderRawValue == "claude", "anthropic→claude")
     assert(CloudProvider.gemini.llmProviderRawValue == "openai", "gemini→openai-compatible")
+    assert(CloudProvider.ollama.defaultBaseURL == "https://ollama.com", "ollama cloud base")
+    assert(CloudProvider.ollama.llmProviderRawValue == "ollama", "ollama→ollama")
+    assert(CloudProvider.ollama.displayName == "Ollama", "ollama display name")
 }
 
 // MARK: - Results
