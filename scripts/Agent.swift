@@ -52,12 +52,12 @@ enum AgentTrace {
 
 // MARK: - Vision request gate
 
-/// A FIFO async mutex (actor) that SERIALIZES access to the single-slot vision
-/// llama-server (:10820). That server has one inference slot and SIGSEGVs if
-/// several multimodal requests hit it at once — and the agent can fire many
-/// `see_image` calls in a single parallel iteration. `acquire()` suspends (no
-/// thread blocked) until the slot is free; `release()` hands it to the next
-/// waiter. The calls all still complete — just one at a time.
+/// A FIFO async mutex (actor) that SERIALIZES `see_image` vision calls. The
+/// agent can fire many in a single parallel iteration, but a single-slot local
+/// llama-server SIGSEGVs under concurrent multimodal requests and Ollama Cloud's
+/// free tier caps concurrency. `acquire()` suspends (no thread blocked) until
+/// the slot is free; `release()` hands it to the next waiter. The calls all
+/// still complete — just one at a time.
 actor VisionRequestGate {
     private var busy = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -86,8 +86,8 @@ actor VisionRequestGate {
 class LLMClient {
     static let llamaServerDownError = "LLAMA_SERVER_DOWN"
     static let shared = LLMClient()
-    /// Serializes calls to the single-slot vision server (:10820) so parallel
-    /// `see_image` tool calls queue instead of crashing it.
+    /// Serializes parallel `see_image` tool calls (see `VisionRequestGate`).
+    /// Held by SeeImageTool around its one-shot vision `chatCompletion`.
     static let visionGate = VisionRequestGate()
     private var config: LLMConfig
     private var activeProvider: LLMConfig.Provider?
@@ -711,112 +711,8 @@ class LLMClient {
     }
 
     /// One round against any OpenAI-compatible `/v1/chat/completions` endpoint
-    /// (llama.cpp, Ollama-OpenAI, OpenAI). Non-streamed (so `tool_calls` parse
-    /// reliably); pushes the final text to `onTextDelta` once.
-    /// One-shot VISION completion against the DEDICATED vision llama-server on
-    /// :10820 (`VisionServerManager`) — NOT the global provider/config. `see_image`
-    /// routes here so it can SEE regardless of what the main model is.
-    ///
-    /// The VL model is a THINKING model, so thinking MUST be disabled or it returns
-    /// an empty answer (`chat_template_kwargs.enable_thinking:false` +
-    /// `enable_thinking:false`). Retries through the connection-refused / 503 window
-    /// (via `LlamaLoadRetry`) while the vision server loads its weights.
-    func visionCompletion(text: String, images: [ImageRef]) async throws -> String {
-        // SERIALIZE: the vision server has ONE inference slot and crashes under
-        // concurrent multimodal requests. Hold the gate for the whole call so
-        // parallel see_image tool calls run one-at-a-time (they all still complete).
-        // `defer` can't `await`, so release explicitly on both the success and the
-        // throw path.
-        await Self.visionGate.acquire()
-        do {
-            let result = try await visionCompletionInner(text: text, images: images)
-            await Self.visionGate.release()
-            return result
-        } catch {
-            await Self.visionGate.release()
-            throw error
-        }
-    }
-
-    private func visionCompletionInner(text: String, images: [ImageRef]) async throws -> String {
-        let urlString = "\(VisionServerManager.endpoint)/v1/chat/completions"
-        guard let url = URL(string: urlString) else {
-            throw NSError(domain: "Invalid URL", code: -1)
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 180
-
-        // llama.cpp ignores `model`; the single user message carries the image
-        // parts (VisionContent.openAIParts builds the OpenAI content array).
-        let body: [String: Any] = [
-            "model": "vision",
-            "messages": [[
-                "role": "user",
-                "content": VisionContent.openAIParts(text: text, images: images),
-            ]],
-            "stream": false,
-            "max_tokens": 500,
-            "temperature": 0,
-            "chat_template_kwargs": ["enable_thinking": false],
-            "enable_thinking": false,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        // Retry through the vision server's "still loading" window (just booted /
-        // weights loading): connection-refused or a 503.
-        let attemptStart = Date()
-        var data: Data!
-        var response: URLResponse!
-        while true {
-            do {
-                (data, response) = try await URLSession.shared.data(for: request)
-            } catch {
-                // cannotConnectToHost = server down; networkConnectionLost/timedOut =
-                // the tiny VL server crashed mid-request and KeepAlive is restarting
-                // it. All are recoverable — retry through the load window.
-                let code = (error as? URLError)?.code
-                if code == .cannotConnectToHost || code == .networkConnectionLost || code == .timedOut {
-                    if LlamaLoadRetry.shouldRetry(elapsed: Date().timeIntervalSince(attemptStart)) {
-                        try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
-                        continue
-                    }
-                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
-                }
-                throw error
-            }
-            if let http = response as? HTTPURLResponse, http.statusCode == 503 {
-                // 503 = vision server alive, still loading its weights — wait through
-                // the long loading budget rather than the short refused budget.
-                if LlamaLoadRetry.shouldKeepWaitingForLoad(elapsed: Date().timeIntervalSince(attemptStart)) {
-                    try await Task.sleep(nanoseconds: UInt64(LlamaLoadRetry.pollIntervalSeconds * 1_000_000_000))
-                    continue
-                }
-                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: LLMClient.llamaServerDownError])
-            }
-            break
-        }
-
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "Invalid response", code: -1)
-        }
-        if let errorObj = json["error"] as? [String: Any], let message = errorObj["message"] as? String {
-            throw NSError(domain: message, code: -1)
-        }
-        guard let choices = json["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any] else {
-            throw NSError(domain: "Invalid response", code: -1)
-        }
-        var content = (message["content"] as? String) ?? ""
-        // Strip any stray <think>…</think> the VL model might still emit.
-        if let range = content.range(of: "</think>") {
-            content = String(content[range.upperBound...])
-        }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
+    /// (llama.cpp, Ollama-OpenAI, OpenAI). Streams SSE deltas — text is pushed
+    /// live to `onTextDelta`; tool_calls are accumulated from the deltas.
     private func chatCompletionOpenAICompatible(
         urlString: String, model: String?, apiKey: String?,
         messages: [ChatMessage], tools: [[String: Any]]?, isLlamaCpp: Bool,

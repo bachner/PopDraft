@@ -4919,11 +4919,13 @@ enum VisionSupport {
     /// True iff the active provider's model is multimodal.
     ///  - OpenAI:   gpt-4o / gpt-4o-mini / gpt-4.1(+mini/nano) / o3 / o4 (vision).
     ///  - Claude:   3.5 / 3.7 / 4 Sonnet & Opus & Haiku (all vision-capable).
-    ///  - llamacpp: ONLY when a known multimodal local model (gemma-3 / gemma-3n /
-    ///              llava / minicpm / qwen*-vl / moondream / pixtral …) is
-    ///              configured (it implies an mmproj is loaded). The default 4B is
-    ///              text-only → false.
-    ///  - ollama:   same multimodal-model heuristic on `ollamaModel`.
+    ///  - llamacpp: multimodal-model NAME heuristic — FALLBACK only. A name
+    ///              can't prove an mmproj is loaded (PopDraft's managed server
+    ///              never loads one), so `see_image` first asks the server via
+    ///              `GET /props` (`parseLlamaProps`), which is authoritative.
+    ///  - ollama:   same multimodal-model heuristic on `ollamaModel`. Also the
+    ///              FALLBACK only — `see_image` first asks the daemon/cloud
+    ///              itself via `POST /api/show` (`parseOllamaCapabilities`).
     static func modelSupportsVision(config: AppConfig) -> Bool {
         switch config.provider {
         case "openai":
@@ -4960,23 +4962,74 @@ enum VisionSupport {
             || m.contains("sonnet-4") || m.contains("opus-4")
     }
 
-    /// Heuristic for a LOCAL multimodal model name (implies an mmproj is loaded).
+    /// Heuristic for a LOCAL multimodal model name. A matching name does NOT
+    /// prove the serving process has a projector loaded — prefer the live
+    /// `/props` / `/api/show` probes; this is their offline fallback.
     static func localModelLooksMultimodal(_ model: String) -> Bool {
         let m = model.lowercased()
-        let needles = ["gemma-3", "gemma3", "llava", "minicpm", "moondream",
-                       "pixtral", "bakllava", "vl", "vision", "internvl", "mmproj",
-                       "smolvlm", "phi-3-vision", "phi-4-multimodal"]
+        let needles = ["gemma-3", "gemma3", "gemma-4", "gemma4", "llava", "minicpm",
+                       "moondream", "pixtral", "bakllava", "vl", "vision", "internvl",
+                       "mmproj", "smolvlm", "phi-3-vision", "phi-4-multimodal"]
         return needles.contains { m.contains($0) }
     }
 
-    /// A clear, actionable message when the user wants to SEE something but no
-    /// vision-capable model is configured. Mirrors `suggest_integration`: never a
-    /// blank failure — tell them exactly how to gain the capability.
-    static func noVisionModelMessage() -> String {
-        return "I can capture the page/image, but I need a vision-capable model to "
-            + "SEE it — add an OpenAI (gpt-4o) or Anthropic (Claude Sonnet) key in "
-            + "Settings → Models, or use a local multimodal model (gemma-3n + mmproj). "
-            + "Once one is set, ask again and I'll describe what it looks like."
+    /// Parse the `capabilities` array of an Ollama `POST /api/show` response
+    /// (e.g. ["completion","thinking","tools","vision"]). Returns nil when the
+    /// body isn't JSON or has no such array — the caller falls back to the name
+    /// heuristic above. (Pure; unit-tested.)
+    static func parseOllamaCapabilities(_ data: Data) -> [String]? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let caps = obj["capabilities"] as? [String] else { return nil }
+        return caps
+    }
+
+    /// Parse a llama-server `GET /props` response into (`modalities.vision`,
+    /// `model_path`). Authoritative for the local server: a multimodal-NAMED
+    /// gguf served WITHOUT a loaded --mmproj still can't see, and `model_path`
+    /// names what is actually loaded (config.llamaModel goes stale when the
+    /// user switches to a user-downloaded gguf). nil when the body isn't the
+    /// expected shape — the caller falls back to the name heuristic.
+    /// (Pure; unit-tested.)
+    static func parseLlamaProps(_ data: Data) -> (vision: Bool, modelPath: String?)? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let modalities = obj["modalities"] as? [String: Any],
+              let vision = modalities["vision"] as? Bool else { return nil }
+        return (vision, obj["model_path"] as? String)
+    }
+
+    /// The name of the model the active provider would answer with. Mirrors the
+    /// provider switch in `modelSupportsVision` so `see_image` can NAME the model
+    /// it refused to send an image to. (Pure; unit-tested.)
+    static func activeModelName(config: AppConfig) -> String {
+        switch config.provider {
+        case "openai": return config.openaiModel
+        case "claude", "anthropic": return config.claudeModel
+        case "llamacpp": return config.llamaModel
+        case "ollama": return config.ollamaModel
+        default: return config.provider
+        }
+    }
+
+    /// The `see_image` tool result when the CHOSEN model can't take images. It is
+    /// read by both the agent model and the user, so it must explain the failure
+    /// (which model, why) and the fix (switch to a vision-capable model) — never
+    /// a blank error.
+    static func unsupportedModelMessage(model: String, provider: String) -> String {
+        let providerName: String
+        switch provider {
+        case "openai": providerName = "OpenAI"
+        case "claude", "anthropic": providerName = "Claude"
+        case "llamacpp": providerName = "llama.cpp (local)"
+        case "ollama": providerName = "Ollama"
+        default: providerName = provider
+        }
+        return "The active model can't see images: '\(model)' (\(providerName)) has "
+            + "no vision support, so the image was NOT analyzed. Do NOT invent or "
+            + "guess a description — tell the user the image could not be analyzed "
+            + "and how to fix it: switch to a vision-capable model via the model "
+            + "picker in chat or Settings → Models — e.g. gemma4:31b, minimax-m3 or "
+            + "qwen3.5:397b on Ollama Cloud, gpt-4o (OpenAI), Claude Sonnet, or a "
+            + "local multimodal model like gemma-3n or a qwen-VL build — then ask again."
     }
 }
 
@@ -5027,6 +5080,33 @@ enum VisionContent {
             }
         }
         return blocks
+    }
+
+    /// Sniffs the ACTUAL bitmap format from magic bytes and returns its media
+    /// type ("image/png" / "image/jpeg" / "image/gif" / "image/webp"). The
+    /// extension and Content-Type can both lie (a ".png" whose bytes are SVG
+    /// would ship an undecodable payload with a lying label), so the
+    /// pass-through decision AND the media type must come from the bytes.
+    /// nil → not one of the four API-accepted bitmaps; the caller rasterizes to
+    /// PNG. (Pure; unit-tested.)
+    static func sniffBitmapType(_ data: Data) -> String? {
+        // Copy the head so byte offsets are 0-based even for Data slices.
+        let head = [UInt8](data.prefix(12))
+        if head.count >= 4, head[0] == 0x89, head[1] == 0x50, head[2] == 0x4E, head[3] == 0x47 {
+            return "image/png"
+        }
+        if head.count >= 3, head[0] == 0xFF, head[1] == 0xD8, head[2] == 0xFF {
+            return "image/jpeg"
+        }
+        if head.count >= 6 {
+            let six = Array(head.prefix(6))
+            if six == Array("GIF87a".utf8) || six == Array("GIF89a".utf8) { return "image/gif" }
+        }
+        if head.count >= 12, Array(head.prefix(4)) == Array("RIFF".utf8),
+           Array(head[8..<12]) == Array("WEBP".utf8) {
+            return "image/webp"
+        }
+        return nil
     }
 
     /// Split a `data:<media>;base64,<payload>` URI into (mediaType, base64). Returns

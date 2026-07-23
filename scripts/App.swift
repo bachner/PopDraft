@@ -1031,14 +1031,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             serverStatusMenuItem?.isHidden = true
         }
 
-        // Start the DEDICATED vision llama-server (parallel :10820) whenever its
-        // model files are present — INDEPENDENT of the main provider, so `see_image`
-        // can SEE regardless of what the main model is. Off the main thread
-        // (writes the plist + runs launchctl, which block).
-        if VisionServerManager.isAvailable {
-            DispatchQueue.global(qos: .utility).async {
-                VisionServerManager.shared.ensureRunning()
-            }
+        // `see_image` runs on the ACTIVE model now — the dedicated :10820 vision
+        // sidecar has no consumers left. Tear down an existing install's launchd
+        // service once (its VL model stays resident in RAM otherwise); the model
+        // files on disk are the user's and are left alone. Off the main thread
+        // (launchctl blocks).
+        DispatchQueue.global(qos: .utility).async {
+            VisionServerManager.shared.teardown()
         }
 
         // Register all global hotkeys
