@@ -206,6 +206,8 @@ struct AppConfig: Codable, Equatable {
     var llamaModel: String
     var ollamaURL: String
     var ollamaModel: String
+    /// Non-empty ⇒ the Ollama provider targets Ollama Cloud (ollama.com).
+    var ollamaAPIKey: String
     var openaiAPIKey: String
     var openaiModel: String
     var claudeAPIKey: String
@@ -251,6 +253,7 @@ struct AppConfig: Codable, Equatable {
         llamaModel: String = "qwen3.5-4b",
         ollamaURL: String = "http://localhost:11434",
         ollamaModel: String = "qwen3.5:4b",
+        ollamaAPIKey: String = "",
         openaiAPIKey: String = "",
         openaiModel: String = "gpt-4o",
         claudeAPIKey: String = "",
@@ -282,6 +285,7 @@ struct AppConfig: Codable, Equatable {
         self.llamaModel = llamaModel
         self.ollamaURL = ollamaURL
         self.ollamaModel = ollamaModel
+        self.ollamaAPIKey = ollamaAPIKey
         self.openaiAPIKey = openaiAPIKey
         self.openaiModel = openaiModel
         self.claudeAPIKey = claudeAPIKey
@@ -320,6 +324,7 @@ struct AppConfig: Codable, Equatable {
         llamaModel = try c.decodeIfPresent(String.self, forKey: .llamaModel) ?? d.llamaModel
         ollamaURL = try c.decodeIfPresent(String.self, forKey: .ollamaURL) ?? d.ollamaURL
         ollamaModel = try c.decodeIfPresent(String.self, forKey: .ollamaModel) ?? d.ollamaModel
+        ollamaAPIKey = try c.decodeIfPresent(String.self, forKey: .ollamaAPIKey) ?? d.ollamaAPIKey
         openaiAPIKey = try c.decodeIfPresent(String.self, forKey: .openaiAPIKey) ?? d.openaiAPIKey
         openaiModel = try c.decodeIfPresent(String.self, forKey: .openaiModel) ?? d.openaiModel
         claudeAPIKey = try c.decodeIfPresent(String.self, forKey: .claudeAPIKey) ?? d.claudeAPIKey
@@ -417,6 +422,7 @@ extension AppConfig {
         if let v = obj["llamaModel"] as? String { c.llamaModel = v }
         if let v = obj["ollamaURL"] as? String { c.ollamaURL = v }
         if let v = obj["ollamaModel"] as? String { c.ollamaModel = v }
+        if let v = obj["ollamaAPIKey"] as? String { c.ollamaAPIKey = v }
         if let v = obj["openaiAPIKey"] as? String { c.openaiAPIKey = v }
         if let v = obj["openaiModel"] as? String { c.openaiModel = v }
         if let v = obj["claudeAPIKey"] as? String { c.claudeAPIKey = v }
@@ -484,6 +490,8 @@ extension AppConfig {
                 config.ollamaURL = value
             case "OLLAMA_MODEL":
                 config.ollamaModel = value
+            case "OLLAMA_API_KEY":
+                config.ollamaAPIKey = value
             case "OPENAI_API_KEY":
                 config.openaiAPIKey = value
             case "OPENAI_MODEL":
@@ -617,6 +625,7 @@ enum CloudProvider: String, CaseIterable, Equatable {
     case anthropic
     case gemini
     case openrouter
+    case ollama
 
     var displayName: String {
         switch self {
@@ -624,6 +633,7 @@ enum CloudProvider: String, CaseIterable, Equatable {
         case .anthropic: return "Anthropic"
         case .gemini: return "Gemini"
         case .openrouter: return "OpenRouter"
+        case .ollama: return "Ollama"
         }
     }
 
@@ -635,6 +645,7 @@ enum CloudProvider: String, CaseIterable, Equatable {
         case .anthropic: return "https://api.anthropic.com"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta/openai"
         case .openrouter: return "https://openrouter.ai/api"
+        case .ollama: return "https://ollama.com"
         }
     }
 
@@ -643,6 +654,7 @@ enum CloudProvider: String, CaseIterable, Equatable {
         switch self {
         case .openai, .gemini, .openrouter: return "openai"
         case .anthropic: return "claude"
+        case .ollama: return "ollama"
         }
     }
 }
@@ -915,6 +927,29 @@ enum ModelValidator {
 
         let base = (baseURL?.isEmpty == false ? baseURL! : provider.defaultBaseURL)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+
+        // ollama.com's /v1/models is PUBLIC — it returns 200 for a missing or
+        // bogus Bearer key, so it can't prove anything. POST /api/me is the auth
+        // discriminator (what `ollama whoami` uses: 401 unless the key is real);
+        // the public model list then feeds the suggestions.
+        if provider == .ollama {
+            guard let meURL = URL(string: "\(base)/api/me") else {
+                return KeyValidation(isValid: false, models: [], error: "Invalid base URL")
+            }
+            var meReq = URLRequest(url: meURL)
+            meReq.httpMethod = "POST"
+            meReq.timeoutInterval = 12
+            meReq.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+            do {
+                let (_, meResponse) = try await URLSession.shared.data(for: meReq)
+                let meStatus = (meResponse as? HTTPURLResponse)?.statusCode ?? 0
+                guard meStatus == 200 else {
+                    return KeyValidation(isValid: false, models: [], error: "HTTP \(meStatus)")
+                }
+            } catch {
+                return KeyValidation(isValid: false, models: [], error: error.localizedDescription)
+            }
+        }
 
         let urlString: String
         var headers: [String: String] = [:]
@@ -3466,8 +3501,8 @@ enum ContextBudget {
     /// Default budget for Ollama when undetected (its default `num_ctx` is small).
     static let ollamaDefaultBudget: Int = 16_384
 
-    /// Default budget for cloud providers (OpenAI/Claude) — their windows are
-    /// large, so we don't needlessly compact at a tiny number.
+    /// Default budget for cloud providers (OpenAI/Claude/Ollama Cloud) — their
+    /// windows are large, so we don't needlessly compact at a tiny number.
     static let cloudBudgetFloor: Int = 120_000
 
     /// The minimum sane budget — below this the loop couldn't make ANY model call.
@@ -3487,7 +3522,9 @@ enum ContextBudget {
     ///   3. otherwise → a sensible per-provider default.
     static func effectiveBudget(provider: String, configured: Int, detected: Int? = nil) -> Int {
         let p = provider.lowercased()
-        let isCloud = (p == "openai" || p == "claude" || p == "anthropic")
+        // "ollama-cloud" is the key-configured Ollama provider (ollama.com);
+        // plain "ollama" stays local with its small default num_ctx.
+        let isCloud = (p == "openai" || p == "claude" || p == "anthropic" || p == "ollama-cloud")
         if configured > 0 {
             let cfg = max(minBudget, configured)
             return isCloud ? max(cfg, cloudBudgetFloor) : cfg
@@ -3496,7 +3533,7 @@ enum ContextBudget {
             return isCloud ? max(d, cloudBudgetFloor) : d
         }
         switch p {
-        case "openai", "claude", "anthropic": return cloudBudgetFloor
+        case "openai", "claude", "anthropic", "ollama-cloud": return cloudBudgetFloor
         case "ollama": return ollamaDefaultBudget
         default: return llamacppDefaultBudget   // llamacpp + unknown
         }

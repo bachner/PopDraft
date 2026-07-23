@@ -218,6 +218,7 @@ struct LLMConfig {
     var llamacppURL: String = "http://localhost:10819"
     var ollamaURL: String = "http://localhost:11434"
     var ollamaModel: String = "qwen3.5:4b"
+    var ollamaAPIKey: String = ""
     var openaiAPIKey: String = ""
     var openaiModel: String = "gpt-4o"
     var claudeAPIKey: String = ""
@@ -229,6 +230,10 @@ struct LLMConfig {
     var ttsVoice: String = "auto"
     var ttsSpeed: Double = 1.0
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
+
+    /// A non-empty API key switches the Ollama provider to Ollama Cloud
+    /// (ollama.com); an empty key keeps local Ollama at `ollamaURL`.
+    var effectiveOllamaURL: String { ollamaAPIKey.isEmpty ? ollamaURL : "https://ollama.com" }
 
     // Legacy fields — only used for migration, not saved
     var disabledBuiltInActions: [String] = []
@@ -322,6 +327,7 @@ struct LLMConfig {
         self.llamacppURL = app.llamacppURL
         self.ollamaURL = app.ollamaURL
         self.ollamaModel = app.ollamaModel
+        self.ollamaAPIKey = app.ollamaAPIKey
         self.openaiAPIKey = app.openaiAPIKey
         self.openaiModel = app.openaiModel
         self.claudeAPIKey = app.claudeAPIKey
@@ -352,6 +358,7 @@ struct LLMConfig {
         app.llamacppURL = llamacppURL
         app.ollamaURL = ollamaURL
         app.ollamaModel = ollamaModel
+        app.ollamaAPIKey = ollamaAPIKey
         app.openaiAPIKey = openaiAPIKey
         app.openaiModel = openaiModel
         app.claudeAPIKey = claudeAPIKey
@@ -403,6 +410,7 @@ struct LLMConfig {
         lines.append("LLAMA_MODEL=\(llamaModel)")
         lines.append("OLLAMA_URL=\(ollamaURL)")
         lines.append("OLLAMA_MODEL=\(ollamaModel)")
+        lines.append("OLLAMA_API_KEY=\(ollamaAPIKey)")
         lines.append("OPENAI_API_KEY=\(openaiAPIKey)")
         lines.append("OPENAI_MODEL=\(openaiModel)")
         lines.append("CLAUDE_API_KEY=\(claudeAPIKey)")

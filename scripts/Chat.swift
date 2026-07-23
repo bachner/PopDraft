@@ -227,9 +227,16 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
             out.append(ModelChoice(provider: .llamacpp, model: fn, label: label,
                                    isActive: cfg.provider == .llamacpp && activeFile == fn))
         }
-        if !cfg.ollamaModel.isEmpty {
-            out.append(ModelChoice(provider: .ollama, model: cfg.ollamaModel, label: cfg.ollamaModel,
-                                   isActive: cfg.provider == .ollama))
+        var ollamaModels = cfg.ollamaModel.isEmpty ? [] : [cfg.ollamaModel]
+        // With an Ollama Cloud key, user-validated cloud models are switchable too.
+        if !cfg.ollamaAPIKey.isEmpty {
+            for um in cfg.userModels where um.provider == "ollama" && !ollamaModels.contains(um.name) {
+                ollamaModels.append(um.name)
+            }
+        }
+        for m in ollamaModels {
+            out.append(ModelChoice(provider: .ollama, model: m, label: m,
+                                   isActive: cfg.provider == .ollama && cfg.ollamaModel == m))
         }
         let openaiKey = cfg.openaiAPIKey.isEmpty ? (cfg.providerKeys["openai"] ?? "") : cfg.openaiAPIKey
         if !openaiKey.isEmpty {
@@ -281,12 +288,21 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
                         label: "Local Model", isActive: isActive(.llamacpp, "Local Model"))
         ]))
 
-        // Ollama — the configured local model (no key needed).
-        let ollamaModel = cfg.ollamaModel
-        groups.append(ModelChoiceGroup(provider: .ollama, needsKey: false, choices: [
-            ModelChoice(provider: .ollama, model: ollamaModel,
-                        label: ollamaModel, isActive: isActive(.ollama, ollamaModel))
-        ]))
+        // Ollama — the configured model (no key needed for the local server).
+        // With an Ollama Cloud key, user-validated cloud models list here too,
+        // same shape as the OpenAI/Claude groups below.
+        var ollamaModels = cfg.ollamaModel.isEmpty ? [] : [cfg.ollamaModel]
+        if !cfg.ollamaAPIKey.isEmpty {
+            for m in cfg.userModels where m.provider == "ollama" && !ollamaModels.contains(m.name) {
+                ollamaModels.append(m.name)
+            }
+        }
+        if ollamaModels.isEmpty { ollamaModels = [cfg.ollamaModel] }
+        groups.append(ModelChoiceGroup(
+            provider: .ollama, needsKey: false,
+            choices: ollamaModels.map { m in
+                ModelChoice(provider: .ollama, model: m, label: m, isActive: isActive(.ollama, m))
+            }))
 
         // OpenAI — ONLY when a key is configured (otherwise it isn't pickable
         // here; "Other model…" → Settings is the way to add a key). Shows the
@@ -522,7 +538,8 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         // budget mirrors the loop's `ContextBudget.effectiveBudget`, including the
         // ACTUAL detected served context (llama-server `/props` `n_ctx`).
         let budget = ContextBudget.effectiveBudget(
-            provider: appConfig.provider,
+            provider: LLMClient.budgetProviderId(provider: appConfig.provider,
+                                                 ollamaAPIKey: appConfig.ollamaAPIKey),
             configured: appConfig.agentSettings.contextTokens,
             detected: LLMClient.shared.detectedContextTokens())
         if ContextBudget.shouldCompact(snapshot.messages, budget: budget) { didCompact = true }
