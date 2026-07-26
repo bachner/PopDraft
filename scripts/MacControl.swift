@@ -110,6 +110,14 @@ enum MacControlExec {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-c", command]
+        // `zsh -c` is neither a login nor an interactive shell, so it does NOT read
+        // .zprofile/.zshrc — it just inherits our PATH, which for a launchd-started
+        // GUI app is only /usr/bin:/bin:/usr/sbin:/sbin. Repair it, or every
+        // `brew`/`node`/`npx`/`python3` the agent tries is "command not found".
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = SubprocessPATH.augmented(base: env["PATH"],
+                                               home: env["HOME"] ?? NSHomeDirectory())
+        process.environment = env
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
