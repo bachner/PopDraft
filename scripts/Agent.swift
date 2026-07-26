@@ -688,7 +688,13 @@ class LLMClient {
                         return [
                             "id": c.id,
                             "type": "function",
-                            "function": ["name": c.name, "arguments": c.arguments],
+                            // Must be a valid JSON object on the wire: Ollama
+                            // decodes it and 400s the WHOLE request ("invalid tool
+                            // call arguments") on anything else, which would end
+                            // the conversation instead of letting the model read
+                            // the tool error and retry.
+                            "function": ["name": c.name,
+                                         "arguments": ToolArgs.sanitizedRequestArguments(c.arguments)],
                         ]
                     }
                 }
@@ -825,8 +831,8 @@ class LLMClient {
         // AssistantTurn shape the non-streamed path returned.
         var contentAccum = ""
         var reasoningAccum = ""
-        // per tool-call index → (id, name, concatenated argument fragments)
-        var toolAccum: [Int: (id: String, name: String, args: String)] = [:]
+        // Fragment re-assembly (index / id / name rules) lives in Core.swift.
+        var toolAccum = ToolCallStreamAccumulator()
         var lastPushedAnswer = ""
 
         // Visible answer = content after </think>; "" while still inside an unclosed
@@ -861,27 +867,13 @@ class LLMClient {
             }
             if let r = delta["reasoning_content"] as? String { reasoningAccum += r }
             if let tcs = delta["tool_calls"] as? [[String: Any]] {
-                for tc in tcs {
-                    let idx = (tc["index"] as? Int) ?? 0
-                    var entry = toolAccum[idx] ?? (id: "", name: "", args: "")
-                    if let id = tc["id"] as? String, !id.isEmpty { entry.id = id }
-                    if let fn = tc["function"] as? [String: Any] {
-                        if let n = fn["name"] as? String, !n.isEmpty { entry.name = n }
-                        if let a = fn["arguments"] as? String { entry.args += a }
-                    }
-                    toolAccum[idx] = entry
-                }
+                toolAccum.ingest(tcs)
             }
         }
 
-        // Assemble tool calls (the concatenated fragments form a complete JSON
+        // Assemble tool calls (each call's concatenated fragments form its JSON
         // arguments string; ToolArgs.parse tolerates a string OR an object).
-        var parsedCalls: [ParsedToolCall] = []
-        for idx in toolAccum.keys.sorted() {
-            guard let e = toolAccum[idx], !e.name.isEmpty else { continue }
-            let id = e.id.isEmpty ? "call_\(idx)" : e.id
-            parsedCalls.append(ParsedToolCall(id: id, name: e.name, rawArguments: e.args))
-        }
+        let parsedCalls = toolAccum.calls
 
         // Split content / <think> exactly as the non-streamed path did; prefer a
         // reasoning_content channel for thinking when present.

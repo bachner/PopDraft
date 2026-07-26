@@ -2896,6 +2896,171 @@ enum ToolArgs {
         // Some other already-decoded value (array, number, bool) — not an object.
         throw ParseError.notAnObject
     }
+
+    /// Split a string that is a run of CONCATENATED top-level JSON objects
+    /// (`{"a":1}{"b":2}`) into its parts. Returns `[]` unless the whole string is
+    /// a clean sequence of one-or-more complete objects (so a malformed or
+    /// truncated fragment is left for `parse` to report).
+    ///
+    /// Needed because a provider can merge two parallel tool calls into one
+    /// `arguments` string (see `ToolCallStreamAccumulator`): recovering the parts
+    /// turns an unusable call into the two calls the model actually asked for.
+    static func splitTopLevelJSONObjects(_ raw: String) -> [String] {
+        var parts: [String] = []
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var start: String.Index? = nil
+
+        for i in raw.indices {
+            let c = raw[i]
+            if inString {
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+                continue
+            }
+            switch c {
+            case "\"":
+                if depth == 0 { return [] }   // a bare string outside any object
+                inString = true
+            case "{":
+                if depth == 0 { start = i }
+                depth += 1
+            case "}":
+                depth -= 1
+                if depth < 0 { return [] }    // unbalanced
+                if depth == 0, let s = start {
+                    parts.append(String(raw[s...i]))
+                    start = nil
+                }
+            default:
+                // Only whitespace may sit BETWEEN top-level objects.
+                if depth == 0, !c.isWhitespace { return [] }
+            }
+        }
+        return (depth == 0 && !inString) ? parts : []
+    }
+
+    /// The `arguments` string to put on the WIRE for a recorded assistant
+    /// tool_call. Always a single valid JSON object string.
+    ///
+    /// A valid object is returned BYTE-IDENTICAL (no re-encoding). Anything else
+    /// — `""`, a concatenation of two objects, plain garbage — is repaired,
+    /// because a strict server rejects the whole request over it: Ollama
+    /// `json.Unmarshal`s this field and answers HTTP 400 `invalid tool call
+    /// arguments`, which would kill the conversation instead of letting the model
+    /// see the tool error and retry.
+    static func sanitizedRequestArguments(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "{}" }
+        if (try? parse(trimmed)) != nil { return raw }
+        // Salvage the first complete object out of a concatenated run.
+        if let first = splitTopLevelJSONObjects(trimmed).first,
+           (try? parse(first)) != nil {
+            return first
+        }
+        return "{}"
+    }
+}
+
+// MARK: - Streaming tool_call accumulator
+
+/// Re-assembles the `tool_calls` deltas of an SSE `/v1/chat/completions` stream
+/// into ordered calls. Owns the ONE tricky rule in that stream format: which
+/// delta belongs to which call.
+///
+/// The spec keys fragments by `index` (first fragment carries `index`+`id`+`name`,
+/// the rest append `function.arguments`). But Ollama's OpenAI-compat layer emits
+/// EVERY parallel call with `index: 0` — two complete calls, distinct `id`s, same
+/// index — so keying on `index` alone concatenates their arguments into one
+/// unparseable call (`{"query":"a"}{"query":"b"}`) and loses the second call.
+///
+/// So: `index` picks the slot, but a fragment that carries a DIFFERENT non-empty
+/// `id` (or a different tool `name`) starts a NEW call, and a repeated `name`
+/// opening a fresh `{` after the slot's arguments already form a complete object
+/// does too (covers a server that sends no ids at all). Genuine fragmenting is
+/// untouched: continuation fragments carry no id/name, so they append as before.
+struct ToolCallStreamAccumulator {
+    struct Slot: Equatable {
+        var id: String
+        var name: String
+        var args: String
+    }
+
+    private(set) var slots: [Slot] = []
+    /// delta `index` → position in `slots` (the call currently open at that index).
+    private var openAtIndex: [Int: Int] = [:]
+
+    /// Ingest one delta's `tool_calls` array (raw JSON dictionaries).
+    mutating func ingest(_ deltas: [[String: Any]]) {
+        for d in deltas { ingestOne(d) }
+    }
+
+    private mutating func ingestOne(_ d: [String: Any]) {
+        let index = (d["index"] as? Int) ?? 0
+        let id = (d["id"] as? String) ?? ""
+        let fn = d["function"] as? [String: Any]
+        let name = (fn?["name"] as? String) ?? ""
+        // `arguments` is a string per spec; tolerate an already-decoded object
+        // (a llama.cpp template quirk) by re-encoding it.
+        var fragment = ""
+        if let s = fn?["arguments"] as? String {
+            fragment = s
+        } else if let obj = fn?["arguments"], !(obj is NSNull),
+                  let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+                  let s = String(data: data, encoding: .utf8) {
+            fragment = s
+        }
+
+        var target = openAtIndex[index]
+        if let t = target {
+            let open = slots[t]
+            let differentID = !id.isEmpty && !open.id.isEmpty && id != open.id
+            let differentName = !name.isEmpty && !open.name.isEmpty && name != open.name
+            // No-id server: a repeated name that opens a fresh object while the
+            // slot's arguments are already complete = the next parallel call.
+            let restartsArgs = !name.isEmpty && !open.name.isEmpty
+                && fragment.hasPrefix("{")
+                && ToolArgs.splitTopLevelJSONObjects(open.args).count == 1
+            if differentID || differentName || restartsArgs { target = nil }
+        }
+
+        let slot: Int
+        if let t = target {
+            slot = t
+        } else {
+            slots.append(Slot(id: id, name: name, args: ""))
+            slot = slots.count - 1
+            openAtIndex[index] = slot
+        }
+
+        if !id.isEmpty { slots[slot].id = id }
+        if !name.isEmpty { slots[slot].name = name }
+        slots[slot].args += fragment
+    }
+
+    /// The finished calls, in arrival order. Named slots only; a slot whose
+    /// arguments still hold several concatenated objects is SPLIT into one call
+    /// per object (a last-resort salvage for a provider that merged them with no
+    /// id or index to tell them apart).
+    var calls: [ParsedToolCall] {
+        var out: [ParsedToolCall] = []
+        for slot in slots where !slot.name.isEmpty {
+            let parts = ToolArgs.splitTopLevelJSONObjects(slot.args)
+            let fallbackID = slot.id.isEmpty ? "call_\(out.count)" : slot.id
+            guard parts.count > 1 else {
+                out.append(ParsedToolCall(id: fallbackID, name: slot.name, rawArguments: slot.args))
+                continue
+            }
+            for (n, part) in parts.enumerated() {
+                out.append(ParsedToolCall(
+                    id: n == 0 ? fallbackID : "\(fallbackID)_\(n)",
+                    name: slot.name, rawArguments: part))
+            }
+        }
+        return out
+    }
 }
 
 // MARK: - Tool value types
@@ -5212,6 +5377,65 @@ enum MCPInstallGuard {
 /// The result of a one-shot, time-bounded MCP connection probe (the Settings
 /// "Test" action). Pure value type so the UI mapping + the parse are unit-tested
 /// without spawning a process.
+/// PATH repair for spawned subprocesses.
+///
+/// A GUI app launched by launchd/Finder inherits only
+/// `/usr/bin:/bin:/usr/sbin:/sbin` — no `/opt/homebrew/bin`, no nvm/volta/bun
+/// shims. So `npx` (every MCP server's launcher) simply isn't found, and the
+/// server dies with status 127 before the handshake. The user's shell finds it,
+/// which is why this only ever shows up in the installed app.
+///
+/// Pure so it's unit-testable: the caller supplies the base PATH, `$HOME`, any
+/// dynamically discovered dirs, and an "is this executable?" probe.
+enum SubprocessPATH {
+    /// Fallback when the process has no PATH at all.
+    static let launchdDefault = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    /// Where Node/uv toolchains actually install on macOS, most-common first.
+    static func extraDirectories(home: String) -> [String] {
+        return [
+            "/opt/homebrew/bin", "/opt/homebrew/sbin",   // Apple-silicon Homebrew
+            "/usr/local/bin", "/usr/local/sbin",         // Intel Homebrew / manual installs
+            "\(home)/.volta/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.nvm/current/bin",
+            "\(home)/.local/bin",                        // uv / uvx / pipx
+            "\(home)/.cargo/bin",
+            "/opt/local/bin",                            // MacPorts
+        ]
+    }
+
+    /// `base` with the extra directories appended — order preserved, duplicates
+    /// and empties dropped. The inherited PATH keeps priority so a user's own
+    /// ordering still wins.
+    static func augmented(base: String?, home: String, discovered: [String] = []) -> String {
+        let inherited = (base?.isEmpty == false ? base! : launchdDefault)
+        var seen = Set<String>()
+        var out: [String] = []
+        for dir in inherited.split(separator: ":", omittingEmptySubsequences: true).map(String.init)
+                    + discovered + extraDirectories(home: home) {
+            guard !dir.isEmpty, seen.insert(dir).inserted else { continue }
+            out.append(dir)
+        }
+        return out.joined(separator: ":")
+    }
+
+    /// Resolve a command to an absolute executable path against `path`.
+    /// A command that already contains a `/` is returned as-is (still probed);
+    /// otherwise each PATH entry is tried in order. nil = not installed.
+    static func resolve(_ command: String, path: String,
+                        isExecutable: (String) -> Bool) -> String? {
+        let cmd = command.trimmingCharacters(in: .whitespaces)
+        guard !cmd.isEmpty else { return nil }
+        if cmd.contains("/") { return isExecutable(cmd) ? cmd : nil }
+        for dir in path.split(separator: ":", omittingEmptySubsequences: true) {
+            let candidate = "\(dir)/\(cmd)"
+            if isExecutable(candidate) { return candidate }
+        }
+        return nil
+    }
+}
+
 struct MCPProbeResult: Equatable {
     enum State: Equatable {
         case reachable(toolCount: Int)   // handshake ok; advertised N tools
@@ -5237,6 +5461,15 @@ struct MCPProbeResult: Equatable {
         switch state {
         case .reachable(let n): return n == 1 ? "1 tool" : "\(n) tools"
         case .unreachable(let msg):
+            // The launcher isn't installed / isn't on PATH — nothing to do with auth.
+            if msg.localizedCaseInsensitiveContains("not found") {
+                return "command not found"
+            }
+            // Started, then quit without answering: almost always missing
+            // credentials or a bad argument, NOT a slow server.
+            if msg.localizedCaseInsensitiveContains("exited") {
+                return "exited on start — check auth/args"
+            }
             // A handshake timeout usually means the server is up but waiting on an
             // auth/OAuth step — surface that, not just "timed out".
             if msg.localizedCaseInsensitiveContains("time") {

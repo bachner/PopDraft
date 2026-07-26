@@ -1562,6 +1562,13 @@ class PopupWindowController: NSWindowController {
                 guard let self = self else { return }
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                // `zsh -c` doesn't read .zprofile/.zshrc, so it inherits OUR PATH —
+                // only /usr/bin:/bin:/usr/sbin:/sbin when launchd started the app.
+                // Repair it so a user's `jq`/`python3`/`gh` command action resolves.
+                var env = ProcessInfo.processInfo.environment
+                env["PATH"] = SubprocessPATH.augmented(base: env["PATH"],
+                                                       home: env["HOME"] ?? NSHomeDirectory())
+                process.environment = env
 
                 let hasPlaceholder = commandTemplate.contains("{text}")
                 let command: String

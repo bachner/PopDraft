@@ -60,12 +60,49 @@ final class MCPClient: @unchecked Sendable {
         }
     }
 
+    /// Every `~/.nvm/versions/node/<v>/bin` on disk, newest version first (nvm has
+    /// no fixed install dir, so it can't be a static candidate). Capped — this is a
+    /// PATH fallback, not a version manager.
+    static func discoveredNodeDirectories(home: String) -> [String] {
+        let root = "\(home)/.nvm/versions/node"
+        guard let versions = try? FileManager.default.contentsOfDirectory(atPath: root) else { return [] }
+        return versions.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+            .prefix(4).map { "\(root)/\($0)/bin" }
+    }
+
+    /// The environment an MCP server subprocess is launched with: the app's own,
+    /// with PATH repaired (a launchd-started GUI app has no Homebrew/nvm on PATH,
+    /// so `npx` can't be found — see `SubprocessPATH`).
+    static func childEnvironment() -> (env: [String: String], path: String) {
+        let base = ProcessInfo.processInfo.environment
+        let home = base["HOME"] ?? NSHomeDirectory()
+        let path = SubprocessPATH.augmented(
+            base: base["PATH"], home: home,
+            discovered: discoveredNodeDirectories(home: home))
+        var env = base
+        env["PATH"] = path
+        return (env, path)
+    }
+
     /// `timeoutMs` defaults high because `npx -y <pkg>` downloads the package on
     /// first run (often >8s) before the server can answer `initialize`.
     func start(command: String, args: [String], timeoutMs: Int = 60000) async throws -> [MCPToolSpec] {
-        // Resolve the command via /usr/bin/env so a bare name (e.g. "npx") works.
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [command] + args
+        // Resolve the launcher ourselves (rather than via `/usr/bin/env`, which can
+        // only search the PATH we were given) so a missing `npx` fails FAST with a
+        // real message instead of a 127-exit the handshake reports as a timeout.
+        let (env, path) = Self.childEnvironment()
+        guard let executable = SubprocessPATH.resolve(
+            command, path: path,
+            isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw NSError(domain: "MCPClient", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "command '\(command)' not found for MCP server "
+                    + "'\(serverName)' — install it (e.g. `brew install node` for npx) "
+                    + "or set an absolute path"])
+        }
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        // The child needs the repaired PATH too: `npx` shells out to `node`.
+        process.environment = env
         process.standardInput = stdin
         process.standardOutput = stdout
         // Let the server's stderr flow to our stderr/log (don't capture/block on it).
@@ -160,7 +197,15 @@ final class MCPClient: @unchecked Sendable {
             guard let chunk = chunk else { break }  // deadline won the race
             if chunk.isEmpty {
                 // EOF or no data yet; if the process is gone and nothing's left, stop.
-                if !process.isRunning && buffer.isEmpty { break }
+                if !process.isRunning && buffer.isEmpty {
+                    // It launched and QUIT without answering — report that, not a
+                    // timeout: it's usually missing credentials or a bad argument,
+                    // and the two need different fixes.
+                    throw NSError(domain: "MCPClient", code: 5, userInfo: [
+                        NSLocalizedDescriptionKey: "MCP server '\(serverName)' exited "
+                            + "(status \(process.terminationStatus)) before answering the "
+                            + "handshake — check its arguments / credentials"])
+                }
                 try await Task.sleep(nanoseconds: 20_000_000)
                 continue
             }
