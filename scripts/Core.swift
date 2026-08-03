@@ -5501,3 +5501,27 @@ enum BuiltinToolNames {
     /// True if `name` would shadow a built-in tool and must be rejected.
     static func isReserved(_ name: String) -> Bool { reserved.contains(name) }
 }
+
+// MARK: - Launch-at-login self-heal (pure decision)
+
+/// The login-item plist records an ABSOLUTE path to the app binary at the time
+/// it was written (`Bundle.main.bundlePath` of whichever copy ran). If the app
+/// was ever launched from a transient location — a DMG-staging dir, the dev
+/// tree — launchd keeps resurrecting that stale copy at every login, and its
+/// different code signature makes TCC re-prompt for Accessibility each time.
+enum LoginItemPolicy {
+    /// Program path the plist should carry for the app bundle at `bundlePath`.
+    static func programPath(forBundle bundlePath: String) -> String {
+        bundlePath + "/Contents/MacOS/PopDraft"
+    }
+
+    /// Whether an EXISTING login-item plist should be rewritten to point at the
+    /// running bundle. Only the installed copy (under /Applications) may capture
+    /// the login item: a dev-tree or DMG-staged copy healing the plist toward
+    /// itself is exactly the poisoning this exists to undo. `existingProgramPath`
+    /// is nil for a malformed/unreadable plist, which also warrants a rewrite.
+    static func shouldRewrite(existingProgramPath: String?, bundlePath: String) -> Bool {
+        guard bundlePath.hasPrefix("/Applications/") else { return false }
+        return existingProgramPath != programPath(forBundle: bundlePath)
+    }
+}
