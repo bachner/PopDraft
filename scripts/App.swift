@@ -823,10 +823,21 @@ class LaunchAtLoginManager {
         }
     }
 
-    private func createLaunchAgent() {
-        // Get the app bundle path
-        let appPath = Bundle.main.bundlePath
+    /// The plist stores the absolute binary path of whichever copy wrote it, so
+    /// a copy once run from a DMG-staging dir or the dev tree keeps getting
+    /// launched at login forever — old version resurrected, Accessibility
+    /// re-prompted (different code signature). Rewrite it to the running bundle;
+    /// LoginItemPolicy restricts this to the installed /Applications copy.
+    func healIfNeeded() {
+        guard isEnabled else { return }
+        let existing = (NSDictionary(contentsOfFile: launchAgentPath)?["ProgramArguments"] as? [String])?.first
+        if LoginItemPolicy.shouldRewrite(existingProgramPath: existing, bundlePath: Bundle.main.bundlePath) {
+            createLaunchAgent()
+            print("Launch at Login healed: \(existing ?? "<unreadable>") -> \(Bundle.main.bundlePath)")
+        }
+    }
 
+    private func createLaunchAgent() {
         // Create LaunchAgents directory if needed
         let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
@@ -834,7 +845,7 @@ class LaunchAtLoginManager {
         // Create plist content
         let plistContent: [String: Any] = [
             "Label": bundleIdentifier,
-            "ProgramArguments": [appPath + "/Contents/MacOS/PopDraft"],
+            "ProgramArguments": [LoginItemPolicy.programPath(forBundle: Bundle.main.bundlePath)],
             "RunAtLoad": true,
             "KeepAlive": false
         ]
@@ -880,6 +891,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create Edit menu for standard text editing commands
         setupEditMenu()
+
+        // Repoint a stale login item at this (installed) copy before anything
+        // else — no-op unless launch-at-login is on and the path is wrong.
+        LaunchAtLoginManager.shared.healIfNeeded()
 
         // Check if onboarding needed
         if !isOnboardingComplete {
