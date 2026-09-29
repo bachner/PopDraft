@@ -369,8 +369,16 @@ final class AgentChatViewModel: ObservableObject, MacControlBroker.Sink {
         case .openai:   cfg.openaiModel = choice.model
         case .claude:   cfg.claudeModel = choice.model
         }
+        let previousProvider = LLMConfig.load().provider
         cfg.save()
         LLMClient.shared.reloadConfig()
+        // Provider switched: leaving llama.cpp stops the local server (no model
+        // stays resident); switching to it starts polling — the restart below
+        // brings the server up on the chosen file.
+        if choice.provider != previousProvider {
+            (NSApp.delegate as? AppDelegate)?.activeProviderChanged(
+                to: choice.provider, startServer: restartLocalFile == nil)
+        }
         // Restart the local server for the new model OFF the main thread (bootout+
         // bootstrap are quick, but the weights then load in the background — the
         // pill updates once the plist is rewritten; the first message waits for

@@ -12,6 +12,53 @@ import WebKit
 import CryptoKit
 import Network
 
+// MARK: - Owned background processes (live side of the pure matchers in Core)
+
+/// Finds and stops background processes PopDraft itself started (a leftover
+/// llama-server, the retired TTS server). Matching is delegated to the pure,
+/// unit-tested predicates in Core.swift (`LocalServerPolicy.isOwnedServer`,
+/// `LegacyTTSServer.isServer`) and is always restricted to this user's processes.
+enum OwnedProcesses {
+    /// PIDs of this user's processes whose command line satisfies `matches`. BLOCKS (runs ps).
+    static func pids(where matches: (String) -> Bool) -> [Int32] {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axww", "-o", "pid=,uid=,command="]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return [] }
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        ps.waitUntilExit()
+        return ProcessTable.pids(in: ProcessTable.parse(output), uid: getuid(), selfPID: getpid(), where: matches)
+    }
+
+    /// The command line of `pid` if it's one of this user's processes. BLOCKS.
+    static func command(of pid: Int32) -> String? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-ww", "-o", "pid=,uid=,command=", "-p", String(pid)]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        ps.waitUntilExit()
+        return ProcessTable.parse(output).first { $0.pid == pid && $0.uid == getuid() }?.command
+    }
+
+    /// SIGTERM, then SIGKILL whatever is still alive after `grace` seconds. BLOCKS.
+    static func terminate(_ pids: [Int32], grace: TimeInterval = 3) {
+        guard !pids.isEmpty else { return }
+        for pid in pids { kill(pid, SIGTERM) }
+        let deadline = Date().addingTimeInterval(grace)
+        while Date() < deadline, pids.contains(where: { kill($0, 0) == 0 }) {
+            usleep(100_000)
+        }
+        for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+    }
+}
+
 // MARK: - Llama Server Manager
 
 class LlamaServerManager {
@@ -19,6 +66,79 @@ class LlamaServerManager {
 
     enum Status {
         case unknown, online, loading, offline
+    }
+
+    /// launchd job of the main local server (plist written by
+    /// `DependencyManager.createLlamaLaunchAgent`; it has RunAtLoad + KeepAlive).
+    static let launchLabel = "com.popdraft.llama-server"
+    static var plistPath: String {
+        NSString(string: "~/Library/LaunchAgents/\(launchLabel).plist").expandingTildeInPath
+    }
+
+    /// Whether the local server may run at all right now: ONLY while the saved
+    /// provider is llama.cpp (`LocalServerPolicy`). Every start path checks this.
+    static var isActiveProvider: Bool {
+        LocalServerPolicy.shouldRun(provider: LLMConfig.load().provider.rawValue)
+    }
+
+    /// Bring the local server in line with `provider` — at startup and whenever
+    /// the active provider changes. llama.cpp: status polling + start the launchd
+    /// service (skipped with `startServer: false` when the caller is about to
+    /// restart it on a new model itself). Anything else: stop polling and stop
+    /// the server, so no local model sits in memory.
+    func applyProvider(_ provider: LLMConfig.Provider, startServer: Bool = true) {
+        if LocalServerPolicy.shouldRun(provider: provider.rawValue) {
+            startPolling()
+            if startServer {
+                lifecycleQueue.async { Self.startService() }
+            }
+        } else {
+            stopPolling()
+            lifecycleQueue.async { Self.stopOwnedServer() }
+        }
+    }
+
+    /// Serializes start/stop so a quick provider flip can't interleave them; each
+    /// step re-reads the SAVED provider, so the latest choice wins.
+    private let lifecycleQueue = DispatchQueue(label: "com.popdraft.llama-lifecycle", qos: .utility)
+
+    /// enable + bootstrap the launchd service (a no-op if it's already loaded).
+    /// Does nothing unless the provider is llama.cpp and the plist exists. BLOCKS.
+    static func startService() {
+        guard isActiveProvider, FileManager.default.fileExists(atPath: plistPath) else { return }
+        launchctl(["enable", "gui/\(getuid())/\(launchLabel)"])
+        launchctl(["bootstrap", "gui/\(getuid())", plistPath])
+    }
+
+    /// Stop PopDraft's local llama-server and KEEP it stopped: boot the launchd
+    /// job out, then `disable` it — its plist has RunAtLoad + KeepAlive, so
+    /// otherwise launchd starts the model again at the next login whatever the
+    /// provider (the "Ollama configured, llama-server still resident" bug). Then
+    /// stop any leftover llama-server PopDraft owns (our port or models dir —
+    /// never anyone else's). The plist stays: it records the chosen local model,
+    /// and switching back to llama.cpp re-enables it. BLOCKS.
+    static func stopOwnedServer() {
+        // Switched back to llama.cpp before this ran? Then there's nothing to stop.
+        guard !isActiveProvider else { return }
+        launchctl(["bootout", "gui/\(getuid())/\(launchLabel)"])
+        launchctl(["disable", "gui/\(getuid())/\(launchLabel)"])
+        let home = NSHomeDirectory()
+        let pids = OwnedProcesses.pids { LocalServerPolicy.isOwnedServer(command: $0, home: home) }
+        if !pids.isEmpty {
+            OwnedProcesses.terminate(pids)
+            Logger.shared.info("Stopped local llama-server (provider isn't llama.cpp): pids \(pids)")
+        }
+    }
+
+    /// Run `launchctl` quietly and wait for it. BLOCKS.
+    static func launchctl(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
     }
 
     private(set) var status: Status = .unknown
@@ -74,7 +194,14 @@ class LlamaServerManager {
 
     func restart(completion: @escaping (Bool) -> Void) {
         let config = LLMConfig.load()
-        let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
+        // Never (re)start a local model for another provider — this also covers
+        // the agent's auto-restart-on-refused-socket path.
+        guard LocalServerPolicy.shouldRun(provider: config.provider.rawValue) else {
+            Logger.shared.info("llama-server restart skipped: provider is \(config.provider.rawValue)")
+            completion(false)
+            return
+        }
+        let plistPath = Self.plistPath
 
         // Create plist if missing
         if !FileManager.default.fileExists(atPath: plistPath) {

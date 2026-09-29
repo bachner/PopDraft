@@ -17,22 +17,8 @@ import Network
 class DependencyManager {
     static let shared = DependencyManager()
 
-    var currentInstallProcess: Process?
-    var installCancelled = false
-
-    var ttsVenvPython: String {
-        NSString(string: "~/.popdraft/tts-venv/bin/python3").expandingTildeInPath
-    }
-
-    func cancelInstall() {
-        installCancelled = true
-        currentInstallProcess?.terminate()
-    }
-
     struct DependencyStatus {
         var hasHomebrew: Bool = false
-        var hasEspeak: Bool = false
-        var hasPythonPackages: Bool = false
         var hasLlamaCpp: Bool = false
         var hasLlamaModel: Bool = false
         var isLlamaServerRunning: Bool = false
@@ -63,17 +49,6 @@ class DependencyManager {
         status.hasHomebrew = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/brew") ||
                             FileManager.default.fileExists(atPath: "/usr/local/bin/brew")
 
-        // Check espeak-ng
-        status.hasEspeak = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/espeak-ng") ||
-                          FileManager.default.fileExists(atPath: "/usr/local/bin/espeak-ng") ||
-                          FileManager.default.fileExists(atPath: "/usr/bin/espeak")
-
-        // Check Python packages (in venv) — Higgs runs via mlx-audio, whose Higgs
-        // loader also needs torch.
-        let checkScript = "\(ttsVenvPython) -c 'import mlx_audio, torch' 2>/dev/null && echo OK"
-        let result = runShellCommand(checkScript)
-        status.hasPythonPackages = result.contains("OK")
-
         // Check llama.cpp
         status.hasLlamaCpp = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/llama-server") ||
                             FileManager.default.fileExists(atPath: "/usr/local/bin/llama-server")
@@ -89,55 +64,6 @@ class DependencyManager {
         status.isLlamaServerRunning = healthCheck.contains("ok") || healthCheck.contains("OK")
 
         return status
-    }
-
-    func installDependencies(statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.installCancelled = false
-            var success = true
-
-            // Check current status
-            let status = self.checkDependencies()
-
-            // Install Python packages into venv if missing. Higgs (via mlx-audio +
-            // torch) needs a modern Python (3.11/3.12) — the system python3 is 3.9,
-            // so find a compatible interpreter first.
-            if !status.hasPythonPackages {
-                DispatchQueue.main.async { statusCallback("Creating Python environment...") }
-                let venvDir = NSString(string: "~/.popdraft/tts-venv").expandingTildeInPath
-                // Prefer a 3.11/3.12 interpreter (mlx-audio + torch require it).
-                let pyCandidates = [
-                    "python3.12", "python3.11", "python3.10",
-                    "/opt/homebrew/bin/python3.12", "/opt/homebrew/bin/python3.11", "/opt/homebrew/bin/python3.10",
-                    "/usr/local/bin/python3.12", "/usr/local/bin/python3.11", "/usr/local/bin/python3.10",
-                ]
-                let pythonBin = self.runShellCommand(
-                    "for py in \(pyCandidates.joined(separator: " ")); do if command -v \"$py\" >/dev/null 2>&1; then echo \"$py\"; break; fi; done"
-                ).trimmingCharacters(in: .whitespacesAndNewlines)
-                let venvPython = pythonBin.isEmpty ? "python3" : pythonBin
-                // Remove old venv to avoid issues with corrupted/partial venvs.
-                try? FileManager.default.removeItem(atPath: venvDir)
-                let venvResult = self.runShellCommand("\"\(venvPython)\" -m venv \"\(venvDir)\" 2>&1", timeout: 120, trackProcess: true)
-                if self.installCancelled { return }
-                if venvResult.contains("Error") {
-                    print("venv creation warning: \(venvResult)")
-                    success = false
-                } else {
-                    DispatchQueue.main.async { statusCallback("Installing TTS packages (mlx-audio + torch, a few minutes)...") }
-                    let pipPath = venvDir + "/bin/pip"
-                    let result = self.runShellCommand("\"\(pipPath)\" install --quiet --timeout 60 --retries 5 mlx-audio torch scipy numpy librosa 2>&1", timeout: 900, trackProcess: true)
-                    if self.installCancelled { return }
-                    if result.contains("ERROR") {
-                        print("pip install warning: \(result)")
-                        success = false
-                    }
-                }
-            }
-
-            DispatchQueue.main.async {
-                completion(success)
-            }
-        }
     }
 
     func installLlamaCpp(modelId: String? = nil, statusCallback: @escaping (String) -> Void, completion: @escaping (Bool) -> Void) {
@@ -232,8 +158,10 @@ class DependencyManager {
                 // Unload existing agent if any
                 _ = self.runShellCommand("launchctl unload ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>&1")
 
-                // Start the server
+                // Start the server (re-enabling it first: switching away from
+                // llama.cpp disables the job so it can't start at login).
                 DispatchQueue.main.async { statusCallback("Starting llama server...") }
+                LlamaServerManager.launchctl(["enable", "gui/\(getuid())/\(LlamaServerManager.launchLabel)"])
                 _ = self.runShellCommand("launchctl load ~/Library/LaunchAgents/com.popdraft.llama-server.plist 2>&1")
 
                 // Wait a moment for server to start
@@ -335,17 +263,19 @@ class DependencyManager {
 
     /// Switch the local server to a specific gguf FILE (a user-downloaded model
     /// that isn't in the built-in list) and restart it.
+    /// The plist is always rewritten (it records the chosen local model), but the
+    /// server is only (re)started while llama.cpp is the SAVED provider — e.g. a
+    /// model picked in Settings before saving a provider switch starts on Save.
     func switchLocalModelFileAndRestart(_ filename: String) {
         createLlamaLaunchAgent(filename: filename)
+        guard LlamaServerManager.isActiveProvider else { return }
         let uid = getuid()
-        let plist = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
-        // bootout (ok if not currently loaded) then bootstrap → reloads the plist.
-        let out = Process(); out.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        out.arguments = ["bootout", "gui/\(uid)/com.popdraft.llama-server"]
-        try? out.run(); out.waitUntilExit()
-        let boot = Process(); boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        boot.arguments = ["bootstrap", "gui/\(uid)", plist]
-        try? boot.run(); boot.waitUntilExit()
+        let label = LlamaServerManager.launchLabel
+        // bootout (ok if not currently loaded), enable (switching away from
+        // llama.cpp disables the job), then bootstrap → reloads the plist.
+        LlamaServerManager.launchctl(["bootout", "gui/\(uid)/\(label)"])
+        LlamaServerManager.launchctl(["enable", "gui/\(uid)/\(label)"])
+        LlamaServerManager.launchctl(["bootstrap", "gui/\(uid)", LlamaServerManager.plistPath])
     }
 
     /// Download a built-in llama model's gguf into `~/.popdraft/models`. This ONLY
@@ -412,7 +342,7 @@ class DependencyManager {
         return (args[mi + 1] as NSString).lastPathComponent
     }
 
-    private func runShellCommand(_ command: String, timeout: TimeInterval = 0, trackProcess: Bool = false) -> String {
+    private func runShellCommand(_ command: String) -> String {
         let process = Process()
         let pipe = Pipe()
 
@@ -421,37 +351,12 @@ class DependencyManager {
         process.standardOutput = pipe
         process.standardError = pipe
 
-        if trackProcess {
-            currentInstallProcess = process
-        }
-
         do {
             try process.run()
         } catch {
-            if trackProcess { currentInstallProcess = nil }
             return "Error: \(error)"
         }
-
-        if timeout > 0 {
-            let deadline = Date().addingTimeInterval(timeout)
-            while process.isRunning {
-                if installCancelled {
-                    process.terminate()
-                    if trackProcess { currentInstallProcess = nil }
-                    return "Error: Cancelled"
-                }
-                if Date() > deadline {
-                    process.terminate()
-                    if trackProcess { currentInstallProcess = nil }
-                    return "Error: Timed out after \(Int(timeout))s"
-                }
-                Thread.sleep(forTimeInterval: 0.5)
-            }
-        } else {
-            process.waitUntilExit()
-        }
-
-        if trackProcess { currentInstallProcess = nil }
+        process.waitUntilExit()
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
@@ -863,6 +768,46 @@ class LaunchAtLoginManager {
     }
 }
 
+// MARK: - Legacy TTS cleanup
+
+/// Text-to-speech was removed. Versions that had it started a Higgs Audio server
+/// (`python ~/.popdraft/llm-tts-server.py`) at launch; it held ~14 GB of GPU
+/// memory and outlives the app, updates included. Stop it — ONLY that process:
+/// the PID file's pid is re-verified by its command line, and the process-table
+/// sweep uses the same guarded match (`LegacyTTSServer.isServer`, this user only)
+/// — then delete the now-useless script, PID file and log. The Python venv and
+/// the downloaded voice model are the user's to delete; never touched here.
+/// Idempotent. BLOCKS — call off the main thread.
+enum LegacyTTSCleanup {
+    static func run() {
+        let home = NSHomeDirectory()
+        let fm = FileManager.default
+        let pidFile = LegacyTTSServer.pidFilePath(home: home)
+
+        var pids = OwnedProcesses.pids { LegacyTTSServer.isServer(command: $0, home: home) }
+        if let text = try? String(contentsOfFile: pidFile, encoding: .utf8),
+           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+           !pids.contains(pid),
+           let command = OwnedProcesses.command(of: pid),
+           LegacyTTSServer.isServer(command: command, home: home) {
+            pids.append(pid)
+        }
+        if !pids.isEmpty {
+            OwnedProcesses.terminate(pids)
+            Logger.shared.info("Stopped leftover TTS server (text-to-speech was removed): pids \(pids)")
+        }
+
+        let leftovers = [
+            LegacyTTSServer.scriptPath(home: home),
+            pidFile,
+            (home as NSString).appendingPathComponent(".popdraft/tts-server.log"),
+        ]
+        for path in leftovers where fm.fileExists(atPath: path) {
+            try? fm.removeItem(atPath: path)
+        }
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -991,39 +936,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             bubbleController?.show()
         }
 
-        // Start TTS server if needed
-        TTSServerManager.shared.ensureRunning()
+        // Text-to-speech was removed. Older versions left its Higgs server running
+        // (it outlives the app, ~14 GB of GPU memory) — stop it and delete its
+        // now-useless script / PID file. Off the main thread (runs ps, waits).
+        DispatchQueue.global(qos: .utility).async {
+            LegacyTTSCleanup.run()
+        }
 
         // PR6: compile the web engine's content-blocking rules once at startup
         // (cached by WebKit). The engine itself is lazy; this just primes it.
         Task { @MainActor in await WebEngine.shared.warmUp() }
 
-        // Ensure llama.cpp server is running if configured
+        // The local llama-server runs ONLY for the llama.cpp provider: start it
+        // (and its status polling) for llama.cpp; for Ollama / OpenAI / Claude stop
+        // one left running by a previous session or started by launchd at login.
         let config = LLMConfig.load()
+        LlamaServerManager.shared.onStatusChanged = { [weak self] status in
+            self?.updateServerStatusMenuItem(status)
+        }
+        activeProviderChanged(to: config.provider)
+
         if config.provider == .llamacpp {
-            let plistPath = NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath
-            if FileManager.default.fileExists(atPath: plistPath) {
-                DispatchQueue.global(qos: .utility).async {
-                    let uid = getuid()
-                    // Ensure service is enabled
-                    let enableProcess = Process()
-                    enableProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                    enableProcess.arguments = ["enable", "gui/\(uid)/com.popdraft.llama-server"]
-                    enableProcess.standardOutput = FileHandle.nullDevice
-                    enableProcess.standardError = FileHandle.nullDevice
-                    try? enableProcess.run()
-                    enableProcess.waitUntilExit()
-
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                    process.arguments = ["bootstrap", "gui/\(uid)", plistPath]
-                    process.standardOutput = FileHandle.nullDevice
-                    process.standardError = FileHandle.nullDevice
-                    try? process.run()
-                    process.waitUntilExit()
-                }
-            }
-
             // Ensure llama.cpp is up to date for newer models
             DispatchQueue.global(qos: .background).async {
                 let process = Process()
@@ -1034,16 +967,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try? process.run()
                 process.waitUntilExit()
             }
-        }
-
-        // Start llama.cpp server monitoring
-        if config.provider == .llamacpp {
-            LlamaServerManager.shared.onStatusChanged = { [weak self] status in
-                self?.updateServerStatusMenuItem(status)
-            }
-            LlamaServerManager.shared.startPolling()
-        } else {
-            serverStatusMenuItem?.isHidden = true
         }
 
         // `see_image` runs on the ACTIVE model now — the dedicated :10820 vision
@@ -1117,7 +1040,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         HotkeyManager.shared.unregisterAll()
-        TTSServerManager.shared.stopServer()
+    }
+
+    /// The active provider changed (startup, Settings, the in-chat model
+    /// switcher). The local llama-server only runs for llama.cpp: start it (and
+    /// the menu's status line) when switching to llama.cpp, stop it when
+    /// switching away. `startServer: false` when the caller restarts it on a new
+    /// model itself.
+    func activeProviderChanged(to provider: LLMConfig.Provider, startServer: Bool = true) {
+        serverStatusMenuItem?.isHidden = provider != .llamacpp
+        LlamaServerManager.shared.applyProvider(provider, startServer: startServer)
     }
 
     /// Whether the persistent corner bubble is enabled in config (PR4).

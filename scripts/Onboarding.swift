@@ -225,15 +225,6 @@ struct OnboardingView: View {
                         Text("This may take a few moments...")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
-                        Button(action: {
-                            DependencyManager.shared.cancelInstall()
-                            finishOnboarding()
-                        }) {
-                            Text("Skip TTS Setup")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
                     }
                     .frame(height: 74)
                 } else {
@@ -357,39 +348,17 @@ struct OnboardingView: View {
                                     self.setupStatus = status
                                 },
                                 completion: { _ in
-                                    self.installTTSDependencies()
+                                    self.finishOnboarding()
                                 }
                             )
                         } else {
-                            self.installTTSDependencies()
+                            self.finishOnboarding()
                         }
                     } else {
-                        self.installTTSDependencies()
-                    }
-                }
-            }
-        }
-    }
-
-    private func installTTSDependencies() {
-        let depStatus = DependencyManager.shared.checkDependencies()
-        if depStatus.hasPythonPackages {
-            // TTS dependencies already installed (Higgs needs no espeak)
-            self.finishOnboarding()
-        } else {
-            // Install TTS dependencies
-            DependencyManager.shared.installDependencies(
-                statusCallback: { status in
-                    DispatchQueue.main.async {
-                        self.setupStatus = status
-                    }
-                },
-                completion: { _ in
-                    DispatchQueue.main.async {
                         self.finishOnboarding()
                     }
                 }
-            )
+            }
         }
     }
 
@@ -402,7 +371,7 @@ struct OnboardingView: View {
             let completePath = configDir + "/onboarding_complete"
             FileManager.default.createFile(atPath: completePath, contents: nil)
 
-            // Complete - TTS server will be started by completeStartup()
+            // Complete - completeStartup() takes it from here
             onComplete()
         }
     }

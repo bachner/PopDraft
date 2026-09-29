@@ -74,10 +74,8 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# Copy TTS server to Resources
 echo "Copying resources..."
 cp "${SCRIPT_DIR}/resources/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
-cp "${SCRIPT_DIR}/scripts/llm-tts-server.py" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/install.sh" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/uninstall.sh" "${APP_BUNDLE}/Contents/Resources/"
 cp "${SCRIPT_DIR}/README.md" "${APP_BUNDLE}/Contents/Resources/"
@@ -136,15 +134,15 @@ xattr -cr "$APP_DEST" 2>/dev/null || true
 echo "[OK] PopDraft installed"
 echo ""
 
-# Run full setup: TTS dependencies, config, and app launch
+# Run setup: config and app launch
 # install.sh detects it's running from the app bundle and skips compilation
 INSTALL_SCRIPT="$APP_DEST/Contents/Resources/install.sh"
 if [ -f "$INSTALL_SCRIPT" ]; then
-    echo "Setting up dependencies (TTS, config)..."
+    echo "Setting up PopDraft (config)..."
     echo ""
     bash "$INSTALL_SCRIPT"
 else
-    echo "[WARN] Setup script not found, launching without TTS setup..."
+    echo "[WARN] Setup script not found, launching without setup..."
     open "$APP_DEST"
 fi
 

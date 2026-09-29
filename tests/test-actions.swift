@@ -8,17 +8,18 @@ import Foundation
 
 enum ActionType: String, Codable, CaseIterable {
     case llm = "llm"
-    case tts = "tts"
     case command = "command"
+    // (Retired: "tts" — text-to-speech was removed; saved TTS actions are dropped.)
 
     var label: String {
         switch self {
         case .llm: return "LLM"
-        case .tts: return "TTS"
         case .command: return "CMD"
         }
     }
 }
+
+struct RetiredActionTypeError: Error {}
 
 struct Action: Identifiable, Hashable {
     var id: String
@@ -65,10 +66,15 @@ extension Action: Codable {
         order = try container.decode(Int.self, forKey: .order)
         isDefault = try container.decode(Bool.self, forKey: .isDefault)
 
-        if let type = try container.decodeIfPresent(ActionType.self, forKey: .actionType) {
+        if let raw = try container.decodeIfPresent(String.self, forKey: .actionType) {
+            if raw == "tts" { throw RetiredActionTypeError() }
+            guard let type = ActionType(rawValue: raw) else {
+                throw DecodingError.dataCorruptedError(forKey: .actionType, in: container, debugDescription: raw)
+            }
             actionType = type
         } else if let isTTS = try container.decodeIfPresent(Bool.self, forKey: .isTTS) {
-            actionType = isTTS ? .tts : .llm
+            if isTTS { throw RetiredActionTypeError() }
+            actionType = .llm
         } else {
             actionType = .llm
         }
@@ -93,6 +99,30 @@ struct ActionsFile: Codable {
     var actions: [Action]
     var customPromptShortcut: String?
     var customPromptEnabled: Bool?
+    var droppedRetiredActions: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case version, actions, customPromptShortcut, customPromptEnabled
+    }
+}
+
+extension ActionsFile {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version)
+        let entries = try c.decode([DecodedAction].self, forKey: .actions)
+        actions = entries.compactMap(\.action)
+        droppedRetiredActions = entries.count - actions.count
+        customPromptShortcut = try c.decodeIfPresent(String.self, forKey: .customPromptShortcut)
+        customPromptEnabled = try c.decodeIfPresent(Bool.self, forKey: .customPromptEnabled)
+    }
+}
+
+private struct DecodedAction: Decodable {
+    let action: Action?
+    init(from decoder: Decoder) throws {
+        do { action = try Action(from: decoder) } catch is RetiredActionTypeError { action = nil }
+    }
 }
 
 private struct LegacyCustomAction: Codable {
@@ -126,8 +156,6 @@ class ActionManager {
         Action(id: "continue_writing", name: "Continue writing", icon: "arrow.right.circle.fill",
                prompt: "Continue writing from where this text ends, matching the style and tone. Only output the continuation, nothing else. Preserve the original language.",
                isEnabled: true, order: 4, isDefault: true),
-        Action(id: "read_aloud", name: "Read aloud", icon: "speaker.wave.2.fill",
-               prompt: "", shortcut: "S", actionType: .tts, isEnabled: true, order: 5, isDefault: true),
     ]
 
     init(actionsFilePath: String) {
@@ -323,14 +351,15 @@ func cleanup(_ path: String) {
 
 print("Running Action system tests...\n")
 
-test("Fresh install - seeds 6 defaults") {
+test("Fresh install - seeds 5 defaults (no Read aloud)") {
     let path = createTempPath()
     defer { cleanup(path) }
 
     let mgr = ActionManager(actionsFilePath: path)
-    assert(mgr.actions.count == 6, "Expected 6 actions, got \(mgr.actions.count)")
+    assert(mgr.actions.count == 5, "Expected 5 actions, got \(mgr.actions.count)")
     assert(mgr.actions[0].id == "fix_grammar_and_spelling", "First action should be grammar")
-    assert(mgr.actions[5].id == "read_aloud", "Last action should be read_aloud")
+    assert(mgr.actions[4].id == "continue_writing", "Last action should be continue_writing")
+    assert(!mgr.actions.contains(where: { $0.id == "read_aloud" }), "No read_aloud default")
     assert(mgr.customPromptShortcut == "P", "Custom prompt shortcut should be P")
 
     // Verify file was created
@@ -364,11 +393,7 @@ test("Fresh install - correct action types") {
 
     let mgr = ActionManager(actionsFilePath: path)
     for action in mgr.actions {
-        if action.id == "read_aloud" {
-            assert(action.actionType == .tts, "read_aloud should be TTS type")
-        } else {
-            assert(action.actionType == .llm, "\(action.id) should be LLM type")
-        }
+        assert(action.actionType == .llm, "\(action.id) should be LLM type")
     }
 }
 
@@ -383,12 +408,12 @@ test("Old format migration - bare array") {
     try! data.write(to: URL(fileURLWithPath: path))
 
     let mgr = ActionManager(actionsFilePath: path)
-    assert(mgr.actions.count == 7, "Expected 6 defaults + 1 custom = 7, got \(mgr.actions.count)")
+    assert(mgr.actions.count == 6, "Expected 5 defaults + 1 custom = 6, got \(mgr.actions.count)")
     assert(mgr.actions.last?.name == "My Custom", "Last action should be custom")
     assert(mgr.actions.last?.isDefault == false, "Custom action should not be isDefault")
 }
 
-test("v2 format migration - isTTS field maps to actionType") {
+test("v2 format migration - isTTS:false maps to LLM, retired isTTS:true is dropped") {
     let path = createTempPath()
     defer { cleanup(path) }
 
@@ -425,9 +450,9 @@ test("v2 format migration - isTTS field maps to actionType") {
     try! v2Json.write(to: URL(fileURLWithPath: path))
 
     let mgr = ActionManager(actionsFilePath: path)
-    assert(mgr.actions.count == 2, "Expected 2 actions")
+    assert(mgr.actions.count == 1, "Expected 1 action (TTS Read aloud dropped), got \(mgr.actions.count)")
     assert(mgr.actions[0].actionType == .llm, "Grammar should be LLM type (migrated from isTTS: false)")
-    assert(mgr.actions[1].actionType == .tts, "Read aloud should be TTS type (migrated from isTTS: true)")
+    assert(mgr.customPromptShortcut == "P", "Rest of the file still loads")
 }
 
 test("v3 format load - preserves actionType") {
@@ -471,7 +496,6 @@ test("Command action type - create and persist") {
 
 test("ActionType label") {
     assert(ActionType.llm.label == "LLM", "LLM label")
-    assert(ActionType.tts.label == "TTS", "TTS label")
     assert(ActionType.command.label == "CMD", "CMD label")
 }
 
@@ -561,7 +585,7 @@ test("visibleActions - only enabled and sorted") {
     mgr.toggleEnabled("articulate")
 
     let visible = mgr.visibleActions
-    assert(visible.count == 5, "Should have 5 visible (6 - 1 disabled)")
+    assert(visible.count == 4, "Should have 4 visible (5 - 1 disabled)")
     assert(!visible.contains(where: { $0.id == "articulate" }), "articulate should not be visible")
 
     // Check sorted by order
@@ -593,13 +617,13 @@ test("Restore defaults - re-adds missing") {
 
     let mgr = ActionManager(actionsFilePath: path)
     mgr.delete("articulate")
-    mgr.delete("read_aloud")
-    assert(mgr.actions.count == 4, "Should have 4 after deleting 2")
+    mgr.delete("continue_writing")
+    assert(mgr.actions.count == 3, "Should have 3 after deleting 2")
 
     mgr.restoreDefaults()
-    assert(mgr.actions.count == 6, "Should have 6 after restore")
+    assert(mgr.actions.count == 5, "Should have 5 after restore")
     assert(mgr.actions.contains(where: { $0.id == "articulate" }), "articulate should be back")
-    assert(mgr.actions.contains(where: { $0.id == "read_aloud" }), "read_aloud should be back")
+    assert(mgr.actions.contains(where: { $0.id == "continue_writing" }), "continue_writing should be back")
 }
 
 test("Custom prompt shortcut - stored separately") {
@@ -673,7 +697,7 @@ test("popupActions includes custom prompt when enabled") {
     let mgr = ActionManager(actionsFilePath: path)
     let popup = mgr.popupActions
     assert(popup.last?.id == "custom_prompt", "Last popup action should be custom_prompt")
-    assert(popup.count == 7, "6 visible + 1 custom prompt = 7")
+    assert(popup.count == 6, "5 visible + 1 custom prompt = 6")
 }
 
 test("popupActions excludes custom prompt when disabled") {
@@ -683,7 +707,7 @@ test("popupActions excludes custom prompt when disabled") {
     let mgr = ActionManager(actionsFilePath: path)
     mgr.customPromptEnabled = false
     let popup = mgr.popupActions
-    assert(popup.count == 6, "6 visible, no custom prompt = 6, got \(popup.count)")
+    assert(popup.count == 5, "5 visible, no custom prompt = 5, got \(popup.count)")
     assert(!popup.contains(where: { $0.id == "custom_prompt" }), "custom_prompt should not be in popup")
 }
 
@@ -742,10 +766,10 @@ test("Toggle enabled - each action can be toggled independently") {
     }
 
     mgr.toggleEnabled("fix_grammar_and_spelling")
-    mgr.toggleEnabled("read_aloud")
+    mgr.toggleEnabled("continue_writing")
 
     assert(!mgr.actions.first(where: { $0.id == "fix_grammar_and_spelling" })!.isEnabled, "Grammar should be disabled")
-    assert(!mgr.actions.first(where: { $0.id == "read_aloud" })!.isEnabled, "Read aloud should be disabled")
+    assert(!mgr.actions.first(where: { $0.id == "continue_writing" })!.isEnabled, "Continue writing should be disabled")
     assert(mgr.actions.first(where: { $0.id == "articulate" })!.isEnabled, "Articulate should still be enabled")
 }
 
@@ -771,13 +795,13 @@ test("visibleActions - disabled actions excluded from popup") {
     let mgr = ActionManager(actionsFilePath: path)
     mgr.toggleEnabled("fix_grammar_and_spelling")
     mgr.toggleEnabled("articulate")
-    mgr.toggleEnabled("read_aloud")
+    mgr.toggleEnabled("continue_writing")
 
     let visible = mgr.visibleActions
-    assert(visible.count == 3, "Should have 3 visible (6 - 3 disabled), got \(visible.count)")
+    assert(visible.count == 2, "Should have 2 visible (5 - 3 disabled), got \(visible.count)")
     assert(!visible.contains(where: { $0.id == "fix_grammar_and_spelling" }), "Grammar should not be visible")
     assert(!visible.contains(where: { $0.id == "articulate" }), "Articulate should not be visible")
-    assert(!visible.contains(where: { $0.id == "read_aloud" }), "Read aloud should not be visible")
+    assert(!visible.contains(where: { $0.id == "continue_writing" }), "Continue writing should not be visible")
 }
 
 // MARK: - Reorder Tests
@@ -815,12 +839,12 @@ test("Move - order persists after save/load") {
     defer { cleanup(path) }
 
     let mgr = ActionManager(actionsFilePath: path)
-    mgr.move(fromIndex: 5, toIndex: 0) // Move read_aloud to top
+    mgr.move(fromIndex: 4, toIndex: 0) // Move continue_writing to top
     mgr.save()
 
     let mgr2 = ActionManager(actionsFilePath: path)
     let sorted = mgr2.actions.sorted { $0.order < $1.order }
-    assert(sorted[0].id == "read_aloud", "Read aloud should be first after reload, got \(sorted[0].id)")
+    assert(sorted[0].id == "continue_writing", "Continue writing should be first after reload, got \(sorted[0].id)")
 }
 
 test("Move - last item cannot move down (stays in place)") {
@@ -851,7 +875,7 @@ test("All default action types are correct") {
     assert(sorted[2].actionType == .llm, "Explain simply should be LLM")
     assert(sorted[3].actionType == .llm, "Craft a reply should be LLM")
     assert(sorted[4].actionType == .llm, "Continue writing should be LLM")
-    assert(sorted[5].actionType == .tts, "Read aloud should be TTS")
+    assert(sorted.count == 5, "No Read aloud (TTS) default")
 }
 
 test("Add command action and verify in popup") {
@@ -867,7 +891,7 @@ test("Add command action and verify in popup") {
     assert(visible.first(where: { $0.id == "word_count" })?.actionType == .command, "Should be command type")
 
     let popup = mgr.popupActions
-    assert(popup.count == 8, "6 defaults + 1 command + 1 custom prompt = 8, got \(popup.count)")
+    assert(popup.count == 7, "5 defaults + 1 command + 1 custom prompt = 7, got \(popup.count)")
 }
 
 test("Disable command action removes from visibleActions") {
@@ -945,9 +969,9 @@ test("Add action gets highest order") {
     mgr.add(Action(id: "a2", name: "Second", icon: "star.fill", prompt: "p2"))
     mgr.add(Action(id: "a3", name: "Third", icon: "star.fill", prompt: "p3"))
 
-    assert(mgr.actions.first(where: { $0.id == "a1" })!.order == 6, "First added should be order 6")
-    assert(mgr.actions.first(where: { $0.id == "a2" })!.order == 7, "Second added should be order 7")
-    assert(mgr.actions.first(where: { $0.id == "a3" })!.order == 8, "Third added should be order 8")
+    assert(mgr.actions.first(where: { $0.id == "a1" })!.order == 5, "First added should be order 5")
+    assert(mgr.actions.first(where: { $0.id == "a2" })!.order == 6, "Second added should be order 6")
+    assert(mgr.actions.first(where: { $0.id == "a3" })!.order == 7, "Third added should be order 7")
 }
 
 // MARK: - Results

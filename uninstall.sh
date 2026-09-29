@@ -43,6 +43,10 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f ~/bin/PopDraft ~/bin/PopDraftApp 2>/dev/null || true
     rm -f ~/bin/setup-workflows.sh 2>/dev/null || true
     rm -f ~/.llm-tts-server.pid 2>/dev/null || true
+    # Text-to-speech was removed from PopDraft: drop its Python venv (torch etc.)
+    # and leftover server files from older installs.
+    rm -rf ~/.popdraft/tts-venv 2>/dev/null || true
+    rm -f ~/.popdraft/llm-tts-server.py ~/.popdraft/tts-server.log 2>/dev/null || true
 
     # Remove legacy workflows
     rm -rf ~/Library/Services/LLM*.workflow 2>/dev/null || true

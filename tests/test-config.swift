@@ -90,8 +90,8 @@ test("Legacy plaintext migration - every field maps correctly") {
     assert(c.claudeThinkingBudget == 20000, "claudeThinkingBudget")
     assert(c.ollamaEnableThinking == true, "ollamaEnableThinking")
     assert(c.llamacppEnableThinking == true, "llamacppEnableThinking")
-    assert(c.ttsVoice == "af_bella", "ttsVoice")
-    assert(c.ttsSpeed == 1.25, "ttsSpeed")
+    // TTS_VOICE / TTS_SPEED are retired (text-to-speech was removed): the legacy
+    // lines above are ignored without disturbing the keys around them.
     assert(c.disabledBuiltInActions == ["articulate", "read_aloud"], "disabledBuiltInActions")
     assert(c.customShortcuts == ["explain_simply": "E", "craft_a_reply": "R"], "customShortcuts (embedded JSON)")
     assert(c.popupHotkey == "J", "popupHotkey")
@@ -104,10 +104,11 @@ test("Legacy plaintext migration - unknown keys / comments / blanks ignored") {
 
     UNKNOWN_KEY=whatever
     TTS_SPEED=2.0
+    POPUP_HOTKEY=K
     """
     let c = AppConfig.migrateLegacyPlaintext(text)
     assert(c.provider == "ollama", "known key parsed")
-    assert(c.ttsSpeed == 2.0, "second known key parsed")
+    assert(c.popupHotkey == "K", "known key after a retired (TTS_SPEED) key parsed")
     // Unrecognized values fall back to defaults.
     assert(c.openaiModel == "gpt-4o", "default kept for absent key")
 }
@@ -161,7 +162,6 @@ test("New fields default when absent from JSON") {
     assert(BubbleCorner.parse(c.bubble.corner) == .bottomRight, "BubbleCorner.parse maps default")
     assert(BubbleCorner.parse("garbage") == .bottomRight, "BubbleCorner.parse falls back for unknown")
     // Absent legacy fields also get defaults.
-    assert(c.ttsVoice == "af_heart", "ttsVoice defaults")
     assert(c.popupHotkey == "Space", "popupHotkey defaults")
 }
 
@@ -171,15 +171,35 @@ test("Load rule (a): full v2 config.json is used as-is") {
 
     var saved = AppConfig()
     saved.provider = "openai"
-    saved.ttsVoice = "af_nicole"
+    saved.popupHotkey = "K"
     assert(saved.save(to: dir), "save")
 
     // Also drop a stale legacy plaintext that should be IGNORED because v2 JSON wins.
-    write("PROVIDER=ollama\nTTS_VOICE=af_heart", to: dir, named: "config")
+    write("PROVIDER=ollama\nPOPUP_HOTKEY=J", to: dir, named: "config")
 
     let c = AppConfig.load(dir: dir)
     assert(c.provider == "openai", "v2 JSON wins over legacy plaintext, got \(c.provider)")
-    assert(c.ttsVoice == "af_nicole", "v2 JSON value used")
+    assert(c.popupHotkey == "K", "v2 JSON value used")
+}
+
+test("Retired TTS keys in a v2 config.json are ignored and not re-written") {
+    let dir = createTempDir()
+    defer { cleanup(dir) }
+
+    // A config written by a version that still had text-to-speech.
+    write(#"{"version":2,"provider":"ollama","ollamaModel":"qwen3.5:4b","ttsVoice":"Hebrew","ttsSpeed":1.3,"popupHotkey":"K"}"#,
+          to: dir, named: "config.json")
+
+    let c = AppConfig.load(dir: dir)
+    assert(c.provider == "ollama", "provider still loads alongside retired keys, got \(c.provider)")
+    assert(c.ollamaModel == "qwen3.5:4b", "ollamaModel still loads")
+    assert(c.popupHotkey == "K", "popupHotkey still loads")
+
+    assert(c.save(to: dir), "save")
+    let raw = String(data: FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent("config.json")) ?? Data(),
+                     encoding: .utf8) ?? ""
+    assert(!raw.contains("ttsVoice") && !raw.contains("ttsSpeed"), "retired TTS keys are not written back")
+    assert(AppConfig.load(dir: dir).provider == "ollama", "re-saved config round-trips")
 }
 
 test("Load rule (b): legacy plaintext WINS over legacy minimal JSON stub") {
@@ -187,7 +207,7 @@ test("Load rule (b): legacy plaintext WINS over legacy minimal JSON stub") {
     defer { cleanup(dir) }
 
     // Legacy plaintext sets several fields, including provider.
-    write("PROVIDER=ollama\nOLLAMA_MODEL=mistral\nTTS_SPEED=1.5", to: dir, named: "config")
+    write("PROVIDER=ollama\nOLLAMA_MODEL=mistral\nPOPUP_HOTKEY=K", to: dir, named: "config")
     // Legacy minimal/partial JSON stub (version < 2) disagrees on provider.
     write(#"{"provider":"claude"}"#, to: dir, named: "config.json")
 
@@ -195,7 +215,7 @@ test("Load rule (b): legacy plaintext WINS over legacy minimal JSON stub") {
     // Plaintext is the old binary's real source of truth -> it wins over the stub.
     assert(c.provider == "ollama", "plaintext provider wins over stub, got \(c.provider)")
     assert(c.ollamaModel == "mistral", "plaintext value retained")
-    assert(c.ttsSpeed == 1.5, "plaintext value retained")
+    assert(c.popupHotkey == "K", "plaintext value retained")
 }
 
 test("Upgrade regression: install.sh stub must NOT reset a real plaintext config") {
