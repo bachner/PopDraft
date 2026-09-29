@@ -19,7 +19,6 @@ enum PopupState {
     case customPrompt
     case processing
     case streaming(text: String, isThinking: Bool)
-    case ttsPlaying(isPaused: Bool)
     case result(String, thinking: String?)
     case error(String)
     /// PR8: the full Claude-style agent chat. The conversation state lives in the
@@ -44,9 +43,6 @@ struct PopupView: View {
     let onCopy: () -> Void
     let onBack: () -> Void
     let onDismiss: () -> Void
-    let onTTSStop: () -> Void
-    let onTTSPause: () -> Void
-    let onTTSResume: () -> Void
     let onOpenAccessibilitySettings: () -> Void
     let onRestartLlamaServer: () -> Void
     /// PR8: present when `state == .chat`. Drives the full agent ChatView.
@@ -71,8 +67,6 @@ struct PopupView: View {
                 processingView
             case .streaming(let text, let isThinking):
                 streamingView(text: text, isThinking: isThinking)
-            case .ttsPlaying(let isPaused):
-                ttsPlayingView(isPaused: isPaused)
             case .result(let text, let thinking):
                 resultView(text: text, thinking: thinking)
             case .error(let message):
@@ -120,7 +114,6 @@ struct PopupView: View {
         case .customPrompt: return "customPrompt"
         case .processing: return "processing"
         case .streaming: return "streaming"
-        case .ttsPlaying: return "ttsPlaying"
         case .result: return "result"
         case .error: return "error"
         case .chat: return "chat"
@@ -297,74 +290,6 @@ struct PopupView: View {
                 .frame(maxHeight: 200)
             }
         }
-    }
-
-    // MARK: - TTS Playing View
-
-    private func ttsPlayingView(isPaused: Bool) -> some View {
-        VStack(spacing: 8) {
-            // Header with status
-            HStack(spacing: 8) {
-                Image(systemName: "speaker.wave.2.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(.accentColor)
-
-                Text(isPaused ? "Paused" : "Reading...")
-                    .font(.system(size: 12, weight: .medium))
-
-                Spacer()
-
-                // Keyboard hints
-                Text("Space: \(isPaused ? "Play" : "Pause") | Esc: Stop")
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-
-            // Compact control buttons
-            HStack(spacing: 8) {
-                // Pause/Resume button
-                Button(action: {
-                    if isPaused {
-                        onTTSResume()
-                    } else {
-                        onTTSPause()
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: isPaused ? "play.fill" : "pause.fill")
-                            .font(.system(size: 10))
-                        Text(isPaused ? "Play" : "Pause")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(5)
-                }
-                .buttonStyle(.plain)
-
-                // Stop button
-                Button(action: onTTSStop) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 10))
-                        Text("Stop")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(Color.red.opacity(0.15))
-                    .foregroundColor(.red)
-                    .cornerRadius(5)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 10)
-        }
-        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Result View
@@ -661,7 +586,6 @@ class PopupWindowController: NSWindowController {
     private var clipboardText = ""
     private var resultText = ""
     private var localMonitor: Any?
-    private var ttsStatusTimer: Timer?
     private var previousApp: NSRunningApplication?
 
     /// The last app that was frontmost BEFORE PopDraft activated itself. Showing
@@ -694,7 +618,7 @@ class PopupWindowController: NSWindowController {
     /// Called right before the popup is shown at the cursor — used to minimize
     /// the corner bubble (PR4). The popup itself stays bubble-agnostic.
     var onWillShow: (() -> Void)?
-    /// Called when the popup is dismissed (copy / Esc / lost focus / TTS done) —
+    /// Called when the popup is dismissed (copy / Esc / lost focus) —
     /// used to bring the corner bubble back (PR4).
     var onDidDismiss: (() -> Void)?
 
@@ -808,9 +732,6 @@ class PopupWindowController: NSWindowController {
             onCopy: { [weak self] in self?.copyResult() },
             onBack: { [weak self] in self?.goBack() },
             onDismiss: { [weak self] in self?.dismiss() },
-            onTTSStop: { [weak self] in self?.stopTTS() },
-            onTTSPause: { [weak self] in self?.pauseTTS() },
-            onTTSResume: { [weak self] in self?.resumeTTS() },
             onOpenAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() },
             onRestartLlamaServer: { [weak self] in self?.restartLlamaServer() },
             chatViewModel: chatViewModel
@@ -1317,7 +1238,6 @@ class PopupWindowController: NSWindowController {
         // empty/aborted session is skipped by hasMeaningfulExchange).
         flushSessionIfMeaningful()
 
-        stopTTSStatusPolling()
         stopKeyboardMonitoring()
 
         // The chat closes with a quick shrink + fade, and the bubble then
@@ -1428,23 +1348,10 @@ class PopupWindowController: NSWindowController {
                 switch self.state {
                 case .actionList, .result, .error:
                     self.dismiss()
-                case .ttsPlaying:
-                    self.stopTTS()  // Stop TTS and dismiss
                 default:
                     self.goBack()
                 }
                 return nil
-
-            case 49: // Space - pause/play TTS
-                if case .ttsPlaying(let isPaused) = self.state {
-                    if isPaused {
-                        self.resumeTTS()
-                    } else {
-                        self.pauseTTS()
-                    }
-                    return nil
-                }
-                return event
 
             case 125: // Down arrow
                 if case .actionList = self.state, self.selectedIndex < actions.count - 1 {
@@ -1520,7 +1427,7 @@ class PopupWindowController: NSWindowController {
             return
         }
 
-        // Text-transformation and Read-aloud actions genuinely need text to act on.
+        // Text-transformation and command actions genuinely need text to act on.
         // If nothing was captured (nothing selected, OR the frontmost app — e.g. a
         // terminal — doesn't expose its selection), say so instead of acting on ""
         guard !clipboardText.isEmpty else {
@@ -1538,23 +1445,6 @@ class PopupWindowController: NSWindowController {
         updateView()
 
         switch action.actionType {
-        case .tts:
-            TTSClient.shared.speak(text: clipboardText) { [weak self] result in
-                DispatchQueue.main.async {
-                    switch result {
-                    case .success:
-                        Logger.shared.info("TTS playback started")
-                        self?.state = .ttsPlaying(isPaused: false)
-                        self?.updateView()
-                        self?.startTTSStatusPolling()
-                    case .failure(let error):
-                        Logger.shared.error("TTS failed: \(error.localizedDescription)")
-                        self?.state = .error("TTS Error: \(error.localizedDescription)\n\nMake sure the TTS server is running.")
-                        self?.updateView()
-                    }
-                }
-            }
-
         case .command:
             let commandTemplate = action.prompt
             Logger.shared.info("Running command action: \(commandTemplate)")
@@ -2151,53 +2041,6 @@ class PopupWindowController: NSWindowController {
         // Show brief feedback then dismiss
         showNotification(title: "PopDraft", message: "Copied to clipboard")
         dismiss()
-    }
-
-    // MARK: - TTS Controls
-
-    private func startTTSStatusPolling() {
-        stopTTSStatusPolling()
-        ttsStatusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            TTSClient.shared.checkStatus { status in
-                DispatchQueue.main.async {
-                    if status == "idle" {
-                        self?.stopTTSStatusPolling()
-                        self?.dismiss()
-                    }
-                }
-            }
-        }
-    }
-
-    private func stopTTSStatusPolling() {
-        ttsStatusTimer?.invalidate()
-        ttsStatusTimer = nil
-    }
-
-    private func stopTTS() {
-        stopTTSStatusPolling()
-        TTSClient.shared.stop()
-        dismiss()
-    }
-
-    private func pauseTTS() {
-        TTSClient.shared.pause { [weak self] success in
-            guard success else { return }
-            DispatchQueue.main.async {
-                self?.state = .ttsPlaying(isPaused: true)
-                self?.updateView()
-            }
-        }
-    }
-
-    private func resumeTTS() {
-        TTSClient.shared.resume { [weak self] success in
-            guard success else { return }
-            DispatchQueue.main.async {
-                self?.state = .ttsPlaying(isPaused: false)
-                self?.updateView()
-            }
-        }
     }
 
     private func openAccessibilitySettings() {

@@ -4,7 +4,7 @@ PopDraft go/no-go acceptance eval — deterministic corpus generator.
 
 Produces one JSONL file per category under `tests/eval/corpus/`, ~2,500+
 AGENT-PROMPT cases total, from a FIXED master seed so the corpus is fully
-reproducible. Stdlib only (like scripts/llm-tts-server.py); the only source of
+reproducible. Stdlib only; the only source of
 randomness is a per-category seeded `random.Random(...)` instance — never the
 module-level `random`.
 

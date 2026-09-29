@@ -16,19 +16,25 @@ import Network
 
 enum ActionType: String, Codable, CaseIterable {
     case llm = "llm"
-    case tts = "tts"
     case command = "command"
     case agent = "agent"   // PR7: runs the tool-calling agent loop
+    // (Retired: "tts" — the text-to-speech "Read aloud" action was removed. Saved
+    //  actions of that type are dropped on load; see `RetiredActionTypeError`.)
 
     var label: String {
         switch self {
         case .llm: return "LLM"
-        case .tts: return "TTS"
         case .command: return "CMD"
         case .agent: return "AGENT"
         }
     }
 }
+
+/// Thrown while decoding a saved action of a REMOVED type — text-to-speech
+/// ("Read aloud"): `"actionType": "tts"`, or the legacy `"isTTS": true`. The
+/// actions-file loader drops such entries rather than failing the whole file
+/// (which would reset every user action to the defaults).
+struct RetiredActionTypeError: Error {}
 
 struct Action: Identifiable, Hashable {
     var id: String
@@ -66,7 +72,7 @@ struct Action: Identifiable, Hashable {
 extension Action: Codable {
     enum CodingKeys: String, CodingKey {
         case id, name, icon, prompt, shortcut, actionType, isEnabled, order, isDefault
-        case isTTS  // legacy field for backward compatibility
+        case isTTS  // legacy field (pre-actionType files) — read only, never written
     }
 
     init(from decoder: Decoder) throws {
@@ -80,11 +86,18 @@ extension Action: Codable {
         order = try container.decode(Int.self, forKey: .order)
         isDefault = try container.decode(Bool.self, forKey: .isDefault)
 
-        // Try new actionType first, fall back to legacy isTTS
-        if let type = try container.decodeIfPresent(ActionType.self, forKey: .actionType) {
+        // Try new actionType first, fall back to legacy isTTS. Text-to-speech
+        // actions are retired: signal them so the file loader can drop them.
+        if let raw = try container.decodeIfPresent(String.self, forKey: .actionType) {
+            if raw == "tts" { throw RetiredActionTypeError() }
+            guard let type = ActionType(rawValue: raw) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .actionType, in: container, debugDescription: "Unknown actionType '\(raw)'")
+            }
             actionType = type
         } else if let isTTS = try container.decodeIfPresent(Bool.self, forKey: .isTTS) {
-            actionType = isTTS ? .tts : .llm
+            if isTTS { throw RetiredActionTypeError() }
+            actionType = .llm
         } else {
             actionType = .llm
         }
@@ -109,6 +122,38 @@ struct ActionsFile: Codable {
     var actions: [Action]
     var customPromptShortcut: String?
     var customPromptEnabled: Bool?
+    /// Retired (text-to-speech) actions dropped while decoding. Not persisted.
+    var droppedRetiredActions: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case version, actions, customPromptShortcut, customPromptEnabled
+    }
+}
+
+extension ActionsFile {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version)
+        let entries = try c.decode([DecodedAction].self, forKey: .actions)
+        actions = entries.compactMap(\.action)
+        droppedRetiredActions = entries.count - actions.count
+        customPromptShortcut = try c.decodeIfPresent(String.self, forKey: .customPromptShortcut)
+        customPromptEnabled = try c.decodeIfPresent(Bool.self, forKey: .customPromptEnabled)
+    }
+}
+
+/// One saved action, or nil when it's of a retired type — so a stale "Read
+/// aloud" entry can't make the whole actions file unreadable.
+private struct DecodedAction: Decodable {
+    let action: Action?
+
+    init(from decoder: Decoder) throws {
+        do {
+            action = try Action(from: decoder)
+        } catch is RetiredActionTypeError {
+            action = nil
+        }
+    }
 }
 
 // Legacy type for migration from old actions.json format
@@ -227,8 +272,6 @@ struct LLMConfig {
     var claudeThinkingBudget: Int = 10000
     var ollamaEnableThinking: Bool = false
     var llamacppEnableThinking: Bool = false
-    var ttsVoice: String = "auto"
-    var ttsSpeed: Double = 1.0
     var popupHotkey: String = "Space"  // Main popup hotkey (with Option modifier)
 
     /// A non-empty API key switches the Ollama provider to Ollama Cloud
@@ -249,33 +292,6 @@ struct LLMConfig {
     // PR9: agent + Mac-control + MCP settings (carried through to AppConfig).
     var agentSettings: AgentSettings = AgentSettings()
     var mcpServers: [MCPServerConfig] = []
-
-    // TTS "voices" for Higgs Audio v3 — one high-quality base voice; the LANGUAGE
-    // is the knob. "Auto-detect" (the default) reads the text's script, so Hebrew
-    // and English selections just work with no picking. Higgs supports 100+
-    // languages; this is a curated subset. The selected id is sent to the server as
-    // the `voice` field and maps to Higgs' `language`.
-    static let ttsVoiceLanguages: [String] = ["Automatic", "Languages"]
-
-    static let ttsVoices: [(id: String, name: String, language: String)] = [
-        ("auto", "Auto-detect (from text)", "Automatic"),
-        ("English", "English", "Languages"),
-        ("Hebrew", "Hebrew — עברית", "Languages"),
-        ("Spanish", "Spanish — Español", "Languages"),
-        ("French", "French — Français", "Languages"),
-        ("German", "German — Deutsch", "Languages"),
-        ("Italian", "Italian — Italiano", "Languages"),
-        ("Portuguese", "Portuguese — Português", "Languages"),
-        ("Russian", "Russian — Русский", "Languages"),
-        ("Arabic", "Arabic — العربية", "Languages"),
-        ("Chinese", "Chinese — 中文", "Languages"),
-        ("Japanese", "Japanese — 日本語", "Languages"),
-        ("Korean", "Korean — 한국어", "Languages"),
-        ("Hindi", "Hindi — हिन्दी", "Languages"),
-        ("Dutch", "Dutch — Nederlands", "Languages"),
-        ("Turkish", "Turkish — Türkçe", "Languages"),
-        ("Polish", "Polish — Polski", "Languages"),
-    ]
 
     // Model lists
     static let openaiModels = [
@@ -336,8 +352,6 @@ struct LLMConfig {
         self.claudeThinkingBudget = app.claudeThinkingBudget
         self.ollamaEnableThinking = app.ollamaEnableThinking
         self.llamacppEnableThinking = app.llamacppEnableThinking
-        self.ttsVoice = app.ttsVoice
-        self.ttsSpeed = app.ttsSpeed
         self.popupHotkey = app.popupHotkey
         self.disabledBuiltInActions = app.disabledBuiltInActions
         self.customShortcuts = app.customShortcuts
@@ -367,8 +381,6 @@ struct LLMConfig {
         app.claudeThinkingBudget = claudeThinkingBudget
         app.ollamaEnableThinking = ollamaEnableThinking
         app.llamacppEnableThinking = llamacppEnableThinking
-        app.ttsVoice = ttsVoice
-        app.ttsSpeed = ttsSpeed
         app.popupHotkey = popupHotkey
         app.disabledBuiltInActions = disabledBuiltInActions
         app.customShortcuts = customShortcuts
@@ -419,8 +431,6 @@ struct LLMConfig {
         lines.append("CLAUDE_THINKING_BUDGET=\(claudeThinkingBudget)")
         lines.append("OLLAMA_ENABLE_THINKING=\(ollamaEnableThinking)")
         lines.append("LLAMACPP_ENABLE_THINKING=\(llamacppEnableThinking)")
-        lines.append("TTS_VOICE=\(ttsVoice)")
-        lines.append("TTS_SPEED=\(ttsSpeed)")
         lines.append("POPUP_HOTKEY=\(popupHotkey)")
 
         let content = lines.joined(separator: "\n")

@@ -2,7 +2,7 @@
 """
 Tiny local fixture HTTP server for PopDraft WebEngine GUI tests.
 
-Python stdlib only (like scripts/llm-tts-server.py). Binds to 127.0.0.1 on an
+Python stdlib only. Binds to 127.0.0.1 on an
 ephemeral port and prints "PORT <n>" on stdout so the test harness can read it,
 then serves a fixed set of routes:
 

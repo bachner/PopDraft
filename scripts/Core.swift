@@ -216,8 +216,8 @@ struct AppConfig: Codable, Equatable {
     var claudeThinkingBudget: Int
     var ollamaEnableThinking: Bool
     var llamacppEnableThinking: Bool
-    var ttsVoice: String
-    var ttsSpeed: Double
+    // (Retired: `ttsVoice` / `ttsSpeed` — text-to-speech was removed. Old
+    //  config.json files still carry them; they're ignored and not re-written.)
     var popupHotkey: String
     var disabledBuiltInActions: [String]
     var customShortcuts: [String: String]
@@ -262,8 +262,6 @@ struct AppConfig: Codable, Equatable {
         claudeThinkingBudget: Int = 10000,
         ollamaEnableThinking: Bool = false,
         llamacppEnableThinking: Bool = false,
-        ttsVoice: String = "af_heart",
-        ttsSpeed: Double = 1.0,
         popupHotkey: String = "Space",
         disabledBuiltInActions: [String] = [],
         customShortcuts: [String: String] = [:],
@@ -294,8 +292,6 @@ struct AppConfig: Codable, Equatable {
         self.claudeThinkingBudget = claudeThinkingBudget
         self.ollamaEnableThinking = ollamaEnableThinking
         self.llamacppEnableThinking = llamacppEnableThinking
-        self.ttsVoice = ttsVoice
-        self.ttsSpeed = ttsSpeed
         self.popupHotkey = popupHotkey
         self.disabledBuiltInActions = disabledBuiltInActions
         self.customShortcuts = customShortcuts
@@ -333,8 +329,6 @@ struct AppConfig: Codable, Equatable {
         claudeThinkingBudget = try c.decodeIfPresent(Int.self, forKey: .claudeThinkingBudget) ?? d.claudeThinkingBudget
         ollamaEnableThinking = try c.decodeIfPresent(Bool.self, forKey: .ollamaEnableThinking) ?? d.ollamaEnableThinking
         llamacppEnableThinking = try c.decodeIfPresent(Bool.self, forKey: .llamacppEnableThinking) ?? d.llamacppEnableThinking
-        ttsVoice = try c.decodeIfPresent(String.self, forKey: .ttsVoice) ?? d.ttsVoice
-        ttsSpeed = try c.decodeIfPresent(Double.self, forKey: .ttsSpeed) ?? d.ttsSpeed
         popupHotkey = try c.decodeIfPresent(String.self, forKey: .popupHotkey) ?? d.popupHotkey
         disabledBuiltInActions = try c.decodeIfPresent([String].self, forKey: .disabledBuiltInActions) ?? d.disabledBuiltInActions
         customShortcuts = try c.decodeIfPresent([String: String].self, forKey: .customShortcuts) ?? d.customShortcuts
@@ -431,8 +425,6 @@ extension AppConfig {
         if let v = obj["claudeThinkingBudget"] as? Int { c.claudeThinkingBudget = v }
         if let v = obj["ollamaEnableThinking"] as? Bool { c.ollamaEnableThinking = v }
         if let v = obj["llamacppEnableThinking"] as? Bool { c.llamacppEnableThinking = v }
-        if let v = obj["ttsVoice"] as? String { c.ttsVoice = v }
-        if let v = obj["ttsSpeed"] as? Double { c.ttsSpeed = v }
         if let v = obj["popupHotkey"] as? String { c.popupHotkey = v }
         if let v = obj["disabledBuiltInActions"] as? [String] { c.disabledBuiltInActions = v }
         if let v = obj["customShortcuts"] as? [String: String] { c.customShortcuts = v }
@@ -508,10 +500,6 @@ extension AppConfig {
                 config.ollamaEnableThinking = (value == "true")
             case "LLAMACPP_ENABLE_THINKING":
                 config.llamacppEnableThinking = (value == "true")
-            case "TTS_VOICE":
-                config.ttsVoice = value
-            case "TTS_SPEED":
-                config.ttsSpeed = Double(value) ?? 1.0
             case "DISABLED_ACTIONS":
                 config.disabledBuiltInActions = value.components(separatedBy: ",").filter { !$0.isEmpty }
             case "CUSTOM_SHORTCUTS":
@@ -522,7 +510,7 @@ extension AppConfig {
             case "POPUP_HOTKEY":
                 config.popupHotkey = value
             default:
-                break
+                break   // unknown or retired (e.g. TTS_VOICE / TTS_SPEED) keys are ignored
             }
         }
 
@@ -5523,5 +5511,92 @@ enum LoginItemPolicy {
     static func shouldRewrite(existingProgramPath: String?, bundlePath: String) -> Bool {
         guard bundlePath.hasPrefix("/Applications/") else { return false }
         return existingProgramPath != programPath(forBundle: bundlePath)
+    }
+}
+
+// MARK: - Local model server policy + owned-process matching (pure decisions)
+
+/// When PopDraft's local llama-server may run. It exists ONLY to serve the
+/// llama.cpp provider: with Ollama / OpenAI / Claude (or anything else) active, a
+/// resident local model is pure memory cost (several GB), so the server is never
+/// started or auto-restarted, and a running one is stopped.
+enum LocalServerPolicy {
+    /// PopDraft's own llama-server port (what its launchd plist serves on).
+    static let ownedPort = 10819
+
+    /// Whether the local llama-server should run for the `provider` config value.
+    static func shouldRun(provider: String) -> Bool { provider == "llamacpp" }
+
+    /// True iff `command` (one `ps -o command=` value) is a llama-server PopDraft
+    /// owns: the `llama-server` binary serving our port, or serving a model from
+    /// `<home>/.popdraft/models/`. Any other llama-server is the user's own and is
+    /// never touched.
+    static func isOwnedServer(command: String, home: String) -> Bool {
+        let args = command.split(separator: " ").map(String.init)
+        guard let exe = args.first, (exe as NSString).lastPathComponent == "llama-server" else { return false }
+        let modelsDir = (home as NSString).appendingPathComponent(".popdraft/models") + "/"
+        for (i, arg) in args.enumerated() {
+            let next: String? = i + 1 < args.count ? args[i + 1] : nil
+            if arg == "--port", next == String(ownedPort) { return true }
+            if arg == "--port=\(ownedPort)" { return true }
+            if arg == "-m" || arg == "--model", let path = next, path.hasPrefix(modelsDir) { return true }
+            if arg.hasPrefix("--model="), arg.dropFirst("--model=".count).hasPrefix(modelsDir) { return true }
+        }
+        return false
+    }
+}
+
+/// What's left of the removed text-to-speech feature: older versions ran a Higgs
+/// Audio server from `~/.popdraft/llm-tts-server.py` that pinned ~14 GB of GPU
+/// memory and OUTLIVES the app (it survives updates). The new app stops it once.
+enum LegacyTTSServer {
+    /// Where older versions installed (and ran) the server script.
+    static func scriptPath(home: String) -> String {
+        (home as NSString).appendingPathComponent(".popdraft/llm-tts-server.py")
+    }
+
+    /// PID file the server wrote (removed by the server on a clean exit).
+    static func pidFilePath(home: String) -> String {
+        (home as NSString).appendingPathComponent(".llm-tts-server.pid")
+    }
+
+    /// True iff `command` is a Python interpreter running OUR installed script:
+    /// `<python…> [-flags…] <home>/.popdraft/llm-tts-server.py [args…]`. Never an
+    /// editor / `cat` / `grep` touching that file, nor a copy run from elsewhere.
+    static func isServer(command: String, home: String) -> Bool {
+        let script = scriptPath(home: home)
+        guard let r = command.range(of: " " + script) else { return false }
+        let rest = command[r.upperBound...]
+        guard rest.isEmpty || rest.hasPrefix(" ") else { return false }  // not `…server.py.bak`
+        let launcher = command[..<r.lowerBound].split(separator: " ").map(String.init)
+        guard let exe = launcher.first,
+              (exe as NSString).lastPathComponent.lowercased().hasPrefix("python") else { return false }
+        // Only interpreter flags may sit between python and the script — rules out
+        // e.g. `python3 -m py_compile <script>`.
+        return launcher.dropFirst().allSatisfy { $0.hasPrefix("-") && $0 != "-m" && $0 != "-c" }
+    }
+}
+
+/// One row of `ps -axww -o pid=,uid=,command=`.
+struct ProcessRow: Equatable {
+    let pid: Int32
+    let uid: UInt32
+    let command: String
+}
+
+enum ProcessTable {
+    /// Parse `ps -axww -o pid=,uid=,command=` output; malformed lines are skipped.
+    static func parse(_ psOutput: String) -> [ProcessRow] {
+        psOutput.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard f.count == 3, let pid = Int32(f[0]), let uid = UInt32(f[1]) else { return nil }
+            return ProcessRow(pid: pid, uid: uid, command: f[2].trimmingCharacters(in: .whitespaces))
+        }
+    }
+
+    /// PIDs owned by `uid` (never `selfPID`) whose command satisfies `matches`.
+    static func pids(in rows: [ProcessRow], uid: UInt32, selfPID: Int32,
+                     where matches: (String) -> Bool) -> [Int32] {
+        rows.filter { $0.uid == uid && $0.pid != selfPID && matches($0.command) }.map(\.pid)
     }
 }

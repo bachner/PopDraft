@@ -6,7 +6,7 @@ server** and a model (local by default, cloud opt-in), runs thousands of seeded
 cases in parallel, applies **deterministic safety + correctness checkers**, and
 emits machine-readable results for a downstream LLM-as-judge phase.
 
-Everything here is Python stdlib only (like `scripts/llm-tts-server.py`) plus
+Everything here is Python stdlib only, plus
 the fixture server in `tests/fixtures/server.py`. It does **not** modify the app.
 
 ```

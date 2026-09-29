@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PopDraft is a macOS menu bar app that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp, Ollama, OpenAI, Claude) for text generation and Higgs Audio v3 (4B) for neural TTS, run locally on Apple Silicon via MLX-Audio (100+ languages incl. Hebrew, language auto-detected from the text).
+PopDraft is a macOS menu bar app that provides system-wide LLM text processing via keyboard shortcuts. It supports multiple backends (llama.cpp, Ollama, OpenAI, Claude) for text generation. (Text-to-speech was removed: its local Higgs Audio server kept ~14 GB of GPU memory resident.)
 
 ## Key Commands
 
@@ -24,14 +24,6 @@ PopDraft is a macOS menu bar app that provides system-wide LLM text processing v
 
 # Clean removal
 ./uninstall.sh
-
-# TTS dependencies (installed by install.sh, into ~/.popdraft/tts-venv)
-# Higgs Audio v3 runs on Apple Silicon via MLX-Audio; its loader needs torch.
-# The ~8 GB voice model downloads from Hugging Face on first use.
-pip install mlx-audio torch scipy numpy librosa
-
-# Test TTS server
-curl http://127.0.0.1:7865/health
 ```
 
 ## Architecture
@@ -54,14 +46,14 @@ globs `scripts/*.swift`, so adding a file needs no build-line change. Key files:
 - `scripts/Popup.swift` - PopupView + PopupWindowController (action menu state machine)
 - `scripts/Bubble.swift` - corner bubble (lives in `Chat.swift`)
 - `scripts/Chat.swift` - ChatView, AgentChatViewModel, markdown/tool-call cards, BubbleView
-- `scripts/Settings.swift` - SettingsView + tabs (General/Models/Actions/MCP/Voice), MCP settings
+- `scripts/Settings.swift` - SettingsView + tabs (General/Models/Actions/MCP), MCP settings
 - `scripts/Onboarding.swift` - first-run onboarding
 - `scripts/Agent.swift` - LLMClient (llama.cpp/Ollama/OpenAI/Claude), PopDraftAgent, text tools, **tool self-registration bootstrap** (`BuiltinTools`)
 - `scripts/WebEngine.swift` - WebEngine, RendererPool, PinningProxy, web/browser tools
 - `scripts/MacControl.swift` - confirm-gated run_shell / run_applescript tools
 - `scripts/MCP.swift` - MCPClient / MCPManager
-- `scripts/TTS.swift`, `scripts/LlamaServer.swift`, `scripts/ActionManager.swift`,
-  `scripts/Models.swift`, `scripts/UIKitGlass.swift`, `scripts/Headless.swift` - supporting concerns
+- `scripts/LlamaServer.swift` - LlamaServerManager (local llama-server lifecycle), OwnedProcesses (leftover-process sweeps)
+- `scripts/ActionManager.swift`, `scripts/Models.swift`, `scripts/UIKitGlass.swift`, `scripts/Headless.swift` - supporting concerns
 - `scripts/Core.swift` - pure/unit-tested core (config, agent loop, tool registry, `AgentToolCatalog`)
 
 **Agent tool self-registration:** built-in tools are NOT listed in a shared
@@ -72,8 +64,24 @@ registers it into `AgentToolCatalog` (in `Core.swift`) via its `register()`;
 `BuiltinToolNames.reserved` are both DERIVED from the catalog — adding a tool is a
 change to one feature file, not an edit to a shared list.
 
-**TTS Server:**
-- `scripts/llm-tts-server.py` - Higgs Audio v3 TTS HTTP server (MLX-Audio backend; same HTTP API as before — `/speak`, `/stop`, `/pause`, `/resume`, `/status`, `/voices`, `/health` on :7865). Model loads lazily in a background thread so `/health` is instant. The `voice` field carries a Higgs language name or `auto` (auto-detect from script).
+**Local llama-server lifecycle:** the launchd job `com.popdraft.llama-server`
+(plist with RunAtLoad + KeepAlive, port 10819) runs ONLY while the saved provider
+is llama.cpp (`LocalServerPolicy` in `Core.swift`, unit-tested by
+`tests/test-localserver.swift`). `AppDelegate.activeProviderChanged(to:)` →
+`LlamaServerManager.applyProvider` is called at startup and on every provider
+switch (Settings save, in-chat model switcher): llama.cpp → enable + bootstrap +
+status polling; anything else → bootout + `launchctl disable` (so launchd can't
+start it at the next login) + stop any leftover llama-server PopDraft owns (our
+port or `~/.popdraft/models`, never a user's own server). Every start path
+(`restart`, `switchLocalModelFileAndRestart`) re-checks the provider.
+
+**Removed TTS:** saved actions of type `"tts"` / legacy `isTTS: true` are dropped
+on load (`RetiredActionTypeError` in `Models.swift`; the file is re-saved without
+them); `ttsVoice`/`ttsSpeed` config keys are ignored. At startup
+`LegacyTTSCleanup` (App.swift) stops a Higgs TTS server left running by an older
+version (guarded match on `python … ~/.popdraft/llm-tts-server.py`) and deletes its
+script / PID file / log; the old `~/.popdraft/tts-venv` is only removed by
+`uninstall.sh`. Covered by `tests/test-legacy-actions.swift`.
 
 **Config:**
 - `scripts/llm-config.sh` - Backend configuration helper (for debugging)
@@ -90,7 +98,6 @@ change to one feature file, not an edit to a shared list.
 - `Ctrl+Option+A` - Articulate
 - `Ctrl+Option+C` - Craft Answer
 - `Ctrl+Option+P` - Custom Prompt
-- `Ctrl+Option+S` - Speak (TTS)
 
 ## Configuration
 
@@ -103,9 +110,7 @@ change to one feature file, not an edit to a shared list.
   "openaiAPIKey": "",
   "openaiModel": "gpt-4o",
   "claudeAPIKey": "",
-  "claudeModel": "claude-sonnet-4-20250514",
-  "ttsVoice": "auto",
-  "ttsSpeed": 1.0
+  "claudeModel": "claude-sonnet-4-20250514"
 }
 ```
 
@@ -114,8 +119,6 @@ change to one feature file, not an edit to a shared list.
 - Ollama: `http://localhost:11434`
 - OpenAI: `https://api.openai.com/v1/chat/completions`
 - Claude: `https://api.anthropic.com/v1/messages`
-
-**TTS server:** `http://127.0.0.1:7865`
 
 **Agent / Mac-control / MCP config (PR9):** under `agentSettings` and `mcpServers`
 in `config.json`:
@@ -186,5 +189,4 @@ by `tests/test-webengine-gui.swift` (RUN_GUI_TESTS=1). The build links
 
 - App: `/Applications/PopDraft.app`
 - Config: `~/.popdraft/config.json`
-- TTS Script: `~/.popdraft/llm-tts-server.py`
 - LaunchAgent: `~/Library/LaunchAgents/com.popdraft.app.plist` (auto-created by app)

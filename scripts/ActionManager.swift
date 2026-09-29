@@ -42,12 +42,12 @@ class ActionManager {
         Action(id: "continue_writing", name: "Continue writing", icon: "arrow.right.circle.fill",
                prompt: "Continue writing from where this text ends, matching the style and tone. Only output the continuation, nothing else. Preserve the original language.",
                isEnabled: true, order: 5, isDefault: true),
-        Action(id: "read_aloud", name: "Read aloud", icon: "speaker.wave.2.fill",
-               prompt: "", shortcut: "S", actionType: .tts, isEnabled: true, order: 6, isDefault: true),
     ]
 
     init() {
-        actionsFilePath = NSString(string: "~/.popdraft/actions.json").expandingTildeInPath
+        // `~/.popdraft/actions.json`, or under PD_CONFIG_DIR (like config.json)
+        // so an isolated test/eval run never reads or rewrites the real file.
+        actionsFilePath = (LLMConfig.configDir as NSString).appendingPathComponent("actions.json")
         load()
     }
 
@@ -171,6 +171,9 @@ class ActionManager {
             customPromptShortcut = actionsFile.customPromptShortcut
             customPromptEnabled = actionsFile.customPromptEnabled ?? true
             ensureAskAgentPresent()
+            // Retired text-to-speech actions ("Read aloud") were dropped while
+            // decoding — persist that so the file no longer carries them.
+            if actionsFile.droppedRetiredActions > 0 { save() }
             return
         }
 
@@ -202,7 +205,7 @@ class ActionManager {
     }
 
     func save() {
-        let dir = NSString(string: "~/.popdraft").expandingTildeInPath
+        let dir = (actionsFilePath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
         let file = ActionsFile(version: 3, actions: actions, customPromptShortcut: customPromptShortcut, customPromptEnabled: customPromptEnabled)

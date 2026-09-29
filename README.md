@@ -16,7 +16,6 @@ The easiest way to use PopDraft - a floating action menu that appears near your 
 - **Explain simply** - Break down complex text
 - **Craft a reply** - Generate thoughtful responses
 - **Continue writing** - Extend your text
-- **Read aloud** - Text-to-speech using neural TTS
 - **Custom prompt** - Enter any instruction
 
 ### Keyboard Shortcuts
@@ -29,12 +28,10 @@ Direct shortcuts for common actions:
 | `Ctrl+Option+A` | Articulate |
 | `Ctrl+Option+C` | Craft Answer |
 | `Ctrl+Option+P` | Custom Prompt |
-| `Ctrl+Option+S` | Speak (TTS) |
 
 ## Requirements
 
 - macOS 13+ (Ventura or later)
-- Python 3.10+ (for TTS features)
 - **One of the following backends:**
   - **llama.cpp** (default) - Runs locally, no account needed
   - **Ollama** - Local models with easy management
@@ -152,10 +149,6 @@ Look for the sparkles icon in your menu bar.
 - `Escape` - Close popup / Go back
 - Type to filter actions
 
-**During TTS playback:**
-- `Space` - Pause / Resume
-- `Escape` - Stop and close
-
 ### Keyboard Shortcuts
 
 1. **Select text** in any application
@@ -165,19 +158,6 @@ Look for the sparkles icon in your menu bar.
 ### Chat Mode
 
 Opens an interactive session with your selected text as context. Type messages to continue the conversation. Type `exit` to quit.
-
-### Text-to-Speech
-
-Uses Kokoro-82M neural TTS for natural-sounding speech.
-
-```bash
-llm-tts.py "Hello, world!"
-llm-tts.py -v bf_emma "British voice"
-llm-tts.py -s 1.2 "Faster speech"
-llm-tts.py -o output.wav "Save to file"
-```
-
-**Voices:** `af_heart`, `af_bella`, `am_adam` (American), `bf_emma`, `bm_george` (British)
 
 ## Configuration
 
@@ -258,9 +238,6 @@ popdraft/
 │   ├── llm-custom.sh       # Custom prompt
 │   ├── llm-chat.sh         # Chat launcher
 │   ├── llm-chat-session.sh # Interactive chat
-│   ├── llm-tts.py          # TTS client
-│   ├── llm-tts-server.py   # TTS server
-│   ├── llm-tts.sh          # TTS wrapper
 │   ├── LLMChat.swift       # Native chat app
 │   └── setup-workflows.sh  # Workflow generator
 ├── ~/.popdraft/
@@ -309,14 +286,6 @@ curl http://localhost:11434/api/tags
 - Verify your API key is correct in Settings
 - Check your account has available credits
 - Ensure you have network connectivity
-
-### TTS issues
-
-```bash
-python3 -c "import kokoro; print('OK')"
-pip install kokoro soundfile numpy
-brew install espeak-ng
-```
 
 ### View current configuration
 

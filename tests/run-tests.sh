@@ -28,6 +28,8 @@ TESTS=(
   "tests/test-launchagent.swift scripts/Core.swift"
   "tests/test-localactions.swift scripts/Core.swift scripts/MacControl.swift scripts/LocalActionTools.swift"
   "tests/test-filetools.swift scripts/Core.swift scripts/MacControl.swift scripts/FileTools.swift"
+  "tests/test-localserver.swift scripts/Core.swift"
+  "tests/test-legacy-actions.swift scripts/Core.swift scripts/Models.swift scripts/ActionManager.swift"
 )
 
 OVERALL_EXIT=0

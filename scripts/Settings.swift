@@ -53,7 +53,6 @@ struct SettingsView: View {
         case models = "Models"
         case actions = "Actions"
         case mcp = "MCP"
-        case tts = "Text-to-Speech"
 
         /// SF Symbol shown beside the tab label in the segmented tab bar.
         var icon: String {
@@ -62,17 +61,11 @@ struct SettingsView: View {
             case .models: return "cpu.fill"
             case .actions: return "wand.and.stars"
             case .mcp: return "server.rack"
-            case .tts: return "speaker.wave.2.fill"
             }
         }
 
         /// Short label for the compact segmented control.
-        var shortLabel: String {
-            switch self {
-            case .tts: return "Voice"
-            default: return rawValue
-            }
-        }
+        var shortLabel: String { rawValue }
     }
 
     @State private var selectedTab: SettingsTab = .general
@@ -89,9 +82,6 @@ struct SettingsView: View {
     @State private var llamacppEnableThinking: Bool = false
     @State private var availableOllamaModels: [String] = []
     @State private var ollamaAPIKey: String = ""
-    @State private var ttsVoice: String = "auto"
-    @State private var ttsSpeed: Double = 1.0
-    @State private var voiceSearchText: String = ""
     @State private var settingsActions: [Action] = []
 
     private var sortedActions: [Action] {
@@ -143,82 +133,6 @@ struct SettingsView: View {
     let onSave: (LLMConfig) -> Void
     let onCancel: () -> Void
 
-    private var filteredVoices: [(id: String, name: String, language: String)] {
-        if voiceSearchText.isEmpty {
-            return LLMConfig.ttsVoices
-        }
-        return LLMConfig.ttsVoices.filter {
-            $0.name.localizedCaseInsensitiveContains(voiceSearchText) ||
-            $0.id.localizedCaseInsensitiveContains(voiceSearchText) ||
-            $0.language.localizedCaseInsensitiveContains(voiceSearchText)
-        }
-    }
-
-    enum VoiceListItem: Identifiable {
-        case header(language: String, count: Int)
-        case voice(id: String, name: String, language: String)
-
-        var id: String {
-            switch self {
-            case .header(let language, _): return "header_\(language)"
-            case .voice(let id, _, _): return id
-            }
-        }
-    }
-
-    private var voiceListItems: [VoiceListItem] {
-        let voices = filteredVoices
-        var items: [VoiceListItem] = []
-        for lang in LLMConfig.ttsVoiceLanguages {
-            let langVoices = voices.filter { $0.language == lang }
-            if !langVoices.isEmpty {
-                items.append(.header(language: lang, count: langVoices.count))
-                for v in langVoices {
-                    items.append(.voice(id: v.id, name: v.name, language: v.language))
-                }
-            }
-        }
-        return items
-    }
-
-    @ViewBuilder
-    private func voiceListRow(_ item: VoiceListItem) -> some View {
-        switch item {
-        case .header(let language, let count):
-            HStack {
-                Text(language)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text("\(count)")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
-            }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
-        case .voice(let voiceId, let name, _):
-            HStack {
-                Image(systemName: ttsVoice == voiceId ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(ttsVoice == voiceId ? .accentColor : .secondary)
-                    .font(.system(size: 14))
-                Text(name)
-                    .font(.system(size: 12))
-                Spacer()
-                Text(voiceId)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
-            }
-            .padding(.vertical, 5)
-            .padding(.horizontal, 8)
-            .background(ttsVoice == voiceId ? Color.accentColor.opacity(0.1) : Color.clear)
-            .cornerRadius(4)
-            .onTapGesture {
-                ttsVoice = voiceId
-            }
-        }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             titleBar
@@ -237,8 +151,6 @@ struct SettingsView: View {
                         modelsSettingsTab
                     case .mcp:
                         MCPSettingsView(servers: $mcpServers)
-                    case .tts:
-                        ttsSettingsTab
                     }
                 }
                 .padding(.horizontal, 18)
@@ -1121,87 +1033,6 @@ struct SettingsView: View {
             set: { otherModelText[provider.rawValue] = $0 })
     }
 
-    // MARK: - TTS Settings Tab
-
-    private var ttsSettingsTab: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            // Voice selection
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Voice")
-                    .font(.system(size: 12, weight: .medium))
-
-                // Search field
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundColor(.secondary)
-                        .font(.system(size: 12))
-                    TextField("Search voices...", text: $voiceSearchText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                }
-                .padding(6)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
-
-                // Voice list grouped by language
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(voiceListItems, id: \.id) { item in
-                            voiceListRow(item)
-                        }
-                    }
-                }
-                .frame(height: 160)
-                .background(Color(NSColor.textBackgroundColor))
-                .cornerRadius(6)
-            }
-
-            // Speed slider
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Speed")
-                        .font(.system(size: 12, weight: .medium))
-                    Spacer()
-                    Text(String(format: "%.1fx", ttsSpeed))
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
-
-                HStack {
-                    Text("0.5x")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Slider(value: $ttsSpeed, in: 0.5...2.0, step: 0.1)
-                    Text("2.0x")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-            }
-
-            // Test button
-            Button(action: testVoice) {
-                HStack {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 10))
-                    Text("Test Voice")
-                        .font(.system(size: 12))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color.accentColor.opacity(0.1))
-                .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-        }
-        .padding(16)
-    }
-
-    private func testVoice() {
-        TTSClient.shared.speak(text: "Hello! This is a test of the selected voice.", voice: ttsVoice, speed: ttsSpeed) { _ in }
-    }
-
     // MARK: - Provider Settings Views
 
     private var llamacppSettings: some View {
@@ -1379,10 +1210,15 @@ struct SettingsView: View {
     private func activateBuiltin(_ m: LLMConfig.LlamaModel) {
         selectedProvider = .llamacpp
         var cfg = LLMConfig.load()
+        let wasLocal = cfg.provider == .llamacpp
         cfg.provider = .llamacpp
         cfg.llamaModel = m.id
         cfg.save()
         LLMClient.shared.reloadConfig()
+        if !wasLocal {
+            // Status polling etc.; the restart below starts the server on this model.
+            (NSApp.delegate as? AppDelegate)?.activeProviderChanged(to: .llamacpp, startServer: false)
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             DependencyManager.shared.switchLocalModelFileAndRestart(m.filename)
         }
@@ -1514,23 +1350,9 @@ struct SettingsView: View {
                     self.userModels.removeAll { $0.name == ref.name && $0.quant == ref.quant }
                     self.userModels.append(ref)
                 }
-                // Point the llama-server LaunchAgent at the freshly downloaded file.
-                let model = LLMConfig.LlamaModel(
-                    id: "hf:\(repo):\(file.quant)",
-                    name: repo,
-                    size: file.sizeBytes.humanReadableSize,
-                    languages: "",
-                    url: resolveURL,
-                    filename: destFilename
-                )
-                DependencyManager.shared.createLlamaLaunchAgentForModel(model)
-
-                let startProcess = Process()
-                startProcess.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                startProcess.arguments = ["bootstrap", "gui/\(getuid())",
-                    NSString(string: "~/Library/LaunchAgents/com.popdraft.llama-server.plist").expandingTildeInPath]
-                try? startProcess.run()
-                startProcess.waitUntilExit()
+                // Point the llama-server LaunchAgent at the freshly downloaded file
+                // and (only while llama.cpp is the saved provider) start it.
+                DependencyManager.shared.switchLocalModelFileAndRestart(destFilename)
 
                 DispatchQueue.main.async {
                     self.downloadProgress = 100
@@ -1568,9 +1390,13 @@ struct SettingsView: View {
         guard let fn = m.filename else { return }
         selectedProvider = .llamacpp
         var cfg = LLMConfig.load()
+        let wasLocal = cfg.provider == .llamacpp
         cfg.provider = .llamacpp
         cfg.save()
         LLMClient.shared.reloadConfig()
+        if !wasLocal {
+            (NSApp.delegate as? AppDelegate)?.activeProviderChanged(to: .llamacpp, startServer: false)
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             DependencyManager.shared.switchLocalModelFileAndRestart(fn)
         }
@@ -1767,8 +1593,6 @@ struct SettingsView: View {
         claudeThinkingBudget = Double(config.claudeThinkingBudget)
         ollamaEnableThinking = config.ollamaEnableThinking
         llamacppEnableThinking = config.llamacppEnableThinking
-        ttsVoice = config.ttsVoice
-        ttsSpeed = config.ttsSpeed
         popupHotkey = config.popupHotkey
         bubbleEnabled = config.bubble.enabled
         bubbleCorner = BubbleCorner.parse(config.bubble.corner)
@@ -1838,8 +1662,6 @@ struct SettingsView: View {
         config.claudeThinkingBudget = Int(claudeThinkingBudget)
         config.ollamaEnableThinking = ollamaEnableThinking
         config.llamacppEnableThinking = llamacppEnableThinking
-        config.ttsVoice = ttsVoice
-        config.ttsSpeed = ttsSpeed
         config.popupHotkey = popupHotkey
         // PR3: persist user-managed models + provider keys.
         config.userModels = userModels
@@ -2262,17 +2084,6 @@ struct ActionEditorSheet: View {
                             Text("The selected text will be sent to the LLM with these instructions.")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
-                        case .tts:
-                            Text("Text-to-Speech")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.secondary)
-                            Text("Selected text will be read aloud using the configured TTS voice.")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                                .padding(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(6)
                         case .command:
                             Text("Shell Command")
                                 .font(.system(size: 12, weight: .medium))
@@ -2414,7 +2225,14 @@ class SettingsWindowController: NSWindowController {
     }
 
     private func saveConfig(_ config: LLMConfig) {
+        let previousProvider = LLMConfig.load().provider
         config.save()
+
+        // Switching TO llama.cpp starts the local server; switching AWAY stops it
+        // (no local model stays resident for Ollama / OpenAI / Claude).
+        if config.provider != previousProvider {
+            (NSApp.delegate as? AppDelegate)?.activeProviderChanged(to: config.provider)
+        }
 
         // Reload config in LLMClient
         LLMClient.shared.reloadConfig()
